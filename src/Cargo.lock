@@ -675,6 +675,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "include_dir",
+ "libc",
  "reqwest",
  "serde_json",
 ]

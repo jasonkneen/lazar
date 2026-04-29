@@ -18,18 +18,19 @@ Everything else is emergent.
 ├── skills/                the agent's "being" — capabilities as folders
 ├── memory/                durable notes
 ├── workspace/             scratchpad, the agent's cwd, projects you build
-└── logs/stream.jsonl      append-only event stream (rotated by skill at ~10MB)
+└── logs/stream.jsonl      append-only event stream (kernel auto-rotates at ~10MB)
 ```
 
-The kernel is ~600 lines of Rust. It does three things:
+The kernel is a small Rust runner. It does three things:
 
 1. Takes a prompt via `-p`.
 2. Calls Claude (SSE-streamed) with one tool, `execute(command)`.
 3. Runs the bash through `sandbox-exec` and feeds the output back.
 
-That's it. Recursion (`lazar -p` calling itself) is just a tool call.
-State (memory, skills) lives on disk. Capabilities are markdown files
-the agent reads and writes.
+That's it. State (memory, skills) lives on disk. Capabilities are markdown files
+the agent reads and writes. Nested `lazar -p` recursion is intentionally API-key
+isolated by default; set `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1` only when you
+want tool subprocesses to be able to launch child lazar API calls.
 
 The kernel also speaks structured `--output-format stream-json` for
 programmatic consumers (TUIs, log analyzers), records every event to
@@ -52,11 +53,11 @@ export ANTHROPIC_API_KEY=sk-...
 lazar -p "what skills do you have?"
 ```
 
-Setup builds in place (`~/lazar/src/`), installs the binary at `~/lazar/bin/lazar`, locks it with `chflags uchg`, and seeds `skills/` from the seed skills baked into the binary.
+Setup builds with an external Cargo target directory (`$LAZAR_HOME/workspace/.cargo-target` by default), installs the binary at `~/lazar/bin/lazar`, locks it with `chflags uchg`, and seeds `skills/` only when the skills directory has no `INDEX.md`. Re-running setup preserves existing skills, memory, workspace, logs, and source unless you opt into source update or reset.
 
 ### What's in vs out of git
 
-The repo ships only the core: `src/` (kernel source + seed skills), `scripts/` (kernel ceremony), `setup.sh`, `README.md`, `.gitignore`. Everything generated at runtime — `skills/` (user-evolved), `memory/`, `workspace/`, `logs/`, `bin/lazar`, `src/target/` — is ignored by git. Cloning gives you a clean install; running gives you your own personal evolution.
+The repo ships only the core: `src/` (kernel source + seed skills), `scripts/` (kernel ceremony), `setup.sh`, `README.md`, `.gitignore`. Everything generated at runtime — root `skills/` (user-evolved), root `memory/`, root `workspace/`, root `logs/`, `bin/lazar`, `src/target/` — is ignored by git. Seed skills under `src/seed-skills/` are source and must remain tracked, including `src/seed-skills/memory/SKILL.md`. Cloning gives you a clean install; running gives you your own personal evolution.
 
 To publish your own fork:
 
@@ -91,7 +92,7 @@ If you have a previous install at `~/clawd/lazar`, run:
 bash ~/clawd/lazar/scripts/migrate-from-clawd.sh
 ```
 
-This moves the directory to `~/lazar`, updates the `/usr/local/bin/lazar` symlink, and patches any `clawd/lazar` references in your shell rc files (with backups). Skills, memory, workspace, and logs are preserved. You'll need to rebuild the kernel after the move — see the steps printed by the script.
+This moves the directory to `~/lazar`, optionally updates the `/usr/local/bin/lazar` symlink, and shows diffs before patching any `clawd/lazar` references in your shell rc files (with backups). Use `--yes` for non-interactive migration. Skills, memory, workspace, and logs are preserved. You'll need to rebuild the kernel after the move — see the steps printed by the script.
 
 If the script isn't present in your old install, copy it from the repo first:
 
@@ -106,8 +107,11 @@ bash ~/clawd/lazar/scripts/migrate-from-clawd.sh
 # normal invocation
 lazar -p "build a skill that prints the current time, then use it"
 
-# reset everything but the kernel (factory restore)
+# reset everything but the kernel (factory restore; asks for confirmation)
 lazar --reset-all
+
+# non-interactive factory reset (destructive)
+lazar --reset-all --yes
 
 # get help
 lazar --help
@@ -137,7 +141,9 @@ That separation — kernel records, agent decides — is the architectural bet. 
 
 ## Reset
 
-`lazar --reset-all` wipes `skills/`, `memory/`, `workspace/`, `logs/` and re-seeds the skills directory from copies embedded in the binary at compile time. The kernel doesn't change. After reset, the agent is at the exact state of a fresh install.
+`lazar --reset-all` wipes `skills/`, `memory/`, `workspace/`, `logs/` and re-seeds the skills directory from copies embedded in the binary at compile time. It asks for confirmation unless you pass `--yes`. The kernel doesn't change. After reset, the agent is at the exact state of a fresh install.
+
+`setup.sh` does not reset runtime state by default. If you deliberately want setup to perform a factory reset after rebuilding, run it as `LAZAR_RESET_ALL=1 bash setup.sh`.
 
 The seed skills are:
 
@@ -147,21 +153,32 @@ The seed skills are:
 
 ## Upgrade
 
-To rebuild the kernel:
+To rebuild the current installed kernel after editing `~/lazar/src`:
 
 ```bash
-chflags nouchg ~/lazar/bin/lazar
-chmod +w ~/lazar/bin/lazar
-chmod -R u+w ~/lazar/src
-# edit src/, then re-run
-bash setup.sh
+bash ~/lazar/scripts/kernel-unlock.sh
+# edit src/, then rebuild + relock
+bash ~/lazar/scripts/kernel-build.sh
 ```
+
+If you are installing from a separate checkout and want to update an existing `~/lazar/src`, setup preserves the existing source unless you opt in. Use:
+
+```bash
+LAZAR_UPDATE_SOURCE=1 bash setup.sh
+```
+
+That creates a timestamped `src.backup.*` first. Runtime state is still preserved unless you also set `LAZAR_RESET_ALL=1`.
 
 ## Environment
 
-- `ANTHROPIC_API_KEY` — required.
+- `ANTHROPIC_API_KEY` — required by the top-level lazar process.
+- `LAZAR_HOME` — install/runtime root; defaults to `~/lazar`.
 - `LAZAR_MODEL` — override the default model (`claude-sonnet-4-6`).
-- `LAZAR_DEPTH` — recursion depth (set automatically when the agent calls itself; capped at 5).
+- `LAZAR_DEPTH` — recursion depth (set automatically for tool subprocesses; capped at 5).
+- `LAZAR_TOOL_TIMEOUT_SECS` — wall-clock timeout for each `execute(command)` tool call; default 120.
+- `LAZAR_TOOL_OUTPUT_MAX_BYTES` — max stdout/stderr bytes kept from a tool call before truncation; default 200000.
+- `LAZAR_LOG_MAX_BYTES` — size at which `logs/stream.jsonl` auto-rotates; default 10485760.
+- `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY` — opt-in (`1`, `true`, `yes`, `on`) to expose the API key to tool subprocesses so nested `lazar -p` calls can make API requests. Off by default for secret isolation.
 
 ## Sandbox boundaries
 
@@ -170,7 +187,7 @@ Every bash command runs through `sandbox-exec` with this policy:
 - **Reads:** open. The agent can read its own kernel and source.
 - **Writes:** only `skills/`, `memory/`, `workspace/`, `logs/`, and `/tmp`.
 - **Network:** open (for API calls and skills like web-search).
-- **Process spawn:** open (for `lazar -p` recursion and any tool the agent invokes).
+- **Process spawn:** open (for CLI tools and optional `lazar -p` recursion; nested API recursion requires `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1`).
 
 Writes outside the allowed zones return `Operation not permitted`. The agent sees this in tool output and learns the boundary is real.
 
@@ -178,5 +195,5 @@ Writes outside the allowed zones return `Operation not permitted`. The agent see
 
 - The runner never "knows about" specific capabilities. A new skill becomes available the moment its SKILL.md exists; no recompile, no registration code.
 - Seed skills are baked into the binary so reset is fully self-sufficient — even if `src/` is gone, reset still works.
-- The kernel logs every invocation to `logs/<unix-millis>.json` for replay and debugging.
-- There is no streaming. Add it as a skill (it can wrap `lazar -p` and stream the output) rather than baking it into the kernel.
+- The kernel appends every invocation to `logs/stream.jsonl` for replay and debugging, and auto-rotates that log before it grows past `LAZAR_LOG_MAX_BYTES`.
+- Human output streams text live. `--output-format stream-json` emits structured JSONL events for TUIs and other programmatic consumers.

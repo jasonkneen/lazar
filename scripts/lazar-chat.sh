@@ -46,7 +46,7 @@ while IFS= read -e -r -p "${CYAN}▶${RESET} " prompt; do
         # glow renders the assistant's markdown. lazar's text mode already
         # streams live; glow buffers and re-renders, so we trade liveness
         # for prettiness. For live + pretty, use a TUI (see create-tui).
-        lazar -p "$prompt" 2>/dev/null | glow -
+        lazar -p "$prompt" | glow -
     else
         lazar -p "$prompt"
     fi

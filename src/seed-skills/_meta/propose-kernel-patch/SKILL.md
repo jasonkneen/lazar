@@ -20,9 +20,11 @@ Do NOT use this for things that should be skills. The kernel does ONE thing — 
        mkdir -p $LAZAR_HOME/workspace/proposals/<slug>/src/src
        mkdir -p $LAZAR_HOME/workspace/proposals/<slug>/src/seed-skills
 
-3. Copy the FULL current kernel as the starting point:
+3. Copy the current kernel source as the starting point, excluding generated build artifacts:
 
-       cp -R $LAZAR_HOME/src/. $LAZAR_HOME/workspace/proposals/<slug>/src/
+       rsync -a --exclude target/ $LAZAR_HOME/src/ $LAZAR_HOME/workspace/proposals/<slug>/src/
+
+   If `rsync` is unavailable, copy `src/` and remove `target/` from the proposal before diffing/applying.
 
 4. Apply your changes inside `$LAZAR_HOME/workspace/proposals/<slug>/src/`:
 
@@ -55,7 +57,7 @@ Do NOT use this for things that should be skills. The kernel does ONE thing — 
 
 ## Principles
 
-- **Never partial.** Always stage the FULL src/ tree. `kernel-apply.sh` does a directory copy; if you only stage main.rs, the rebuild gets your main.rs but loses any other changes you didn't realize were paired.
+- **Never partial.** Always stage a complete source tree, but exclude generated artifacts such as `target/`. `kernel-apply.sh` applies with delete semantics, so the proposal tree must contain every source file that should remain.
 - **Always include a README.** A patch you can't explain isn't a patch worth applying.
 - **Keep proposals small.** Big rewrites should be split. The user has to read every line of the diff.
 - **Prefer skills over kernel changes.** If you can express the fix as a skill, do that instead — no upgrade ceremony required.

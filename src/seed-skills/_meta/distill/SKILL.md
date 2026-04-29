@@ -15,7 +15,7 @@ Do NOT use this on every invocation. It costs an LLM call per archive, and learn
 ## Hard rules
 
 - **Bound the sample.** Never pass a whole archive into the recursion prompt. Pick a focused slice — last N invocations, or events around a specific topic — and cap by bytes.
-- **Use `lazar -p` recursion**, not a separate API call. This keeps the kernel as the only API consumer and makes the LLM call appear in `stream.jsonl` itself.
+- **Use `lazar -p` recursion**, not a separate API call. This keeps the kernel as the only API consumer and makes the LLM call appear in `stream.jsonl` itself. In the default tool-secret-isolated mode, this requires running the parent lazar with key inheritance enabled; otherwise the recipe should stop and ask the user to opt in.
 - **Write to `memory/distilled/<category>.md`**, never to top-level memory. Distilled insights are LLM-generated; mark them clearly.
 - **Tag every entry** with the source archive's timestamp and the date you distilled. Future-you needs to know how stale the learning is.
 
@@ -23,8 +23,9 @@ Do NOT use this on every invocation. It costs an LLM call per archive, and learn
 
 ```bash
 # Pick the archive to distill (default: most recent rotation)
-ARCHIVE=$(ls -t $LAZAR_HOME/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
+ARCHIVE=$(ls -t "$LAZAR_HOME"/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
 [ -z "$ARCHIVE" ] && { echo "no archives to distill"; exit 0; }
+[ -z "${ANTHROPIC_API_KEY:-}" ] && { echo "distill needs child lazar API access; rerun with LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1 if you are inside lazar"; exit 1; }
 
 # Bounded sample: last 30 user prompts + assistant responses, capped at 30KB
 SAMPLE=$(jq -s '
@@ -36,7 +37,8 @@ SAMPLE=$(jq -s '
 [ -z "$SAMPLE" ] && { echo "no usable events in $ARCHIVE"; exit 0; }
 
 # Recurse — ask lazar to extract structured learnings
-LAZAR_DEPTH=1 lazar -p "Read this conversation transcript (JSONL events) and extract durable learnings worth saving. Be selective — only include things future-you will genuinely benefit from remembering.
+DISTILL_OUT="/tmp/lazar-distill-$$.md"
+LAZAR_DEPTH=$((${LAZAR_DEPTH:-0}+1)) lazar -p "Read this conversation transcript (JSONL events) and extract durable learnings worth saving. Be selective — only include things future-you will genuinely benefit from remembering.
 
 Output ONLY this exact format, with each section terse and one-line bullets:
 
@@ -55,28 +57,30 @@ Output ONLY this exact format, with each section terse and one-line bullets:
 Skip any section that has nothing real. Don't pad. If nothing is worth saving, output 'nothing durable' on a single line.
 
 Transcript:
-$SAMPLE" > /tmp/distill-out.md 2>/dev/null
+$SAMPLE" > "$DISTILL_OUT" 2>/dev/null
 
 # If the agent said nothing durable, bail
-grep -qi "nothing durable" /tmp/distill-out.md && { echo "no durable learnings found"; exit 0; }
+grep -qi "nothing durable" "$DISTILL_OUT" && { echo "no durable learnings found"; rm -f "$DISTILL_OUT"; exit 0; }
 
 # Write to memory, tagged with source + date
-mkdir -p $LAZAR_HOME/memory/distilled
-TS=$(basename "$ARCHIVE" | grep -oE '[0-9]+')
+mkdir -p "$LAZAR_HOME/memory/distilled"
+TS=$(basename "$ARCHIVE" | grep -oE '[0-9]+' | head -n 1)
 DATE=$(date -u +%Y-%m-%d)
 
 # Split the output by section, append each to its category file
 awk -v ts="$TS" -v date="$DATE" -v home="$LAZAR_HOME" '
   /^## / { cat = tolower(substr($0, 4)); next }
   /^- / && cat != "" {
+    if (cat != "gotchas" && cat != "conventions" && cat != "recipes" && cat != "preferences") next
     path = home "/memory/distilled/" cat ".md"
     print "- " substr($0, 3) " _(distilled " date ", from archive ." ts ".bak)_" >> path
     close(path)
   }
-' /tmp/distill-out.md
+' "$DISTILL_OUT"
 
-echo "distilled into $LAZAR_HOME/memory/distilled/ (sections: $(ls $LAZAR_HOME/memory/distilled/ 2>/dev/null | tr '\n' ' '))"
-rm -f /tmp/distill-out.md
+SECTIONS=$(ls "$LAZAR_HOME/memory/distilled/" 2>/dev/null | tr '\n' ' ')
+echo "distilled into $LAZAR_HOME/memory/distilled/ (sections: $SECTIONS)"
+rm -f "$DISTILL_OUT"
 ```
 
 ## Output shape

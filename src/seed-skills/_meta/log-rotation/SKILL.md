@@ -30,28 +30,33 @@ Do NOT run this on every prompt. Once-per-archive is plenty. The kernel's auto-r
 
 ### Rotate if over threshold (and write a summary to memory/)
 
-    LOG=$LAZAR_HOME/logs/stream.jsonl
+    LOG="$LAZAR_HOME/logs/stream.jsonl"
     THRESHOLD=10485760  # 10 MB
 
     if [ -f "$LOG" ]; then
-      SIZE=$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null)
+      SIZE=$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null || echo 0)
       if [ "${SIZE:-0}" -gt "$THRESHOLD" ]; then
-        TS=$(date +%s)
+        TS="$(date +%s).$$"
         ARCHIVE="${LOG}.${TS}.bak"
+        N=0
+        while [ -e "$ARCHIVE" ]; do
+          N=$((N+1))
+          ARCHIVE="${LOG}.${TS}.${N}.bak"
+        done
         mv "$LOG" "$ARCHIVE"
         echo "rotated: ${LOG} -> ${ARCHIVE} (was ${SIZE} bytes)"
 
         # CRITICAL: write a summary into memory/ so long-term recall stays cheap.
         # This is the L2 tier — the agent reads these instead of scanning .bak files.
-        mkdir -p $LAZAR_HOME/memory/log-summaries
-        SUM=$LAZAR_HOME/memory/log-summaries/${TS}.md
+        mkdir -p "$LAZAR_HOME/memory/log-summaries"
+        SUM="$LAZAR_HOME/memory/log-summaries/$(basename "$ARCHIVE").md"
         FIRST_TS=$(head -n 1 "$ARCHIVE" | jq -r '.ts_ms // empty' 2>/dev/null || echo "?")
         LAST_TS=$(tail -n 1  "$ARCHIVE" | jq -r '.ts_ms // empty' 2>/dev/null || echo "?")
         N_INVOKES=$(grep -c '"kind":"invoke_start"' "$ARCHIVE" 2>/dev/null || echo 0)
         N_TOOLS=$(grep -c   '"kind":"tool_result"'  "$ARCHIVE" 2>/dev/null || echo 0)
 
         cat > "$SUM" <<EOF
-# log-summary $(date -u -r "$TS" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%d)
+# log-summary $(date -u -r "${TS%%.*}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%d)
 
 archive: $ARCHIVE
 size: ${SIZE} bytes
@@ -63,7 +68,7 @@ tool_calls: ${N_TOOLS}
 ## User prompts (last 30)
 
 EOF
-        jq -r 'select(.kind == "user") | .content' "$ARCHIVE" 2>/dev/null \
+        jq -r 'select(.kind == "user") | (.content | tostring | .[0:1000])' "$ARCHIVE" 2>/dev/null \
           | tail -n 30 \
           | sed 's/^/- /' \
           >> "$SUM" || true
@@ -92,7 +97,12 @@ EOF
 
 ### Prune very old archives (optional, conservative — keeps last 5)
 
-    ls -t $LAZAR_HOME/logs/stream.jsonl.*.bak* 2>/dev/null | tail -n +6 | xargs -r rm
+    find "$LAZAR_HOME/logs" -name 'stream.jsonl.*.bak*' -type f -print \
+      | while IFS= read -r f; do printf '%s\t%s\n' "$(stat -f%m "$f" 2>/dev/null || stat -c%Y "$f" 2>/dev/null || echo 0)" "$f"; done \
+      | sort -rn \
+      | cut -f2- \
+      | tail -n +6 \
+      | while IFS= read -r old; do rm -f -- "$old"; done
 
 ## Pairing with load-context and archive-search
 

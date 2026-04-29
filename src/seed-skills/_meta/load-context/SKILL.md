@@ -30,7 +30,7 @@ Use this 90% of the time. The double-tail bounds both lines and bytes against pa
 
 ### Last N user prompts only (lightweight context check)
 
-    grep '"kind":"user"' $LAZAR_HOME/logs/stream.jsonl | tail -n 5
+    grep '"kind":"user"' $LAZAR_HOME/logs/stream.jsonl | tail -n 5 | tail -c 20000
 
 ### The most recent invocation (start to finish)
 
@@ -39,12 +39,13 @@ Use this 90% of the time. The double-tail bounds both lines and bytes against pa
 
 ### Search for a topic across all history
 
-    grep -i "topic-name" $LAZAR_HOME/logs/stream.jsonl | tail -n 50
+    grep -i "topic-name" $LAZAR_HOME/logs/stream.jsonl | tail -n 50 | tail -c 50000
 
 ### Filter by event kind
 
     jq -r 'select(.kind == "tool_result") | .command' $LAZAR_HOME/logs/stream.jsonl \
-      | tail -n 30
+      | tail -n 30 \
+      | tail -c 20000
 
 ## When L1 isn't enough — go to L2 (memory summaries + distilled)
 
@@ -53,11 +54,11 @@ L2 has two flavors, both under `$LAZAR_HOME/memory/`:
 **Mechanical summaries** at `memory/log-summaries/<ts>.md`, written automatically by `_meta/log-rotation`. Each one tells you what time period a `.bak` archive covers, the top user prompts, and the most-used commands. Cheap, broad, always present.
 
     ls -la $LAZAR_HOME/memory/log-summaries/
-    cat $LAZAR_HOME/memory/log-summaries/*.md | head -n 100
+    cat $LAZAR_HOME/memory/log-summaries/*.md 2>/dev/null | head -n 100 | head -c 50000
 
 **Distilled learnings** at `memory/distilled/<category>.md` (gotchas / conventions / recipes / preferences), written by `_meta/distill` when the agent has been asked to curate. High-signal, but only present if `distill` has been run for the archive in question. Read these FIRST when looking for "what did we learn" rather than "what happened":
 
-    cat $LAZAR_HOME/memory/distilled/*.md 2>/dev/null | head -n 200
+    cat $LAZAR_HOME/memory/distilled/*.md 2>/dev/null | head -n 200 | head -c 50000
 
 Use the summaries to figure out *which* archive is worth searching, and the distilled files to recall lessons without re-reading transcripts.
 

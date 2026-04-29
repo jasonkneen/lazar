@@ -8,7 +8,18 @@
 use clap::{Parser, ValueEnum};
 use include_dir::{include_dir, Dir};
 use serde_json::{json, Value};
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    fs::File,
+    io::{BufRead, Read, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -34,6 +45,134 @@ static SANDBOX_PROFILE: &str = include_str!("../sandbox.sb");
 const MAX_DEPTH: u32 = 5;
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 200_000;
+const TOOL_READ_CHUNK_BYTES: usize = 8192;
+
+#[derive(Clone, Copy, Debug)]
+struct ToolLimits {
+    timeout: Duration,
+    output_max_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    total_bytes: usize,
+}
+
+impl CapturedOutput {
+    fn was_truncated(&self) -> bool {
+        self.total_bytes > self.bytes.len()
+    }
+}
+
+impl ToolLimits {
+    fn from_env() -> Self {
+        let timeout_secs = env::var("LAZAR_TOOL_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|secs: &u64| *secs > 0)
+            .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS);
+        let output_max_bytes = env::var("LAZAR_TOOL_OUTPUT_MAX_BYTES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|bytes: &usize| *bytes > 0)
+            .unwrap_or(DEFAULT_TOOL_OUTPUT_MAX_BYTES);
+
+        Self {
+            timeout: Duration::from_secs(timeout_secs),
+            output_max_bytes,
+        }
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn safe_prefix(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+
+    let prefix = safe_prefix(output, max_bytes);
+    let omitted = output.len().saturating_sub(prefix.len());
+    format!("{prefix}\n[truncated: {omitted} bytes omitted]")
+}
+
+fn tool_input_preview(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+
+    let prefix = safe_prefix(input, max_bytes);
+    let omitted = input.len().saturating_sub(prefix.len());
+    format!("{prefix}…[+{omitted}b]")
+}
+
+fn validate_reset_home(home: &Path) -> Result<(), String> {
+    if home.as_os_str().is_empty() {
+        return Err("refusing to reset an empty LAZAR_HOME".into());
+    }
+    if home.is_relative() {
+        return Err(format!(
+            "refusing to reset relative LAZAR_HOME: {}",
+            home.display()
+        ));
+    }
+    if home.parent().is_none() {
+        return Err(format!(
+            "refusing to reset filesystem root: {}",
+            home.display()
+        ));
+    }
+    if let Ok(user_home) = env::var("HOME") {
+        if Path::new(&user_home) == home {
+            return Err(format!(
+                "refusing to reset HOME directly: {}",
+                home.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn emit_stream_error(format: OutputFormat, message: &str) {
+    if format == OutputFormat::StreamJson {
+        emit_event(json!({"type": "error", "message": message}));
+    }
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    matches!(
+        env::var(name).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
 
 #[derive(Parser)]
 #[command(name = "lazar", about = "The smallest self-evolving agent.")]
@@ -79,6 +218,8 @@ fn lazar_home() -> PathBuf {
 
 fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
     let home = lazar_home();
+    validate_reset_home(&home)
+        .map_err(|msg| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg))?;
 
     if !skip_confirm {
         eprint!(
@@ -109,44 +250,201 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn read_capped<R>(mut reader: R, cap: usize) -> thread::JoinHandle<CapturedOutput>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut kept = Vec::with_capacity(cap.min(TOOL_READ_CHUNK_BYTES));
+        let mut total = 0usize;
+        let mut buf = [0u8; TOOL_READ_CHUNK_BYTES];
+
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total = total.saturating_add(n);
+                    if kept.len() < cap {
+                        let remaining = cap - kept.len();
+                        kept.extend_from_slice(&buf[..n.min(remaining)]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        CapturedOutput {
+            bytes: kept,
+            total_bytes: total,
+        }
+    })
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
+
 fn run_bash(cmd: &str) -> String {
+    let limits = ToolLimits::from_env();
     let lazar_path = lazar_home();
     let lazar = lazar_path.to_string_lossy().to_string();
     let workspace = format!("{lazar}/workspace");
 
-    // make sure workspace exists; sandbox-exec needs a real cwd
-    let _ = fs::create_dir_all(&workspace);
+    if let Err(e) = fs::create_dir_all(&workspace) {
+        return format!("[workspace error: {e}]\n[exit 1]");
+    }
 
-    let result = Command::new("sandbox-exec")
-        .arg("-D").arg(format!("SKILLS_PATH={lazar}/skills"))
-        .arg("-D").arg(format!("MEMORY_PATH={lazar}/memory"))
-        .arg("-D").arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-        .arg("-D").arg(format!("LOGS_PATH={lazar}/logs"))
-        .arg("-p").arg(SANDBOX_PROFILE)
-        .arg("bash").arg("-c").arg(cmd)
+    let current_depth = env::var("LAZAR_DEPTH")
+        .ok()
+        .and_then(|d| d.parse::<u32>().ok())
+        .unwrap_or(0);
+    let child_depth = current_depth.saturating_add(1);
+
+    let mut command = Command::new("/usr/bin/sandbox-exec");
+    command
+        .arg("-D")
+        .arg(format!("SKILLS_PATH={lazar}/skills"))
+        .arg("-D")
+        .arg(format!("MEMORY_PATH={lazar}/memory"))
+        .arg("-D")
+        .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
+        .arg("-D")
+        .arg(format!("LOGS_PATH={lazar}/logs"))
+        .arg("-p")
+        .arg(SANDBOX_PROFILE)
+        .arg("/bin/bash")
+        .arg("-c")
+        .arg(cmd)
         .current_dir(&workspace)
-        // Export env vars so skills can use $LAZAR_HOME / $LAZAR_SKILLS / etc.
-        // instead of hardcoded paths. This is what makes skills portable to
-        // any agent that exports LAZAR_HOME.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env(
+            "PATH",
+            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        )
+        .env("HOME", &lazar)
         .env("LAZAR_HOME", &lazar)
         .env("LAZAR_SKILLS", format!("{lazar}/skills"))
         .env("LAZAR_MEMORY", format!("{lazar}/memory"))
         .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
         .env("LAZAR_LOGS", format!("{lazar}/logs"))
-        .output();
+        .env("LAZAR_TOOL_ENV", "1")
+        .env("LAZAR_DEPTH", child_depth.to_string())
+        .env(
+            "TERM",
+            env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+        )
+        .env(
+            "LANG",
+            env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
+        );
 
-    match result {
-        Ok(o) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).to_string();
-            let err = String::from_utf8_lossy(&o.stderr);
-            if !err.is_empty() {
-                s.push_str(&format!("\n[stderr]\n{err}"));
-            }
-            s.push_str(&format!("\n[exit {}]", o.status.code().unwrap_or(-1)));
-            s
-        }
-        Err(e) => format!("[spawn error: {e}]"),
+    if let Ok(model) = env::var("LAZAR_MODEL") {
+        command.env("LAZAR_MODEL", model);
     }
+
+    if env_flag_enabled("LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY") {
+        command.env("LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY", "1");
+        if let Ok(api_key) = env::var("ANTHROPIC_API_KEY") {
+            command.env("ANTHROPIC_API_KEY", api_key);
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => return format!("[spawn error: {e}]\n[exit 1]"),
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .map(|out| read_capped(out, limits.output_max_bytes));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|err| read_capped(err, limits.output_max_bytes));
+
+    let started = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if started.elapsed() >= limits.timeout {
+                    timed_out = true;
+                    kill_process_group(child.id());
+                    let _ = child.kill();
+                    break child.wait().ok();
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                return format!("[wait error: {e}]\n[exit 1]");
+            }
+        }
+    };
+
+    let stdout = stdout
+        .and_then(|h| h.join().ok())
+        .unwrap_or(CapturedOutput {
+            bytes: vec![],
+            total_bytes: 0,
+        });
+    let stderr = stderr
+        .and_then(|h| h.join().ok())
+        .unwrap_or(CapturedOutput {
+            bytes: vec![],
+            total_bytes: 0,
+        });
+
+    let mut result = String::from_utf8_lossy(&stdout.bytes).to_string();
+    if stdout.was_truncated() {
+        result.push_str(&format!(
+            "\n[stdout truncated: {} bytes omitted]",
+            stdout.total_bytes.saturating_sub(stdout.bytes.len())
+        ));
+    }
+
+    if !stderr.bytes.is_empty() || stderr.was_truncated() {
+        let err = String::from_utf8_lossy(&stderr.bytes);
+        result.push_str("\n[stderr]\n");
+        result.push_str(&err);
+        if stderr.was_truncated() {
+            result.push_str(&format!(
+                "\n[stderr truncated: {} bytes omitted]",
+                stderr.total_bytes.saturating_sub(stderr.bytes.len())
+            ));
+        }
+    }
+
+    if timed_out {
+        result.push_str(&format!("\n[timeout after {}s]", limits.timeout.as_secs()));
+    }
+    result.push_str(&format!(
+        "\n[exit {}]",
+        status.and_then(|s| s.code()).unwrap_or(-1)
+    ));
+
+    truncate_tool_output(&result, limits.output_max_bytes)
 }
 
 /// Emit a single JSON event to stdout (used when --format=json). Adds ts_ms.
@@ -165,62 +463,173 @@ fn emit_event(mut event: Value) {
     let _ = std::io::stdout().flush();
 }
 
+fn unique_log_archive_path(logs: &Path) -> PathBuf {
+    let pid = std::process::id();
+    for attempt in 0..1000u32 {
+        let suffix = if attempt == 0 {
+            String::new()
+        } else {
+            format!(".{attempt}")
+        };
+        let candidate = logs.join(format!("stream.jsonl.{}.{pid}{suffix}.bak", now_nanos()));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    logs.join(format!("stream.jsonl.{}.{pid}.fallback.bak", now_nanos()))
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File) {
+    unsafe {
+        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File) {}
+
+fn ensure_dir_not_symlink(path: &Path, label: &str) -> std::io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to use symlinked {label}"),
+            ));
+        }
+    }
+    fs::create_dir_all(path)?;
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("refusing to use symlinked {label}"),
+        ));
+    }
+    Ok(())
+}
+
+fn open_append_no_follow(path: &Path, label: &str) -> std::io::Result<File> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to append to symlinked {label}"),
+            ));
+        }
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
+
+fn write_new_no_follow(path: &Path, label: &str, contents: &str) -> std::io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to write symlinked {label}"),
+            ));
+        }
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(contents.as_bytes())
+}
+
 /// Auto-rotate the stream log when it exceeds LAZAR_LOG_MAX_BYTES (default 10MB).
-/// The current log is moved to stream.jsonl.<unix_secs>.bak and a minimal
-/// summary is written into memory/log-summaries/<unix_secs>.md so the agent
-/// has a navigable index of past archives. Skills like _meta/log-rotation
+/// The current log is moved to a unique stream.jsonl.<unix-nanos>.<pid>.bak
+/// archive and a minimal summary is written into memory/log-summaries/ so the
+/// agent has a navigable index of past archives. Skills like _meta/log-rotation
 /// can layer richer summaries on top, but this floor is non-negotiable —
 /// without it the log grows unbounded and any context-loading attempt
 /// blows the API limit.
-fn maybe_rotate_log(logs: &PathBuf, path: &PathBuf) {
+fn maybe_rotate_log(logs: &Path, path: &Path) {
     let max_bytes: u64 = env::var("LAZAR_LOG_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_485_760); // 10 MB
 
-    let meta = match fs::metadata(path) {
+    let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(_) => return, // file doesn't exist yet — nothing to rotate
     };
+    if meta.file_type().is_symlink() {
+        eprintln!("[lazar] WARN: refusing to rotate symlinked stream.jsonl");
+        return;
+    }
+
     let size = meta.len();
     if size < max_bytes {
         return;
     }
 
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let archive = logs.join(format!("stream.jsonl.{ts}.bak"));
+    let archive = unique_log_archive_path(logs);
     if fs::rename(path, &archive).is_err() {
         eprintln!("[lazar] WARN: log rotation rename failed; log will keep growing");
         return;
     }
     eprintln!(
-        "[lazar] auto-rotated stream.jsonl → stream.jsonl.{ts}.bak ({size} bytes)"
+        "[lazar] auto-rotated stream.jsonl → {} ({size} bytes)",
+        archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("archive")
     );
 
     // Write a minimal summary into memory/log-summaries/ so the agent has
     // an index of past archives without re-reading them. _meta/log-rotation
     // and _meta/distill can layer richer per-archive summaries on top.
-    let memory = lazar_home().join("memory/log-summaries");
-    let _ = fs::create_dir_all(&memory);
-    let sum_path = memory.join(format!("{ts}.md"));
+    let memory_root = logs
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("memory");
+    let memory = memory_root.join("log-summaries");
+    if let Err(e) = ensure_dir_not_symlink(&memory_root, "memory directory") {
+        eprintln!("[lazar] WARN: not writing rotation summary: {e}");
+        return;
+    }
+    if let Err(e) = ensure_dir_not_symlink(&memory, "log-summaries directory") {
+        eprintln!("[lazar] WARN: not writing rotation summary: {e}");
+        return;
+    }
+    let summary_name = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("stream.jsonl.unknown.bak")
+        .trim_start_matches("stream.jsonl.")
+        .trim_end_matches(".bak")
+        .to_string();
+    let sum_path = memory.join(format!("{summary_name}.md"));
     let header = format!(
-        "# log-summary {ts}\n\
+        "# log-summary {summary_name}\n\
          \n\
          archive: {}\n\
          size_bytes: {size}\n\
-         rotated_at_unix: {ts}\n\
+         rotated_at_unix_ms: {}\n\
          \n\
          _Auto-rotated by the lazar kernel when stream.jsonl exceeded \
          LAZAR_LOG_MAX_BYTES. For richer per-archive summaries (top user prompts, \
          top tool commands), run the `_meta/log-rotation` skill against this archive. \
          For LLM-extracted learnings, run `_meta/distill`._\n",
-        archive.display()
+        archive.display(),
+        now_millis()
     );
-    let _ = fs::write(sum_path, header);
+    if let Err(e) = write_new_no_follow(&sum_path, "rotation summary", &header) {
+        eprintln!("[lazar] WARN: failed to write rotation summary: {e}");
+    }
 }
 
 /// Append a single JSON event to the canonical stream at logs/stream.jsonl.
@@ -233,37 +642,36 @@ fn append_stream(mut event: Value) {
     let logs = lazar_home().join("logs");
     let _ = fs::create_dir_all(&logs);
     let path = logs.join("stream.jsonl");
+    let lock_path = logs.join(".stream.lock");
+
+    let lock = open_append_no_follow(&lock_path, "stream lock").ok();
+    if let Some(lock) = lock.as_ref() {
+        lock_file_exclusive(lock);
+    }
 
     // Safety floor: rotate before appending if oversized. Without this,
     // the agent's own load-context calls eventually blow the API limit.
     maybe_rotate_log(&logs, &path);
 
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
     if let Some(obj) = event.as_object_mut() {
-        obj.insert("ts_ms".into(), json!(ts_ms));
+        obj.insert("ts_ms".into(), json!(now_millis()));
     }
 
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{}", event);
+    match open_append_no_follow(&path, "stream log") {
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", event);
+        }
+        Err(e) => eprintln!("[lazar] WARN: failed to append stream log: {e}"),
     }
 }
 
 /// Parse an SSE stream from the Anthropic Messages API.
 ///
 /// In `Text` mode: streams text deltas to stdout as they arrive (live).
-/// In `Json` mode: emits structured JSONL events to stdout (text_delta,
-/// text_done, tool_use). Tool inputs stream as `input_json_delta` chunks but
-/// are only emitted as a complete `tool_use` event on `content_block_stop`,
-/// once the partial JSON has been fully accumulated and parsed.
+/// In `StreamJson` mode: emits structured JSONL events to stdout. Tool inputs
+/// stream as `input_json_delta` chunks but are only emitted as a complete
+/// `tool_use` event on `content_block_stop`, once the partial JSON has been
+/// fully accumulated and parsed.
 ///
 /// Either way, the function reassembles the full assistant content array and
 /// returns it together with the final stop_reason for the agent loop.
@@ -271,15 +679,20 @@ fn parse_sse_stream(
     resp: reqwest::blocking::Response,
     format: OutputFormat,
 ) -> Result<(Value, String), Box<dyn std::error::Error>> {
+    parse_sse_reader(std::io::BufReader::new(resp), format)
+}
+
+fn parse_sse_reader<R: BufRead>(
+    reader: R,
+    format: OutputFormat,
+) -> Result<(Value, String), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
-    use std::io::{BufRead, Write};
 
     let mut blocks: HashMap<u64, Value> = HashMap::new();
     let mut tool_input_buffers: HashMap<u64, String> = HashMap::new();
     let mut stop_reason = String::new();
     let mut printed_any_text = false;
-
-    let reader = std::io::BufReader::new(resp);
+    let mut saw_message_stop = false;
 
     for line in reader.lines() {
         let line = line?;
@@ -331,10 +744,7 @@ fn parse_sse_stream(
                     }
                     "input_json_delta" => {
                         let partial = delta["partial_json"].as_str().unwrap_or("");
-                        tool_input_buffers
-                            .entry(idx)
-                            .or_default()
-                            .push_str(partial);
+                        tool_input_buffers.entry(idx).or_default().push_str(partial);
                     }
                     _ => {}
                 }
@@ -354,7 +764,7 @@ fn parse_sse_stream(
                                 eprintln!(
                                     "[lazar] WARN: tool_use input parse failed (err={e}); buffer ({} bytes) was: {:?}",
                                     buf.len(),
-                                    if buf.len() > 500 { format!("{}…[+{}b]", &buf[..500], buf.len() - 500) } else { buf.clone() }
+                                    tool_input_preview(&buf, 500)
                                 );
                                 json!({})
                             }
@@ -387,7 +797,10 @@ fn parse_sse_stream(
                     stop_reason = r.to_string();
                 }
             }
-            "message_stop" => break,
+            "message_stop" => {
+                saw_message_stop = true;
+                break;
+            }
             "error" => {
                 let msg = v["error"]["message"].as_str().unwrap_or("unknown");
                 if format == OutputFormat::StreamJson {
@@ -397,6 +810,10 @@ fn parse_sse_stream(
             }
             _ => {}
         }
+    }
+
+    if !saw_message_stop {
+        return Err("SSE stream ended before message_stop".into());
     }
 
     if format == OutputFormat::Text && printed_any_text {
@@ -419,9 +836,15 @@ fn run_agent(
     verbose: bool,
     model_override: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let started = std::time::Instant::now();
-    let api_key = env::var("ANTHROPIC_API_KEY")
-        .map_err(|_| "ANTHROPIC_API_KEY is not set")?;
+    let started = Instant::now();
+    let api_key = match env::var("ANTHROPIC_API_KEY") {
+        Ok(key) => key,
+        Err(_) => {
+            let msg = "ANTHROPIC_API_KEY is not set";
+            emit_stream_error(format, msg);
+            return Err(msg.into());
+        }
+    };
     let model = model_override
         .or_else(|| env::var("LAZAR_MODEL").ok())
         .unwrap_or_else(|| DEFAULT_MODEL.into());
@@ -431,8 +854,9 @@ fn run_agent(
         .unwrap_or(0);
 
     if depth > MAX_DEPTH {
-        eprintln!("[lazar] recursion depth {depth} exceeds max {MAX_DEPTH}");
-        std::process::exit(2);
+        let msg = format!("recursion depth {depth} exceeds max {MAX_DEPTH}");
+        emit_stream_error(format, &msg);
+        return Err(msg.into());
     }
 
     let home = lazar_home();
@@ -473,8 +897,9 @@ fn run_agent(
          _meta/load-context/SKILL.md and use its bounded recipes. NEVER \
          `cat` the log — it can be MB+ and will exceed your context window \
          (the API will reject the request).\n\
-         - The log grows without bound. Run _meta/log-rotation when it \
-         exceeds ~10MB. A cheap size check at session start is good hygiene: \
+         - The log auto-rotates at LAZAR_LOG_MAX_BYTES (default ~10MB). \
+         Run _meta/log-rotation only when you want richer archive summaries. \
+         A cheap size check at session start is good hygiene: \
          `wc -c {home_disp}/logs/stream.jsonl`\n\
          \n\
          If a prompt is referential (\"yes\", \"do that\", \"continue\", \"as I \
@@ -497,7 +922,11 @@ fn run_agent(
          hard-won detail you need.\n\
          \n\
          RECURSION\n\
-         To delegate a sub-task: execute `LAZAR_DEPTH={next_depth} lazar -p \"...\"`.\n\
+         Tool subprocesses do not inherit ANTHROPIC_API_KEY by default. \
+         If the operator set LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1, \
+         nested calls can use: execute `LAZAR_DEPTH={next_depth} lazar -p \"...\"`. \
+         Otherwise treat nested `lazar -p` API calls as unavailable and ask \
+         the user to re-run with that opt-in if recursion is essential.\n\
          Recursion depth is capped at {max_depth}; current depth is {depth}.\n\
          \n\
          BOUNDARIES\n\
@@ -531,11 +960,18 @@ fn run_agent(
     });
 
     let mut messages: Vec<Value> = vec![json!({"role": "user", "content": prompt})];
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .connect_timeout(std::time::Duration::from_secs(30))
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .connect_timeout(Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("reqwest client build failed: {e}"))?;
+    {
+        Ok(client) => client,
+        Err(e) => {
+            let msg = format!("reqwest client build failed: {e}");
+            emit_stream_error(format, &msg);
+            return Err(msg.into());
+        }
+    };
 
     append_stream(json!({"kind": "invoke_start", "depth": depth, "model": model}));
     append_stream(json!({"kind": "user", "content": prompt}));
@@ -569,13 +1005,22 @@ fn run_agent(
             "stream": true,
         });
 
-        let resp = client
+        let resp = match client
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", &api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&body)
-            .send()?;
+            .send()
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = format!("API request failed: {e}");
+                emit_stream_error(format, &msg);
+                append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
+                return Err(msg.into());
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -584,16 +1029,23 @@ fn run_agent(
             // Mirror the in-stream "error" event so stream-json consumers
             // (e.g. the TUI) see a structured message instead of just stderr
             // + non-zero exit.
-            if format == OutputFormat::StreamJson {
-                emit_event(json!({"type": "error", "message": msg}));
-            }
+            emit_stream_error(format, &msg);
             if verbose {
                 eprintln!("[lazar] {msg}");
             }
+            append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
             return Err(msg.into());
         }
 
-        let (content, stop_reason_str) = parse_sse_stream(resp, format)?;
+        let (content, stop_reason_str) = match parse_sse_stream(resp, format) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let msg = e.to_string();
+                emit_stream_error(format, &msg);
+                append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
+                return Err(msg.into());
+            }
+        };
         messages.push(json!({"role": "assistant", "content": content.clone()}));
         append_stream(json!({"kind": "assistant", "content": content.clone()}));
 
@@ -707,7 +1159,9 @@ fn run_agent(
                     "aborted after {consecutive_empty_turns} consecutive turns with only empty tool calls"
                 );
                 eprintln!("[lazar] {msg}");
-                append_stream(json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}));
+                append_stream(
+                    json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}),
+                );
                 if format == OutputFormat::StreamJson {
                     emit_event(json!({"type": "error", "message": &msg}));
                 }
@@ -720,18 +1174,25 @@ fn run_agent(
         if results.is_empty() {
             // text already streamed in parse_sse_stream; just log and exit
             eprintln!("[lazar] stop_reason={stop_reason}, no tool calls; exiting");
-            append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}));
+            append_stream(
+                json!({"kind": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}),
+            );
             if format == OutputFormat::StreamJson {
-                emit_event(json!({"type": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}));
+                emit_event(
+                    json!({"type": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}),
+                );
             } else if format == OutputFormat::Json {
-                println!("{}", json!({
-                    "type": "result",
-                    "stop_reason": stop_reason,
-                    "model": &model,
-                    "result": "",
-                    "content": content,
-                    "note": "no tool calls",
-                }));
+                println!(
+                    "{}",
+                    json!({
+                        "type": "result",
+                        "stop_reason": stop_reason,
+                        "model": &model,
+                        "result": "",
+                        "content": content,
+                        "note": "no tool calls",
+                    })
+                );
             }
             return Ok(());
         }
@@ -755,4 +1216,104 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = args.input_format;
 
     run_agent(&prompt, args.output_format, args.verbose, args.model)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::path::Path;
+
+    #[test]
+    fn env_flag_accepts_only_explicit_truthy_values() {
+        let name = format!("LAZAR_TEST_FLAG_{}_{}", std::process::id(), now_millis());
+
+        env::remove_var(&name);
+        assert!(!env_flag_enabled(&name));
+
+        env::set_var(&name, "yes");
+        assert!(env_flag_enabled(&name));
+
+        env::set_var(&name, "0");
+        assert!(!env_flag_enabled(&name));
+        env::remove_var(&name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_and_write_helpers_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = env::temp_dir().join(format!(
+            "lazar-symlink-test-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target");
+        let append_link = dir.join("append-link");
+        let write_link = dir.join("write-link");
+        fs::write(&target, "existing").unwrap();
+        symlink(&target, &append_link).unwrap();
+        symlink(&target, &write_link).unwrap();
+
+        let append_err = open_append_no_follow(&append_link, "test append").unwrap_err();
+        let write_err = write_new_no_follow(&write_link, "test write", "new").unwrap_err();
+
+        assert!(append_err.to_string().contains("symlinked"));
+        assert!(write_err.to_string().contains("symlinked"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncates_tool_results_with_omitted_byte_count() {
+        let original = "a".repeat(80);
+        let truncated = truncate_tool_output(&original, 25);
+
+        assert!(truncated.len() <= 80);
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.contains("55 bytes omitted"));
+    }
+
+    #[test]
+    fn tool_input_preview_handles_multibyte_boundaries() {
+        let input = "é".repeat(400);
+        let preview = tool_input_preview(&input, 501);
+
+        assert!(preview.contains("…[+"));
+        assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn sse_parser_rejects_eof_before_message_stop() {
+        let data = b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n";
+        let err = parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap_err();
+
+        assert!(err.to_string().contains("ended before message_stop"));
+    }
+
+    #[test]
+    fn unique_archive_path_does_not_reuse_existing_archive() {
+        let dir = env::temp_dir().join(format!(
+            "lazar-test-{}-{}",
+            std::process::id(),
+            now_millis()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let first = unique_log_archive_path(&dir);
+        fs::write(&first, "existing").unwrap();
+        let second = unique_log_archive_path(&dir);
+
+        assert_ne!(first, second);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn reset_home_validation_rejects_user_home() {
+        let home = env::var("HOME").unwrap();
+        let err = validate_reset_home(Path::new(&home)).unwrap_err();
+
+        assert!(err.contains("refusing to reset HOME"));
+    }
 }
