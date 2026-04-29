@@ -179,4 +179,3 @@ Writes outside the allowed zones return `Operation not permitted`. The agent see
 - The runner never "knows about" specific capabilities. A new skill becomes available the moment its SKILL.md exists; no recompile, no registration code.
 - Seed skills are baked into the binary so reset is fully self-sufficient — even if `src/` is gone, reset still works.
 - The kernel logs every invocation to `logs/<unix-millis>.json` for replay and debugging.
-- There is no streaming. Add it as a skill (it can wrap `lazar -p` and stream the output) rather than baking it into the kernel.
