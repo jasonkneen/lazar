@@ -1,0 +1,43 @@
+;; lazar sandbox profile
+;; Applied to every bash command spawned by the lazar runner.
+;; Writes are restricted to the agent's writable zones — never bin/ or src/.
+
+(version 1)
+(deny default)
+
+;; process and signal plumbing
+(allow process-fork)
+(allow process-exec)
+(allow signal (target self))
+(allow signal (target children))
+
+;; mach + sysctl + iokit (most CLI tools need these)
+(allow mach-lookup)
+(allow iokit-open)
+(allow sysctl-read)
+(allow ipc-posix-shm*)
+
+;; reads: open. The kernel binary and source are world-readable;
+;; the agent is allowed to study itself. Write restrictions handle
+;; everything that matters.
+(allow file-read*)
+
+;; writes: ONLY the agent's writable zones + tmp.
+;; bin/ and src/ are NOT in this list, so the agent cannot modify
+;; the runner. Every path is passed in via -D from the runner.
+(allow file-write*
+  (subpath (param "SKILLS_PATH"))
+  (subpath (param "MEMORY_PATH"))
+  (subpath (param "WORKSPACE_PATH"))
+  (subpath (param "LOGS_PATH"))
+  (subpath "/private/tmp")
+  (subpath "/private/var/tmp")
+  (subpath "/private/var/folders"))
+
+;; standard fds
+(allow file-write-data (literal "/dev/null"))
+(allow file-write-data (literal "/dev/dtracehelper"))
+(allow file-write-data (literal "/dev/tty"))
+
+;; network: open, for API calls and skills like web-search
+(allow network*)

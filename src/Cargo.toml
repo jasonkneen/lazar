@@ -1,0 +1,17 @@
+[package]
+name = "lazar"
+version = "0.1.0"
+edition = "2021"
+description = "The smallest self-evolving agent harness"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+include_dir = "0.7"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
