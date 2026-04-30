@@ -2,6 +2,11 @@
 
 The smallest self-evolving agent harness.
 
+This is the TUI it built for me -- yours will not be the same as this
+
+<img width="1069" height="772" alt="Screenshot 2026-04-29 at 21 45 31" src="https://github.com/user-attachments/assets/c5ef3807-4601-457f-a92c-116b45425a26" />
+
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 One tool: `execute(command)` — bash, sandboxed.
@@ -195,5 +200,6 @@ Writes outside the allowed zones return `Operation not permitted`. The agent see
 
 - The runner never "knows about" specific capabilities. A new skill becomes available the moment its SKILL.md exists; no recompile, no registration code.
 - Seed skills are baked into the binary so reset is fully self-sufficient — even if `src/` is gone, reset still works.
+- The kernel logs every invocation to `logs/<unix-millis>.json` for replay and debugging.
 - The kernel appends every invocation to `logs/stream.jsonl` for replay and debugging, and auto-rotates that log before it grows past `LAZAR_LOG_MAX_BYTES`.
 - Human output streams text live. `--output-format stream-json` emits structured JSONL events for TUIs and other programmatic consumers.
