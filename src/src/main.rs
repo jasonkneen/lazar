@@ -356,6 +356,9 @@ fn run_bash(cmd: &str) -> String {
         if let Ok(api_key) = env::var("ANTHROPIC_API_KEY") {
             command.env("ANTHROPIC_API_KEY", api_key);
         }
+        if let Ok(base_url) = env::var("ANTHROPIC_BASE_URL") {
+            command.env("ANTHROPIC_BASE_URL", base_url);
+        }
     }
 
     #[cfg(unix)]
@@ -845,6 +848,12 @@ fn run_agent(
             return Err(msg.into());
         }
     };
+    let api_url = {
+        let base = env::var("ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+        let trimmed = base.trim_end_matches('/');
+        format!("{trimmed}/v1/messages")
+    };
     let model = model_override
         .or_else(|| env::var("LAZAR_MODEL").ok())
         .unwrap_or_else(|| DEFAULT_MODEL.into());
@@ -1006,7 +1015,7 @@ fn run_agent(
         });
 
         let resp = match client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&api_url)
             .header("x-api-key", &api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
