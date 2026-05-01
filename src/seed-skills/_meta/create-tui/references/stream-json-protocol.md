@@ -4,7 +4,7 @@ Lazar emits one JSON object per line on stdout when invoked as:
 
     lazar -p "..." --output-format stream-json
 
-Every stdout event has a `type` field and a `ts_ms` field (Unix milliseconds, added by the kernel). The canonical `$LAZAR_HOME/logs/stream.jsonl` file is a separate history schema with `kind` records (`user`, `assistant`, `tool_result`, `invoke_start`, `invoke_end`); do not replay it as stdout stream-json.
+Every event has a `type` field and a `ts_ms` field (Unix milliseconds, added by the kernel). All events are also written to `$LAZAR_HOME/logs/stream.jsonl` for offline replay.
 
 ## Event types
 
@@ -16,7 +16,7 @@ Every stdout event has a `type` field and a `ts_ms` field (Unix milliseconds, ad
 
 Emitted exactly once at the start of the agent run.
 
-- `depth` — recursion depth (0 for top-level; child lazar processes should inherit or be launched with `LAZAR_DEPTH=$((${LAZAR_DEPTH:-0}+1))`). Tool subprocesses do not inherit API keys by default, so nested child API calls require explicit key-inheritance opt-in.
+- `depth` — recursion depth (0 for top-level, increments when lazar calls itself via `lazar -p` from a tool).
 - `model` — the model name in use.
 - `prompt` — the user prompt that started this invocation.
 
@@ -158,7 +158,7 @@ Live incremental markdown rendering (re-rendering as each delta arrives) looks g
 
 ## Recursion (depth > 0)
 
-When lazar calls itself via `lazar -p "..."` from a tool, the child should inherit the parent's tool environment or be launched explicitly as `LAZAR_DEPTH=$((${LAZAR_DEPTH:-0}+1)) lazar -p "..."`; its `invoke_start.depth` should then be one greater than the parent. By default, tool subprocesses do not receive `ANTHROPIC_API_KEY`, so nested child API calls fail early with a structured `error` event unless the operator explicitly enabled key inheritance. If the parent's `tool_result` content is itself JSONL events, the parent's TUI is reading "rendered events" from the child as text — not parsing them as nested events.
+When lazar calls itself via `lazar -p "..."` from a tool, the child process emits its own stream of events with `depth: 1`. If the parent's `tool_result` content is itself JSONL events, the parent's TUI is reading "rendered events" from the child as text — not parsing them as nested events.
 
 Most TUIs ignore this and just show the child's output as opaque tool_result content. That's fine. If you want nested rendering, parse the child JSONL inside the parent's tool_result handler. Almost no one needs this.
 

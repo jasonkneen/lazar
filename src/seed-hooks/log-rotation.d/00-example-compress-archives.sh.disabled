@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# log-rotation example: gzip any .bak archives older than the one that
+# just rotated. Saves disk; archive-search uses zgrep transparently.
+# Activate by removing .disabled and chmod +x.
+
+PAYLOAD=$(cat)
+
+# The just-rotated archive — skip it (we may want to inspect it raw).
+JUST_ROTATED=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"archive":"\([^"]*\)".*/\1/p')
+
+for f in "$LAZAR_LOGS"/stream.jsonl.*.bak; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$JUST_ROTATED" ] && continue
+    [ -f "${f}.gz" ] && continue
+    gzip "$f" 2>/dev/null || true
+done
+
+echo '{"action":"continue"}'

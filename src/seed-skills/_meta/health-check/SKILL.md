@@ -58,25 +58,8 @@ touch "$TESTSRC" 2>/dev/null && { rm -f "$TESTSRC"; fail "src/ is writable — s
 [ -n "$LAZAR_WORKSPACE" ] && pass "LAZAR_WORKSPACE=$LAZAR_WORKSPACE" || fail "LAZAR_WORKSPACE unset"
 [ -n "$LAZAR_LOGS" ]      && pass "LAZAR_LOGS=$LAZAR_LOGS"           || fail "LAZAR_LOGS unset"
 
-# api key exposure policy
-if [ "${LAZAR_TOOL_ENV:-0}" = "1" ]; then
-    case "${LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY:-0}" in
-        1|true|TRUE|yes|YES|on|ON)
-            [ -n "${ANTHROPIC_API_KEY:-}" ] \
-                && pass "ANTHROPIC_API_KEY inherited by explicit opt-in" \
-                || fail "key inheritance enabled but ANTHROPIC_API_KEY not available"
-            ;;
-        *)
-            [ -z "${ANTHROPIC_API_KEY:-}" ] \
-                && pass "ANTHROPIC_API_KEY is not exposed to tool subprocesses" \
-                || fail "ANTHROPIC_API_KEY leaked into tool subprocess env"
-            ;;
-    esac
-else
-    [ -n "${ANTHROPIC_API_KEY:-}" ] \
-        && pass "ANTHROPIC_API_KEY is set in this shell" \
-        || fail "ANTHROPIC_API_KEY not set in this shell"
-fi
+# api key
+[ -n "$ANTHROPIC_API_KEY" ] && pass "ANTHROPIC_API_KEY is set" || fail "ANTHROPIC_API_KEY not set"
 
 # seed skills present in live skills/
 for s in create-skill find-capability shell-handoff load-context log-rotation archive-search distill propose-kernel-patch project-context create-tui health-check; do
@@ -134,44 +117,31 @@ Set a tiny threshold and trigger a rotation by running a small lazar invocation.
 ```bash
 echo "── 4. log auto-rotation ────────────────────────────"
 
-BEFORE_HOME="$HC/rotation-home"
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    skip "live log-rotation probe needs child lazar API access; ANTHROPIC_API_KEY not available in this shell"
+BEFORE=$(ls "$LAZAR_LOGS"/stream.jsonl.*.bak 2>/dev/null | wc -l | tr -d ' ')
+
+# tiny threshold so the next event triggers rotation
+LAZAR_LOG_MAX_BYTES=1 lazar -p "echo health-check-rotation-probe" --output-format text >/dev/null 2>&1
+
+AFTER=$(ls "$LAZAR_LOGS"/stream.jsonl.*.bak 2>/dev/null | wc -l | tr -d ' ')
+if [ "$AFTER" -gt "$BEFORE" ]; then
+    pass "log auto-rotation fired ($BEFORE -> $AFTER archives)"
+    # confirm the kernel wrote a summary too
+    NEWEST=$(ls -t "$LAZAR_HOME/memory/log-summaries/"*.md 2>/dev/null | head -n 1)
+    [ -f "$NEWEST" ] && pass "rotation summary written: $(basename "$NEWEST")" || fail "no log-summary written"
 else
-    mkdir -p "$BEFORE_HOME"/{skills,memory,workspace,logs,bin}
-    cp -R "$LAZAR_SKILLS/." "$BEFORE_HOME/skills/"
-    cp "$LAZAR_HOME/bin/lazar" "$BEFORE_HOME/bin/lazar"
-
-    # tiny threshold so the next event triggers rotation in the temp home only
-    LAZAR_HOME="$BEFORE_HOME" LAZAR_LOG_MAX_BYTES=1 lazar -p "echo health-check-rotation-probe" --output-format text >/dev/null 2>&1
-
-    AFTER=$(ls "$BEFORE_HOME"/logs/stream.jsonl.*.bak 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$AFTER" -gt 0 ]; then
-        pass "log auto-rotation fired in temp home ($AFTER archive(s))"
-        # confirm the kernel wrote a summary too
-        NEWEST=$(ls -t "$BEFORE_HOME/memory/log-summaries/"*.md 2>/dev/null | head -n 1)
-        [ -f "$NEWEST" ] && pass "rotation summary written: $(basename "$NEWEST")" || fail "no log-summary written"
-    else
-        fail "log did not rotate despite tiny threshold"
-    fi
+    fail "log did not rotate despite tiny threshold"
 fi
 ```
 
-## 5. Recursion (optional lazar calling itself)
+## 5. Recursion (lazar calling itself)
 
 ```bash
-echo "── 5. recursion (optional lazar -p inside a tool call) ─"
-case "${LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY:-0}" in
-    1|true|TRUE|yes|YES|on|ON)
-        OUT=$(lazar -p "run this exact command and tell me the result: lazar -p 'echo HEALTH_RECURSION_OK_$$'" --verbose 2>&1 || true)
-        echo "$OUT" | grep -q "HEALTH_RECURSION_OK_$$" \
-            && pass "recursion works (depth>0 invocation succeeded)" \
-            || fail "recursion did not produce expected output"
-        ;;
-    *)
-        skip "recursion disabled by default secret isolation; set LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1 to test it"
-        ;;
-esac
+echo "── 5. recursion (lazar -p inside a tool call) ──────"
+
+OUT=$(lazar -p "run this exact command and tell me the result: lazar -p 'echo HEALTH_RECURSION_OK_$$'" --verbose 2>&1 || true)
+echo "$OUT" | grep -q "HEALTH_RECURSION_OK_$$" \
+    && pass "recursion works (depth>0 invocation succeeded)" \
+    || fail "recursion did not produce expected output"
 ```
 
 ## 6. Empty-command safeguard
@@ -267,7 +237,7 @@ fi
 
 - **Run only inside `workspace/`.** All temp state goes under `workspace/.health-check-<ts>/`. Never write to `skills/`, `memory/`, `bin/`, `src/`, or `~/`.
 - **Clean up.** Remove the temp dir on success AND on failure. Don't leave health-check probes scattered.
-- **Don't run on every prompt.** Once after install, then on demand. Live lazar probes make real API calls when `ANTHROPIC_API_KEY` is available.
+- **Don't run on every prompt.** Once after install, then on demand. The recursion test alone makes a real API call.
 - **Skip gracefully.** If python3 or npx aren't installed, mark SKIP not FAIL — toolchain absence isn't a kernel bug.
 
 ## Anti-patterns

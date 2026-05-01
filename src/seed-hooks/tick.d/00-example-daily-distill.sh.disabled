@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# tick example: run distill once a day, even if the user hasn't ended a
+# session. Wire `lazar --tick` to launchd / cron (see hooks/README.md);
+# this hook decides whether it's its turn each tick.
+# Activate by removing .disabled and chmod +x.
+
+LAST="$LAZAR_MEMORY/.heartbeat-distill"
+INTERVAL=86400  # 24h in seconds
+
+NOW=$(date +%s)
+if [ -f "$LAST" ]; then
+    if command -v stat >/dev/null 2>&1; then
+        # macOS: stat -f%m, Linux: stat -c%Y
+        LAST_TS=$(stat -f%m "$LAST" 2>/dev/null || stat -c%Y "$LAST" 2>/dev/null || echo 0)
+    else
+        LAST_TS=0
+    fi
+    AGE=$((NOW - LAST_TS))
+    if [ "$AGE" -lt "$INTERVAL" ]; then
+        # Not yet — skip silently.
+        echo '{"action":"continue"}'
+        exit 0
+    fi
+fi
+
+# It's time. Find the newest rotated archive that hasn't been distilled.
+NEWEST_BAK=$(ls -t "$LAZAR_LOGS"/stream.jsonl.*.bak 2>/dev/null | head -n 1)
+if [ -z "$NEWEST_BAK" ]; then
+    touch "$LAST"
+    echo '{"action":"continue"}'
+    exit 0
+fi
+
+ARCHIVE_NAME=$(basename "$NEWEST_BAK" .bak | sed 's/^stream\.jsonl\.//')
+DISTILLED="$LAZAR_MEMORY/distilled/${ARCHIVE_NAME}.md"
+mkdir -p "$LAZAR_MEMORY/distilled"
+
+if [ ! -f "$DISTILLED" ]; then
+    DISTILL_LOG="$LAZAR_WORKSPACE/.tick-distill-$(date +%s).log"
+    nohup bash -c "lazar -p 'use the _meta/distill skill against $NEWEST_BAK and write the distilled summary to $DISTILLED'" \
+        >"$DISTILL_LOG" 2>&1 &
+    disown 2>/dev/null || true
+fi
+
+touch "$LAST"
+echo '{"action":"continue"}'

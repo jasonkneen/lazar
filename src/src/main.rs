@@ -21,6 +21,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
 
+mod hooks;
+use hooks::HookEvent;
+
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
     /// Human-readable: streams assistant text to stdout, tool calls silent.
@@ -40,7 +43,8 @@ enum InputFormat {
 }
 
 static SEED_SKILLS: Dir = include_dir!("$CARGO_MANIFEST_DIR/seed-skills");
-static SANDBOX_PROFILE: &str = include_str!("../sandbox.sb");
+static SEED_HOOKS: Dir = include_dir!("$CARGO_MANIFEST_DIR/seed-hooks");
+pub(crate) static SANDBOX_PROFILE: &str = include_str!("../sandbox.sb");
 
 const MAX_DEPTH: u32 = 5;
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
@@ -56,9 +60,9 @@ struct ToolLimits {
 }
 
 #[derive(Debug)]
-struct CapturedOutput {
-    bytes: Vec<u8>,
-    total_bytes: usize,
+pub(crate) struct CapturedOutput {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) total_bytes: usize,
 }
 
 impl CapturedOutput {
@@ -87,7 +91,7 @@ impl ToolLimits {
     }
 }
 
-fn now_millis() -> u128 {
+pub(crate) fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -204,9 +208,15 @@ struct Args {
     /// Input format: 'text' (default; prompt from -p) or 'stream-json' (reserved; treated as text).
     #[arg(long, value_enum, default_value_t = InputFormat::Text)]
     input_format: InputFormat,
+
+    /// Heartbeat: fire all hooks under hooks/tick.d/ and exit. No model call.
+    /// Wire this to launchd / cron for scheduled work (memory consolidation,
+    /// log compression, etc).
+    #[arg(long, conflicts_with_all = ["prompt", "reset_all"])]
+    tick: bool,
 }
 
-fn lazar_home() -> PathBuf {
+pub(crate) fn lazar_home() -> PathBuf {
     // Allow override via LAZAR_HOME for non-default install locations.
     if let Ok(p) = env::var("LAZAR_HOME") {
         if !p.is_empty() {
@@ -223,7 +233,7 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     if !skip_confirm {
         eprint!(
-            "Wipe skills/, memory/, workspace/, logs/ in {} and reseed?\n[y/N] ",
+            "Wipe skills/, hooks/, memory/, workspace/, logs/ in {} and reseed?\n[y/N] ",
             home.display()
         );
         let mut buf = String::new();
@@ -234,7 +244,7 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    for sub in ["skills", "memory", "workspace", "logs"] {
+    for sub in ["skills", "hooks", "memory", "workspace", "logs"] {
         let p = home.join(sub);
         if p.exists() {
             fs::remove_dir_all(&p)?;
@@ -243,14 +253,40 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     SEED_SKILLS.extract(home.join("skills"))?;
+    SEED_HOOKS.extract(home.join("hooks"))?;
     eprintln!(
-        "[lazar] reset complete. {} seed files written.",
-        SEED_SKILLS.files().count()
+        "[lazar] reset complete. {} skill files + {} hook files written.",
+        SEED_SKILLS.files().count(),
+        SEED_HOOKS.files().count()
     );
     Ok(())
 }
 
-fn read_capped<R>(mut reader: R, cap: usize) -> thread::JoinHandle<CapturedOutput>
+/// First-run safety: if `~/lazar/hooks/` doesn't exist (e.g. user upgraded
+/// from a pre-hooks version without re-running --reset-all), seed the
+/// directory in place. Skills are NOT touched — only the missing tree.
+fn ensure_hooks_seeded() {
+    let home = lazar_home();
+    let hooks = home.join("hooks");
+    if hooks.exists() {
+        return;
+    }
+    if let Err(e) = fs::create_dir_all(&hooks) {
+        eprintln!("[lazar] WARN: could not create {}: {e}", hooks.display());
+        return;
+    }
+    if let Err(e) = SEED_HOOKS.extract(&hooks) {
+        eprintln!("[lazar] WARN: could not seed hooks tree at {}: {e}", hooks.display());
+        return;
+    }
+    eprintln!(
+        "[lazar] seeded {} into {} (first-run, was missing)",
+        SEED_HOOKS.files().count(),
+        hooks.display()
+    );
+}
+
+pub(crate) fn read_capped<R>(mut reader: R, cap: usize) -> thread::JoinHandle<CapturedOutput>
 where
     R: Read + Send + 'static,
 {
@@ -281,14 +317,14 @@ where
 }
 
 #[cfg(unix)]
-fn kill_process_group(pid: u32) {
+pub(crate) fn kill_process_group(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
 #[cfg(not(unix))]
-fn kill_process_group(_pid: u32) {}
+pub(crate) fn kill_process_group(_pid: u32) {}
 
 fn run_bash(cmd: &str) -> String {
     let limits = ToolLimits::from_env();
@@ -559,7 +595,17 @@ fn write_new_no_follow(path: &Path, label: &str, contents: &str) -> std::io::Res
 /// can layer richer summaries on top, but this floor is non-negotiable —
 /// without it the log grows unbounded and any context-loading attempt
 /// blows the API limit.
-fn maybe_rotate_log(logs: &Path, path: &Path) {
+/// Result of a successful log rotation. Returned to the caller so it can
+/// fire the `log-rotation` hook AFTER releasing the stream lock — firing
+/// inside the lock would deadlock because hooks themselves write hook_start
+/// / hook_end events through append_stream.
+struct RotationInfo {
+    archive: PathBuf,
+    size_bytes: u64,
+    summary: Option<PathBuf>,
+}
+
+fn maybe_rotate_log(logs: &Path, path: &Path) -> Option<RotationInfo> {
     let max_bytes: u64 = env::var("LAZAR_LOG_MAX_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -567,22 +613,22 @@ fn maybe_rotate_log(logs: &Path, path: &Path) {
 
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
-        Err(_) => return, // file doesn't exist yet — nothing to rotate
+        Err(_) => return None, // file doesn't exist yet — nothing to rotate
     };
     if meta.file_type().is_symlink() {
         eprintln!("[lazar] WARN: refusing to rotate symlinked stream.jsonl");
-        return;
+        return None;
     }
 
     let size = meta.len();
     if size < max_bytes {
-        return;
+        return None;
     }
 
     let archive = unique_log_archive_path(logs);
     if fs::rename(path, &archive).is_err() {
         eprintln!("[lazar] WARN: log rotation rename failed; log will keep growing");
-        return;
+        return None;
     }
     eprintln!(
         "[lazar] auto-rotated stream.jsonl → {} ({size} bytes)",
@@ -600,39 +646,46 @@ fn maybe_rotate_log(logs: &Path, path: &Path) {
         .unwrap_or_else(|| Path::new("."))
         .join("memory");
     let memory = memory_root.join("log-summaries");
+    let mut summary_path: Option<PathBuf> = None;
     if let Err(e) = ensure_dir_not_symlink(&memory_root, "memory directory") {
         eprintln!("[lazar] WARN: not writing rotation summary: {e}");
-        return;
-    }
-    if let Err(e) = ensure_dir_not_symlink(&memory, "log-summaries directory") {
+    } else if let Err(e) = ensure_dir_not_symlink(&memory, "log-summaries directory") {
         eprintln!("[lazar] WARN: not writing rotation summary: {e}");
-        return;
+    } else {
+        let summary_name = archive
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("stream.jsonl.unknown.bak")
+            .trim_start_matches("stream.jsonl.")
+            .trim_end_matches(".bak")
+            .to_string();
+        let sum_path = memory.join(format!("{summary_name}.md"));
+        let header = format!(
+            "# log-summary {summary_name}\n\
+             \n\
+             archive: {}\n\
+             size_bytes: {size}\n\
+             rotated_at_unix_ms: {}\n\
+             \n\
+             _Auto-rotated by the lazar kernel when stream.jsonl exceeded \
+             LAZAR_LOG_MAX_BYTES. For richer per-archive summaries (top user prompts, \
+             top tool commands), run the `_meta/log-rotation` skill against this archive. \
+             For LLM-extracted learnings, run `_meta/distill`._\n",
+            archive.display(),
+            now_millis()
+        );
+        if let Err(e) = write_new_no_follow(&sum_path, "rotation summary", &header) {
+            eprintln!("[lazar] WARN: failed to write rotation summary: {e}");
+        } else {
+            summary_path = Some(sum_path);
+        }
     }
-    let summary_name = archive
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("stream.jsonl.unknown.bak")
-        .trim_start_matches("stream.jsonl.")
-        .trim_end_matches(".bak")
-        .to_string();
-    let sum_path = memory.join(format!("{summary_name}.md"));
-    let header = format!(
-        "# log-summary {summary_name}\n\
-         \n\
-         archive: {}\n\
-         size_bytes: {size}\n\
-         rotated_at_unix_ms: {}\n\
-         \n\
-         _Auto-rotated by the lazar kernel when stream.jsonl exceeded \
-         LAZAR_LOG_MAX_BYTES. For richer per-archive summaries (top user prompts, \
-         top tool commands), run the `_meta/log-rotation` skill against this archive. \
-         For LLM-extracted learnings, run `_meta/distill`._\n",
-        archive.display(),
-        now_millis()
-    );
-    if let Err(e) = write_new_no_follow(&sum_path, "rotation summary", &header) {
-        eprintln!("[lazar] WARN: failed to write rotation summary: {e}");
-    }
+
+    Some(RotationInfo {
+        archive,
+        size_bytes: size,
+        summary: summary_path,
+    })
 }
 
 /// Append a single JSON event to the canonical stream at logs/stream.jsonl.
@@ -641,30 +694,53 @@ fn maybe_rotate_log(logs: &Path, path: &Path) {
 /// prompt, response, tool call, and result across all invocations.
 ///
 /// Auto-rotates when the log exceeds LAZAR_LOG_MAX_BYTES.
-fn append_stream(mut event: Value) {
+pub(crate) fn append_stream(mut event: Value) {
     let logs = lazar_home().join("logs");
     let _ = fs::create_dir_all(&logs);
     let path = logs.join("stream.jsonl");
     let lock_path = logs.join(".stream.lock");
 
-    let lock = open_append_no_follow(&lock_path, "stream lock").ok();
-    if let Some(lock) = lock.as_ref() {
-        lock_file_exclusive(lock);
-    }
-
-    // Safety floor: rotate before appending if oversized. Without this,
-    // the agent's own load-context calls eventually blow the API limit.
-    maybe_rotate_log(&logs, &path);
-
-    if let Some(obj) = event.as_object_mut() {
-        obj.insert("ts_ms".into(), json!(now_millis()));
-    }
-
-    match open_append_no_follow(&path, "stream log") {
-        Ok(mut f) => {
-            let _ = writeln!(f, "{}", event);
+    // Capture rotation info from inside the lock so we can fire the
+    // log-rotation hook AFTER the lock is released — firing it inside
+    // would deadlock because hooks emit hook_start/hook_end events back
+    // through this same function.
+    let rotation_info = {
+        let lock = open_append_no_follow(&lock_path, "stream lock").ok();
+        if let Some(lock) = lock.as_ref() {
+            lock_file_exclusive(lock);
         }
-        Err(e) => eprintln!("[lazar] WARN: failed to append stream log: {e}"),
+
+        // Safety floor: rotate before appending if oversized. Without this,
+        // the agent's own load-context calls eventually blow the API limit.
+        let info = maybe_rotate_log(&logs, &path);
+
+        if let Some(obj) = event.as_object_mut() {
+            obj.insert("ts_ms".into(), json!(now_millis()));
+        }
+
+        match open_append_no_follow(&path, "stream log") {
+            Ok(mut f) => {
+                let _ = writeln!(f, "{}", event);
+            }
+            Err(e) => eprintln!("[lazar] WARN: failed to append stream log: {e}"),
+        }
+        info
+        // lock dropped here
+    };
+
+    if let Some(info) = rotation_info {
+        // Hook fires post-lock so it can write its own hook_start/hook_end
+        // events without deadlocking. The new stream.jsonl is now empty,
+        // so a hook calling load-context won't see the old data — but the
+        // archive path is in the payload.
+        hooks::fire(
+            HookEvent::LogRotation,
+            json!({
+                "archive": info.archive,
+                "size_bytes": info.size_bytes,
+                "summary": info.summary,
+            }),
+        );
     }
 }
 
@@ -833,6 +909,58 @@ fn parse_sse_reader<R: BufRead>(
     Ok((json!(content), stop_reason))
 }
 
+/// RAII guard that fires the `session-end` hook on drop. Defaults to
+/// `status: "error"` so any early return (panic, ?, explicit Err) reports
+/// as an error session. The success path calls `mark_ok()` before returning.
+struct SessionEndGuard {
+    depth: u32,
+    base_payload: Value,
+    status: std::cell::Cell<&'static str>,
+    error: std::cell::RefCell<Option<String>>,
+    fired: std::cell::Cell<bool>,
+}
+
+impl SessionEndGuard {
+    fn new(depth: u32, base_payload: Value) -> Self {
+        Self {
+            depth,
+            base_payload,
+            status: std::cell::Cell::new("error"),
+            error: std::cell::RefCell::new(None),
+            fired: std::cell::Cell::new(false),
+        }
+    }
+    fn mark_ok(&self) {
+        self.status.set("ok");
+    }
+    fn mark_error(&self, err: impl Into<String>) {
+        self.status.set("error");
+        *self.error.borrow_mut() = Some(err.into());
+    }
+}
+
+impl Drop for SessionEndGuard {
+    fn drop(&mut self) {
+        if self.fired.get() {
+            return;
+        }
+        self.fired.set(true);
+        // Only top-level invocations fire session-end. Nested lazar calls
+        // are tools, not sessions.
+        if self.depth != 0 {
+            return;
+        }
+        let mut payload = self.base_payload.clone();
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("status".into(), json!(self.status.get()));
+            if let Some(err) = self.error.borrow().as_ref() {
+                obj.insert("error".into(), json!(err));
+            }
+        }
+        hooks::fire(HookEvent::SessionEnd, payload);
+    }
+}
+
 fn run_agent(
     prompt: &str,
     format: OutputFormat,
@@ -868,6 +996,49 @@ fn run_agent(
         return Err(msg.into());
     }
 
+    // session-end fires on every exit path via Drop. Top-level only.
+    let session_guard = SessionEndGuard::new(
+        depth,
+        json!({
+            "depth": depth,
+            "model": &model,
+            "prompt": prompt,
+        }),
+    );
+
+    // session-start and user-prompt: top-level only. Nested lazar calls
+    // (depth > 0) act like tools, not new sessions.
+    let mut injected_context = String::new();
+    if depth == 0 {
+        let start_results = hooks::fire(
+            HookEvent::SessionStart,
+            json!({
+                "depth": depth,
+                "model": &model,
+                "prompt": prompt,
+            }),
+        );
+        let start_ctx = hooks::join_injected_contexts(&start_results);
+        if !start_ctx.is_empty() {
+            injected_context.push_str(&start_ctx);
+        }
+
+        let prompt_results = hooks::fire(
+            HookEvent::UserPrompt,
+            json!({
+                "depth": depth,
+                "prompt": prompt,
+            }),
+        );
+        let prompt_ctx = hooks::join_injected_contexts(&prompt_results);
+        if !prompt_ctx.is_empty() {
+            if !injected_context.is_empty() {
+                injected_context.push_str("\n\n");
+            }
+            injected_context.push_str(&prompt_ctx);
+        }
+    }
+
     let home = lazar_home();
     let skills = home.join("skills");
 
@@ -882,6 +1053,11 @@ fn run_agent(
          - bin/   and src/   are READ-ONLY (the immutable kernel). You may \
          `cat` them to study yourself; writes are blocked by the OS.\n\
          - skills/  your \"being\" — capabilities you can read and grow.\n\
+         - hooks/   user-controlled lifecycle scripts. The kernel fires them \
+         at session-start, user-prompt, pre-tool, post-tool, session-end, \
+         log-rotation, agent-stop, and tick. Drop scripts into hooks/<event>.d/. \
+         You may read these but do not modify hooks the user installed without \
+         being asked. See hooks/README.md for the protocol.\n\
          - memory/  durable notes (managed via the memory skill).\n\
          - workspace/  scratchpad and your cwd (write freely).\n\
          - logs/stream.jsonl  the canonical event stream (see CONTEXT).\n\
@@ -950,6 +1126,16 @@ fn run_agent(
         max_depth = MAX_DEPTH,
         depth = depth
     );
+
+    // Append hook-injected runtime context to the system prompt. Hooks that
+    // return {"action":"inject","context":"..."} on session-start or
+    // user-prompt land here — used for things like project-context, ambient
+    // facts about the user's environment, etc.
+    let system = if injected_context.is_empty() {
+        system
+    } else {
+        format!("{system}\n\nRUNTIME CONTEXT (from hooks)\n{injected_context}")
+    };
 
     let tool = json!({
         "name": "execute",
@@ -1027,6 +1213,7 @@ fn run_agent(
                 let msg = format!("API request failed: {e}");
                 emit_stream_error(format, &msg);
                 append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
+                session_guard.mark_error(&msg);
                 return Err(msg.into());
             }
         };
@@ -1043,6 +1230,7 @@ fn run_agent(
                 eprintln!("[lazar] {msg}");
             }
             append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
+            session_guard.mark_error(&msg);
             return Err(msg.into());
         }
 
@@ -1052,6 +1240,7 @@ fn run_agent(
                 let msg = e.to_string();
                 emit_stream_error(format, &msg);
                 append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
+                session_guard.mark_error(&msg);
                 return Err(msg.into());
             }
         };
@@ -1064,6 +1253,18 @@ fn run_agent(
             // text was already streamed live in parse_sse_stream (Text mode)
             append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason}));
             let duration_ms = started.elapsed().as_millis();
+
+            // agent-stop: top-level only.
+            if depth == 0 {
+                hooks::fire(
+                    HookEvent::AgentStop,
+                    json!({
+                        "depth": depth,
+                        "stop_reason": stop_reason,
+                        "duration_ms": duration_ms,
+                    }),
+                );
+            }
 
             if format == OutputFormat::StreamJson {
                 emit_event(json!({
@@ -1101,6 +1302,7 @@ fn run_agent(
             if verbose {
                 eprintln!("[lazar] invoke_end stop_reason={stop_reason} duration={duration_ms}ms");
             }
+            session_guard.mark_ok();
             return Ok(());
         }
 
@@ -1129,7 +1331,49 @@ fn run_agent(
                         let preview: String = cmd.chars().take(120).collect();
                         eprintln!("[lazar] tool_use: {preview}");
                     }
-                    run_bash(cmd)
+
+                    // pre-tool hook: veto blocks the call, transform rewrites it.
+                    let pre = hooks::fire(
+                        HookEvent::PreTool,
+                        json!({
+                            "depth": depth,
+                            "tool_use_id": b["id"],
+                            "command": cmd_raw,
+                        }),
+                    );
+                    if let Some(reason) = hooks::first_veto(&pre) {
+                        if verbose {
+                            eprintln!("[lazar] pre-tool veto: {reason}");
+                        }
+                        format!(
+                            "[vetoed by hook: {reason}]\n[exit 1]\n\
+                             [note: A pre-tool hook blocked this command. Adjust your approach \
+                             or escalate to the user; do not retry the same command.]"
+                        )
+                    } else {
+                        let effective_cmd = hooks::last_transform_command(&pre)
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| cmd.to_string());
+                        if verbose && effective_cmd != cmd {
+                            eprintln!("[lazar] pre-tool rewrote command");
+                        }
+                        let raw_output = run_bash(&effective_cmd);
+
+                        // post-tool hook: transform rewrites the output before
+                        // it goes back to the model.
+                        let post = hooks::fire(
+                            HookEvent::PostTool,
+                            json!({
+                                "depth": depth,
+                                "tool_use_id": b["id"],
+                                "command": &effective_cmd,
+                                "output": &raw_output,
+                            }),
+                        );
+                        hooks::last_transform_output(&post)
+                            .map(|s| s.to_string())
+                            .unwrap_or(raw_output)
+                    }
                 };
 
                 let result_event = json!({
@@ -1174,6 +1418,7 @@ fn run_agent(
                 if format == OutputFormat::StreamJson {
                     emit_event(json!({"type": "error", "message": &msg}));
                 }
+                session_guard.mark_error(&msg);
                 return Err(msg.into());
             }
         } else if had_any_valid_call {
@@ -1186,6 +1431,16 @@ fn run_agent(
             append_stream(
                 json!({"kind": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}),
             );
+            if depth == 0 {
+                hooks::fire(
+                    HookEvent::AgentStop,
+                    json!({
+                        "depth": depth,
+                        "stop_reason": stop_reason,
+                        "note": "no tool calls",
+                    }),
+                );
+            }
             if format == OutputFormat::StreamJson {
                 emit_event(
                     json!({"type": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}),
@@ -1203,11 +1458,44 @@ fn run_agent(
                     })
                 );
             }
+            session_guard.mark_ok();
             return Ok(());
         }
 
         messages.push(json!({"role": "user", "content": results}));
     }
+}
+
+/// Heartbeat path: fire all hooks under hooks/tick.d/ and exit.
+/// No model call, no agent loop. Wire this to launchd/cron for scheduled
+/// background work like memory consolidation, log compression, etc.
+fn run_tick(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let started = std::time::Instant::now();
+    append_stream(json!({"kind": "tick_start"}));
+    if verbose {
+        eprintln!("[lazar] tick_start");
+    }
+
+    let results = hooks::fire(
+        HookEvent::Tick,
+        json!({
+            "ts_ms": now_millis(),
+        }),
+    );
+
+    let duration_ms = started.elapsed().as_millis();
+    append_stream(json!({
+        "kind": "tick_end",
+        "hooks_fired": results.len(),
+        "duration_ms": duration_ms,
+    }));
+    if verbose {
+        eprintln!(
+            "[lazar] tick_end hooks_fired={} duration={duration_ms}ms",
+            results.len()
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1217,9 +1505,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return reset_all(args.yes);
     }
 
+    // Make sure hooks/ exists for any path that fires hooks. First-run
+    // installs that predate this kernel won't have the directory yet.
+    ensure_hooks_seeded();
+
+    if args.tick {
+        return run_tick(args.verbose);
+    }
+
     let prompt = args
         .prompt
-        .ok_or("must pass -p <prompt> or --reset-all (see --help)")?;
+        .ok_or("must pass -p <prompt>, --tick, or --reset-all (see --help)")?;
 
     // input_format is reserved for now; both values currently consume the prompt as text.
     let _ = args.input_format;

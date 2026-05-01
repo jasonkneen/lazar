@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# pre-tool example: hard-deny obvious self-destructive commands.
+# Activate by removing the .disabled suffix and chmod +x.
+
+# Read the JSON payload off stdin.
+PAYLOAD=$(cat)
+
+# Cheap field extraction (no jq required, but jq is available).
+COMMAND=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
+
+# Deny anything that looks like rm -rf / or rm -rf $HOME
+if printf '%s' "$COMMAND" | grep -Eq 'rm[[:space:]]+-rf?[[:space:]]+/(\s|$)|rm[[:space:]]+-rf?[[:space:]]+\$?HOME|rm[[:space:]]+-rf?[[:space:]]+~/?(\s|$)'; then
+    cat <<'EOF'
+{"action":"veto","reason":"command appears to delete the system root or home directory; refused by pre-tool hook"}
+EOF
+    exit 0
+fi
+
+# Deny piping curl|bash from arbitrary URLs.
+if printf '%s' "$COMMAND" | grep -Eq 'curl[^|]*\|[[:space:]]*(bash|sh|zsh)'; then
+    cat <<'EOF'
+{"action":"veto","reason":"refusing to pipe network input to a shell; download, inspect, then run"}
+EOF
+    exit 0
+fi
+
+# Default: continue.
+echo '{"action":"continue"}'

@@ -13,14 +13,14 @@ You and the user should be able to `cat` it and understand instantly.
 
 ## How to use
 
-### Read bounded memory at the start of a task
+### Read all memory at the start of a task
 
-    cat "$LAZAR_HOME"/memory/*.md 2>/dev/null | head -c 50000 || echo "(no memory yet)"
+    cat $LAZAR_HOME/memory/*.md 2>/dev/null || echo "(no memory yet)"
 
 ### Append a timestamped note
 
-    mkdir -p "$LAZAR_HOME/memory"
-    cat >> "$LAZAR_HOME/memory/notes.md" <<EOF
+    mkdir -p $LAZAR_HOME/memory
+    cat >> $LAZAR_HOME/memory/notes.md <<EOF
 
     ## $(date -u +%Y-%m-%dT%H:%M:%SZ)
     <the note in one or two sentences>

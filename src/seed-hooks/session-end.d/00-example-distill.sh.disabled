@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# session-end example: trigger memory consolidation if a rotated archive
+# exists that hasn't been distilled yet. This is fire-and-forget — the
+# session is already over, so we nohup + background.
+# Activate by removing .disabled and chmod +x.
+
+PAYLOAD=$(cat)
+
+# Only act on healthy sessions; skip if the session errored.
+STATUS=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+if [ "$STATUS" != "ok" ]; then
+    echo '{"action":"continue"}'
+    exit 0
+fi
+
+# Look for the most recent rotated archive that doesn't yet have a
+# distilled summary in memory/distilled/.
+NEWEST_BAK=$(ls -t "$LAZAR_LOGS"/stream.jsonl.*.bak 2>/dev/null | head -n 1)
+if [ -z "$NEWEST_BAK" ]; then
+    echo '{"action":"continue"}'
+    exit 0
+fi
+
+ARCHIVE_NAME=$(basename "$NEWEST_BAK" .bak | sed 's/^stream\.jsonl\.//')
+DISTILLED="$LAZAR_MEMORY/distilled/${ARCHIVE_NAME}.md"
+mkdir -p "$LAZAR_MEMORY/distilled"
+
+if [ -f "$DISTILLED" ]; then
+    echo '{"action":"continue"}'
+    exit 0
+fi
+
+# Fire the distill skill in the background. nohup so the parent
+# (already exiting) doesn't wait. Output goes to a logfile.
+DISTILL_LOG="$LAZAR_WORKSPACE/.distill-$(date +%s).log"
+nohup bash -c "lazar -p 'use the _meta/distill skill against $NEWEST_BAK and write the distilled summary to $DISTILLED'" \
+    >"$DISTILL_LOG" 2>&1 &
+disown 2>/dev/null || true
+
+echo '{"action":"continue"}'

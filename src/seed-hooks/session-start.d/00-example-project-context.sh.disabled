@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# session-start example: if the user's cwd has a PROJECT.md, inject it
+# as runtime context so the agent doesn't have to discover it.
+# Activate by removing .disabled and chmod +x.
+
+# Note: hooks run with cwd set to $LAZAR_WORKSPACE, NOT the user's cwd.
+# To detect "the user's project", read PWD from the parent process or
+# watch a file the shell-handoff skill writes. This example just looks
+# at $LAZAR_WORKSPACE for a PROJECT.md the agent staged earlier.
+
+PROJECT_FILE="$LAZAR_WORKSPACE/PROJECT.md"
+
+if [ ! -f "$PROJECT_FILE" ]; then
+    echo '{"action":"continue"}'
+    exit 0
+fi
+
+# Cap the injected context at 4KB to avoid bloating the system prompt.
+CONTEXT=$(head -c 4096 "$PROJECT_FILE")
+
+# JSON-escape the context. Python is the easiest cross-platform tool;
+# fall back to a sed-based escape if python3 is unavailable.
+if command -v python3 >/dev/null 2>&1; then
+    ESCAPED=$(printf '%s' "$CONTEXT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+    printf '{"action":"inject","context":%s}\n' "$ESCAPED"
+else
+    # Best-effort fallback (escapes ", \, and newlines only).
+    ESCAPED=$(printf '%s' "$CONTEXT" | sed 's/\\/\\\\/g; s/"/\\"/g' | awk 'BEGIN{ORS="\\n"}1')
+    printf '{"action":"inject","context":"%s"}\n' "$ESCAPED"
+fi

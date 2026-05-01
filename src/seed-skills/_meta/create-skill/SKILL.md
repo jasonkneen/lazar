@@ -46,7 +46,7 @@ When you need a capability that isn't in INDEX.md, author a new skill.
 ## Principles
 
 - Skills should be small. If a skill does two things, split it.
-- Prefer composition: existing skills + bash. Use `lazar -p` recursion only when child API calls are explicitly enabled (`LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1`) or when running from a shell that already has the API key.
+- Prefer composition: existing skills + bash + `lazar -p` recursion.
 - Bash-first. If the recipe can't be expressed in bash, the skill is too big.
 - Document the failure modes you hit while designing it. Future-you will thank you.
 - Skills go in `$LAZAR_HOME/skills/`. Never write outside that tree to extend your capabilities.
