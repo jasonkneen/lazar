@@ -310,18 +310,23 @@ fn run_hook(
         }
     };
 
-    // Write payload to stdin, then close to signal EOF.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload_str.as_bytes());
-        // drop closes the pipe
-    }
+    // Start output readers before writing stdin. A hook may ignore stdin;
+    // writing a large payload synchronously would otherwise block before the
+    // timeout loop ever starts.
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|out| crate::read_capped(out, HOOK_STDOUT_CAP_BYTES));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|err| crate::read_capped(err, HOOK_STDERR_CAP_BYTES));
 
-    // Wait with timeout, capping captured output.
-    let stdout_handle = child.stdout.take().map(|out| {
-        crate::read_capped(out, HOOK_STDOUT_CAP_BYTES)
-    });
-    let stderr_handle = child.stderr.take().map(|err| {
-        crate::read_capped(err, HOOK_STDERR_CAP_BYTES)
+    let stdin_handle = child.stdin.take().map(|mut stdin| {
+        let payload = payload_str.as_bytes().to_vec();
+        thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+        })
     });
 
     let mut timed_out = false;
@@ -343,6 +348,10 @@ fn run_hook(
             }
         }
     };
+
+    if let Some(handle) = stdin_handle {
+        let _ = handle.join();
+    }
 
     let stdout_bytes = stdout_handle
         .and_then(|h| h.join().ok())

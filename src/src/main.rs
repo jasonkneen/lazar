@@ -22,6 +22,7 @@ use std::{
 use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
 
 mod hooks;
+mod session;
 use hooks::HookEvent;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +52,8 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 200_000;
+const DEFAULT_MAX_AGENT_TURNS: u32 = 50;
+const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
 const TOOL_READ_CHUNK_BYTES: usize = 8192;
 
 #[derive(Clone, Copy, Debug)]
@@ -214,6 +217,23 @@ struct Args {
     /// log compression, etc).
     #[arg(long, conflicts_with_all = ["prompt", "reset_all"])]
     tick: bool,
+
+    /// Session id for multi-turn conversation continuity. When set, prior
+    /// turns from logs/sessions/<id>.jsonl are prepended to the message
+    /// array, and new events are appended to that log. Same flag both
+    /// creates the log on first turn and continues it on subsequent turns.
+    /// Allowed chars: a-z A-Z 0-9 - _ . (max 64 chars, no path traversal).
+    #[arg(long, conflicts_with = "resume")]
+    session: Option<String>,
+
+    /// Resume the most recently modified session log automatically.
+    /// Equivalent to `--session <newest>`. Useful for referential
+    /// prompts ("ok do that", "yes", "fine") when you don't remember
+    /// the session id. The agent can also use this on a nested
+    /// `execute lazar --resume -p "..."` call to disambiguate a
+    /// referential prompt against full prior context.
+    #[arg(long)]
+    resume: bool,
 }
 
 pub(crate) fn lazar_home() -> PathBuf {
@@ -724,6 +744,27 @@ pub(crate) fn append_stream(mut event: Value) {
             }
             Err(e) => eprintln!("[lazar] WARN: failed to append stream log: {e}"),
         }
+
+        // If a session id is set for this invocation, mirror the event
+        // into the session log so multi-turn continuity works on the
+        // next invocation. Skipped for hook_start/hook_end and rotation
+        // bookkeeping events — those are kernel-internal and don't need
+        // to be in the session-level history.
+        if let Ok(session_id) = env::var("LAZAR_SESSION_ID") {
+            if !session_id.is_empty() {
+                let kind = event
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let mirror = matches!(
+                    kind,
+                    "user" | "assistant" | "tool_result" | "invoke_start" | "invoke_end"
+                );
+                if mirror {
+                    session::append_session(&session_id, event.clone());
+                }
+            }
+        }
         info
         // lock dropped here
     };
@@ -996,6 +1037,8 @@ fn run_agent(
         return Err(msg.into());
     }
 
+    let session_id_for_payload = env::var("LAZAR_SESSION_ID").ok().filter(|s| !s.is_empty());
+
     // session-end fires on every exit path via Drop. Top-level only.
     let session_guard = SessionEndGuard::new(
         depth,
@@ -1003,6 +1046,7 @@ fn run_agent(
             "depth": depth,
             "model": &model,
             "prompt": prompt,
+            "session_id": session_id_for_payload,
         }),
     );
 
@@ -1016,6 +1060,7 @@ fn run_agent(
                 "depth": depth,
                 "model": &model,
                 "prompt": prompt,
+                "session_id": &session_id_for_payload,
             }),
         );
         let start_ctx = hooks::join_injected_contexts(&start_results);
@@ -1067,8 +1112,39 @@ fn run_agent(
          {skills_disp}/<name>/ and append a one-line entry to {skills_disp}/INDEX.md.\n\
          \n\
          CONTEXT (this is important)\n\
-         Each `lazar -p` invocation starts with NO prior messages. Your \
-         conversational context is just this prompt and the system prompt.\n\
+         By default, each `lazar -p` invocation starts with NO prior messages \
+         — your conversational context is just this prompt and the system prompt.\n\
+         \n\
+         EXCEPTION: if the operator passed --session <id> or --resume, prior \
+         turns from a session log have been prepended to your message array. \
+         You CAN see what was said before in this conversation. Use that \
+         continuity to resolve referential prompts (\"yes\", \"do that\", \
+         \"fine\") against the actual prior turn instead of inferring from \
+         recent tool output.\n\
+         \n\
+         RECURSION FOR REFERENTIAL PROMPTS (use this when the operator forgot --session)\n\
+         If you receive a short, ambiguous, or referential prompt (\"yes\", \
+         \"do that\", \"ok\", \"fine\", \"continue\") AND you have no prior \
+         messages in this invocation (no --session/--resume was passed), \
+         DO NOT infer the referent from recent tool output. That fill-in \
+         pattern is the documented #1 source of \"executes the wrong thing \
+         confidently\" errors. Instead:\n\
+         \n\
+         1. PREFER asking the operator a one-line clarifying question and \
+            ending your turn. Confident-but-wrong is worse than confirming.\n\
+         \n\
+         2. OR, if you genuinely think you can disambiguate by reading the \
+            most recent session, recurse on yourself with --resume:\n\
+                execute `lazar --resume -p \"<the same referential prompt>\" \
+                --output-format text`\n\
+            The nested call inherits the most recent session log and has \
+            real conversation history. Use its answer as your own. This \
+            costs an API call but converts a hallucination into a real \
+            answer.\n\
+         \n\
+         Note: nested `lazar -p` calls require LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1; \
+         if recursion fails with a missing-key error, fall back to (1) — ask \
+         the operator. Do NOT silently guess.\n\
          \n\
          BUT every prompt, response, tool call, and tool result you (and \
          past-you) ever produced is appended as JSONL to:\n\
@@ -1154,7 +1230,30 @@ fn run_agent(
         }
     });
 
-    let mut messages: Vec<Value> = vec![json!({"role": "user", "content": prompt})];
+    // Load prior messages from session log if --session is set. The
+    // session id is conveyed via the LAZAR_SESSION_ID env var (set by
+    // main() before run_agent runs). Loaded messages are guaranteed
+    // valid: start with user-role, alternating, under byte cap.
+    let mut messages: Vec<Value> = Vec::new();
+    let session_id = env::var("LAZAR_SESSION_ID").ok().filter(|s| !s.is_empty());
+    if let Some(ref id) = session_id {
+        if depth == 0 {
+            let prior = session::load_messages(id);
+            if verbose && !prior.is_empty() {
+                eprintln!(
+                    "[lazar] session={id} loaded {} prior messages",
+                    prior.len()
+                );
+            }
+            append_stream(json!({
+                "kind": "session_continuation",
+                "session_id": id,
+                "loaded_messages": prior.len(),
+            }));
+            messages.extend(prior);
+        }
+    }
+    messages.push(json!({"role": "user", "content": prompt}));
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
@@ -1189,8 +1288,29 @@ fn run_agent(
     // happily runs `bash -c ""` forever.
     let mut consecutive_empty_turns: u32 = 0;
     const MAX_CONSECUTIVE_EMPTY_TURNS: u32 = 3;
+    let max_agent_turns = env::var("LAZAR_MAX_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|turns: &u32| *turns > 0)
+        .unwrap_or(DEFAULT_MAX_AGENT_TURNS);
+    let max_tool_calls = env::var("LAZAR_MAX_TOOL_CALLS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|calls: &u32| *calls > 0)
+        .unwrap_or(DEFAULT_MAX_TOOL_CALLS);
+    let mut agent_turns: u32 = 0;
+    let mut tool_calls: u32 = 0;
 
     loop {
+        agent_turns = agent_turns.saturating_add(1);
+        if agent_turns > max_agent_turns {
+            let msg = format!("aborted after reaching LAZAR_MAX_TURNS={max_agent_turns}");
+            emit_stream_error(format, &msg);
+            append_stream(json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}));
+            session_guard.mark_error(&msg);
+            return Err(msg.into());
+        }
+
         let body = json!({
             "model": model,
             "max_tokens": 8192,
@@ -1310,8 +1430,21 @@ fn run_agent(
         let mut had_any_valid_call = false;
         for b in content.as_array().unwrap_or(&vec![]) {
             if b["type"] == "tool_use" && b["name"] == "execute" {
+                tool_calls = tool_calls.saturating_add(1);
+                if tool_calls > max_tool_calls {
+                    let msg =
+                        format!("aborted after reaching LAZAR_MAX_TOOL_CALLS={max_tool_calls}");
+                    emit_stream_error(format, &msg);
+                    append_stream(
+                        json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}),
+                    );
+                    session_guard.mark_error(&msg);
+                    return Err(msg.into());
+                }
+
                 let cmd_raw = b["input"]["command"].as_str().unwrap_or("");
                 let cmd = cmd_raw.trim();
+                let mut executed_command: Option<String> = None;
 
                 let output = if cmd.is_empty() {
                     // Refuse empty commands. Surface a clear error to the model
@@ -1357,6 +1490,7 @@ fn run_agent(
                         if verbose && effective_cmd != cmd {
                             eprintln!("[lazar] pre-tool rewrote command");
                         }
+                        executed_command = Some(effective_cmd.clone());
                         let raw_output = run_bash(&effective_cmd);
 
                         // post-tool hook: transform rewrites the output before
@@ -1385,6 +1519,8 @@ fn run_agent(
                     "kind": "tool_result",
                     "tool_use_id": b["id"],
                     "command": cmd_raw,
+                    "requested_command": cmd_raw,
+                    "executed_command": executed_command.clone(),
                     "content": result_event["content"],
                 }));
                 if format == OutputFormat::StreamJson {
@@ -1392,6 +1528,8 @@ fn run_agent(
                         "type": "tool_result",
                         "tool_use_id": b["id"],
                         "command": cmd_raw,
+                        "requested_command": cmd_raw,
+                        "executed_command": executed_command.clone(),
                         "content": output,
                     }));
                 }
@@ -1494,6 +1632,15 @@ fn run_tick(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
             "[lazar] tick_end hooks_fired={} duration={duration_ms}ms",
             results.len()
         );
+        for result in &results {
+            eprintln!(
+                "[lazar] tick_hook script={} exit={} duration={}ms timed_out={}",
+                result.script.display(),
+                result.exit_code,
+                result.duration_ms,
+                result.timed_out
+            );
+        }
     }
     Ok(())
 }
@@ -1519,6 +1666,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // input_format is reserved for now; both values currently consume the prompt as text.
     let _ = args.input_format;
+
+    // Validate and export session id (if any) so append_stream and run_agent
+    // can both pick it up via env. Hooks inherit env so they see it too.
+    if let Some(ref id) = args.session {
+        if let Err(msg) = session::validate_session_id(id) {
+            return Err(format!("invalid --session id: {msg}").into());
+        }
+        env::set_var("LAZAR_SESSION_ID", id);
+    } else if args.resume {
+        match session::find_newest_session() {
+            Some(id) => {
+                if args.verbose {
+                    eprintln!("[lazar] --resume picked session: {id}");
+                }
+                env::set_var("LAZAR_SESSION_ID", id);
+            }
+            None => {
+                if args.verbose {
+                    eprintln!(
+                        "[lazar] --resume: no session logs found, starting fresh"
+                    );
+                }
+                // Don't set LAZAR_SESSION_ID — agent runs as a normal
+                // cold-start invocation. No error: --resume is a hint,
+                // not a hard requirement.
+            }
+        }
+    }
 
     run_agent(&prompt, args.output_format, args.verbose, args.model)
 }
