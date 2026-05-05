@@ -114,9 +114,24 @@ pub fn find_newest_session() -> Option<String> {
 /// Anthropic Messages API format. Returns an empty Vec if the log
 /// doesn't exist (first turn).
 ///
+/// IMPORTANT: tool_use blocks and tool_result events are STRIPPED from the
+/// loaded history. Tool ids are provider-specific (Anthropic, MiniMax,
+/// OpenRouter, etc all use different formats), and lazar's cascading
+/// provider failover means a session log can mix providers. Sending a
+/// `tool_result` with a foreign tool_use_id back to any single provider
+/// produces an "unknown tool id" 400.
+///
+/// Truncation can also break tool_use→tool_result pairing (drop the
+/// assistant message and you have an orphan tool_result).
+///
+/// The clean, provider-portable, truncation-safe choice is: load only
+/// text content. The agent loses fine-grained "what tools did I run"
+/// detail in continued sessions, but stream.jsonl still has it for
+/// archeology — and the multi-turn referential bug is fixed regardless.
+///
 /// The returned messages are guaranteed to:
 ///   - Start with a user-role message
-///   - Have alternating roles (user → assistant → user → ...)
+///   - Contain only text content (no tool_use, no tool_result)
 ///   - Total under LAZAR_SESSION_HISTORY_MAX_BYTES
 pub fn load_messages(id: &str) -> Vec<Value> {
     let path = session_log_path(id);
@@ -127,17 +142,6 @@ pub fn load_messages(id: &str) -> Vec<Value> {
 
     let reader = BufReader::new(file);
     let mut messages: Vec<Value> = Vec::new();
-    let mut pending_tool_results: Vec<Value> = Vec::new();
-
-    let flush_tool_results =
-        |messages: &mut Vec<Value>, pending: &mut Vec<Value>| {
-            if !pending.is_empty() {
-                messages.push(json!({
-                    "role": "user",
-                    "content": std::mem::take(pending),
-                }));
-            }
-        };
 
     for line in reader.lines() {
         let line = match line {
@@ -154,8 +158,8 @@ pub fn load_messages(id: &str) -> Vec<Value> {
         let kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "user" => {
-                flush_tool_results(&mut messages, &mut pending_tool_results);
                 if let Some(content) = event.get("content") {
+                    // User content is usually a plain string. Pass through.
                     messages.push(json!({
                         "role": "user",
                         "content": content,
@@ -163,32 +167,49 @@ pub fn load_messages(id: &str) -> Vec<Value> {
                 }
             }
             "assistant" => {
-                flush_tool_results(&mut messages, &mut pending_tool_results);
-                if let Some(content) = event.get("content") {
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": content,
-                    }));
+                // Strip tool_use blocks; keep only text blocks. If the
+                // turn was tool-use-only, skip it entirely.
+                if let Some(text) = extract_text_from_assistant_content(event.get("content")) {
+                    if !text.is_empty() {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": text,
+                        }));
+                    }
                 }
             }
-            "tool_result" => {
-                if let (Some(id), Some(content)) = (
-                    event.get("tool_use_id").cloned(),
-                    event.get("content").cloned(),
-                ) {
-                    pending_tool_results.push(json!({
-                        "type": "tool_result",
-                        "tool_use_id": id,
-                        "content": content,
-                    }));
-                }
-            }
+            // tool_result events are intentionally dropped — see doc above.
             _ => {}
         }
     }
-    flush_tool_results(&mut messages, &mut pending_tool_results);
 
     truncate_to_byte_cap(messages)
+}
+
+/// Pull the concatenated text out of an assistant content array,
+/// dropping tool_use and any other non-text blocks. Returns None if
+/// content is missing; returns Some("") if the turn was tool-only.
+fn extract_text_from_assistant_content(content: Option<&Value>) -> Option<String> {
+    let content = content?;
+    // Assistant content can be either a plain string (rare, defensive)
+    // or an array of content blocks (the normal Anthropic shape).
+    if let Some(s) = content.as_str() {
+        return Some(s.to_string());
+    }
+    let arr = content.as_array()?;
+    let mut out = String::new();
+    for block in arr {
+        if block.get("type").and_then(|v| v.as_str()) == Some("text") {
+            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+        // tool_use, tool_result, image, etc — silently dropped.
+    }
+    Some(out)
 }
 
 /// Drop oldest message pairs until the remaining set fits under the

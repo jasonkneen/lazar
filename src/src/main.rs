@@ -120,6 +120,46 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Extract bash/sh commands from ```bash / ```sh / ```shell fences in a text block.
+/// Used by the bash-fence fallback when a model emits shell commands as markdown
+/// instead of proper tool_use blocks.
+fn extract_bash_fences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let mut found: Option<usize> = None;
+        let mut tag_len = 0usize;
+        for tag in ["```bash\n", "```sh\n", "```shell\n", "```bash\r\n", "```sh\r\n", "```shell\r\n"] {
+            if let Some(pos) = rest.find(tag) {
+                if found.map_or(true, |p| pos < p) {
+                    found = Some(pos);
+                    tag_len = tag.len();
+                }
+            }
+        }
+        let fence_start = match found {
+            Some(p) => p,
+            None => break,
+        };
+        let body_start = fence_start + tag_len;
+        let body = &rest[body_start..];
+        let close_rel = match body.find("\n```").or_else(|| body.find("\r\n```")) {
+            Some(p) => p,
+            None => break,
+        };
+        let cmd = body[..close_rel].trim();
+        if !cmd.is_empty() {
+            out.push(cmd.to_string());
+        }
+        let after_close = body_start + close_rel + 4; // \n```
+        if after_close >= rest.len() {
+            break;
+        }
+        rest = &rest[after_close..];
+    }
+    out
+}
+
 fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output.to_string();
@@ -1364,6 +1404,73 @@ fn run_agent(
                 return Err(msg.into());
             }
         };
+
+        // ─── Bash-fence fallback ─────────────────────────────────────────
+        // Some models (especially non-Anthropic routes via ANTHROPIC_BASE_URL,
+        // weaker function-callers, or models that degrade after seeing
+        // tool_result history) emit shell commands as ```bash fenced markdown
+        // inside a text block instead of proper tool_use blocks, then return
+        // stop_reason=end_turn. The agent loop then halts even though the
+        // model clearly wanted to run a command. Detect that pattern and
+        // synthesize tool_use blocks so the loop can keep progressing.
+        // Disable with LAZAR_NO_BASH_FALLBACK=1.
+        let mut content = content;
+        let mut stop_reason_str = stop_reason_str;
+        let bash_fallback_off = env::var("LAZAR_NO_BASH_FALLBACK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !bash_fallback_off && stop_reason_str == "end_turn" {
+            let has_tool_use = content
+                .as_array()
+                .map(|a| a.iter().any(|b| b["type"] == "tool_use"))
+                .unwrap_or(false);
+            if !has_tool_use {
+                let mut commands: Vec<String> = Vec::new();
+                if let Some(arr) = content.as_array() {
+                    for b in arr {
+                        if b["type"] == "text" {
+                            if let Some(t) = b["text"].as_str() {
+                                commands.extend(extract_bash_fences(t));
+                            }
+                        }
+                    }
+                }
+                if !commands.is_empty() {
+                    if verbose {
+                        eprintln!(
+                            "[lazar] bash-fence fallback: synthesizing {} tool_use call(s) from markdown",
+                            commands.len()
+                        );
+                    }
+                    if let Some(arr) = content.as_array_mut() {
+                        for (i, cmd) in commands.iter().enumerate() {
+                            let synth_id = format!("synth_bash_{}_{}", agent_turns, i);
+                            let block = json!({
+                                "type": "tool_use",
+                                "id": synth_id,
+                                "name": "execute",
+                                "input": {"command": cmd},
+                            });
+                            // Emit a stream tool_use event so the TUI shows the
+                            // synthesized call in the same shape it expects from
+                            // a normal streamed turn.
+                            if format == OutputFormat::StreamJson {
+                                emit_event(json!({
+                                    "type": "tool_use",
+                                    "id": &block["id"],
+                                    "name": "execute",
+                                    "input": {"command": cmd},
+                                    "synthesized": true,
+                                }));
+                            }
+                            arr.push(block);
+                        }
+                    }
+                    stop_reason_str = "tool_use".to_string();
+                }
+            }
+        }
+
         messages.push(json!({"role": "assistant", "content": content.clone()}));
         append_stream(json!({"kind": "assistant", "content": content.clone()}));
 
