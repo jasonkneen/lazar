@@ -235,20 +235,44 @@ fn run_hook(
     let workspace = format!("{lazar}/workspace");
     let _ = fs::create_dir_all(&workspace);
 
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    // Honor LAZAR_NO_SANDBOX (set by main when --no-sandbox is passed).
+    // Hooks run in the same trust mode as the agent — if the operator
+    // disabled sandboxing, hooks aren't sandboxed either.
+    let unsandboxed = crate::no_sandbox_active();
+
+    let mut command = if unsandboxed {
+        let mut c = Command::new("/bin/bash");
+        c.arg(script);
+        c
+    } else {
+        let mut c = Command::new("/usr/bin/sandbox-exec");
+        c.arg("-D")
+            .arg(format!("SKILLS_PATH={lazar}/skills"))
+            .arg("-D")
+            .arg(format!("MEMORY_PATH={lazar}/memory"))
+            .arg("-D")
+            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
+            .arg("-D")
+            .arg(format!("LOGS_PATH={lazar}/logs"))
+            .arg("-D")
+            .arg(format!(
+                "USER_HOME={}",
+                env::var("HOME").unwrap_or_else(|_| "/".to_string())
+            ))
+            .arg("-p")
+            .arg(SANDBOX_PROFILE)
+            .arg("/bin/bash")
+            .arg(script);
+        c
+    };
+
+    let bash_home = if unsandboxed {
+        env::var("HOME").unwrap_or_else(|_| lazar.clone())
+    } else {
+        lazar.clone()
+    };
+
     command
-        .arg("-D")
-        .arg(format!("SKILLS_PATH={lazar}/skills"))
-        .arg("-D")
-        .arg(format!("MEMORY_PATH={lazar}/memory"))
-        .arg("-D")
-        .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-        .arg("-D")
-        .arg(format!("LOGS_PATH={lazar}/logs"))
-        .arg("-p")
-        .arg(SANDBOX_PROFILE)
-        .arg("/bin/bash")
-        .arg(script)
         .current_dir(&workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -258,7 +282,7 @@ fn run_hook(
             "PATH",
             "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         )
-        .env("HOME", &lazar)
+        .env("HOME", &bash_home)
         .env("LAZAR_HOME", &lazar)
         .env("LAZAR_SKILLS", format!("{lazar}/skills"))
         .env("LAZAR_MEMORY", format!("{lazar}/memory"))
@@ -274,6 +298,10 @@ fn run_hook(
             "LANG",
             env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
         );
+
+    if unsandboxed {
+        command.env("LAZAR_NO_SANDBOX", "1");
+    }
 
     #[cfg(unix)]
     unsafe {

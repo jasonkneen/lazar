@@ -22,14 +22,20 @@
 ;; everything that matters.
 (allow file-read*)
 
-;; writes: ONLY the agent's writable zones + tmp.
+;; writes: ONLY the agent's writable zones + tmp + agent-CLI config dirs.
 ;; bin/ and src/ are NOT in this list, so the agent cannot modify
 ;; the runner. Every path is passed in via -D from the runner.
+;;
+;; USER_HOME is the operator's real home (e.g. /Users/jkneen), distinct
+;; from LAZAR_HOME. Allowing writes to ~/.codex and ~/.claude lets
+;; sub-agent CLIs (codex, claude-code) update their session/auth state.
 (allow file-write*
   (subpath (param "SKILLS_PATH"))
   (subpath (param "MEMORY_PATH"))
   (subpath (param "WORKSPACE_PATH"))
   (subpath (param "LOGS_PATH"))
+  (subpath (string-append (param "USER_HOME") "/.codex"))
+  (subpath (string-append (param "USER_HOME") "/.claude"))
   (subpath "/private/tmp")
   (subpath "/private/var/tmp")
   (subpath "/private/var/folders"))

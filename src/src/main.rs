@@ -23,6 +23,7 @@ use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
 
 mod hooks;
 mod session;
+mod verifier;
 use hooks::HookEvent;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,46 +119,6 @@ fn safe_prefix(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
-}
-
-/// Extract bash/sh commands from ```bash / ```sh / ```shell fences in a text block.
-/// Used by the bash-fence fallback when a model emits shell commands as markdown
-/// instead of proper tool_use blocks.
-fn extract_bash_fences(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    loop {
-        let mut found: Option<usize> = None;
-        let mut tag_len = 0usize;
-        for tag in ["```bash\n", "```sh\n", "```shell\n", "```bash\r\n", "```sh\r\n", "```shell\r\n"] {
-            if let Some(pos) = rest.find(tag) {
-                if found.map_or(true, |p| pos < p) {
-                    found = Some(pos);
-                    tag_len = tag.len();
-                }
-            }
-        }
-        let fence_start = match found {
-            Some(p) => p,
-            None => break,
-        };
-        let body_start = fence_start + tag_len;
-        let body = &rest[body_start..];
-        let close_rel = match body.find("\n```").or_else(|| body.find("\r\n```")) {
-            Some(p) => p,
-            None => break,
-        };
-        let cmd = body[..close_rel].trim();
-        if !cmd.is_empty() {
-            out.push(cmd.to_string());
-        }
-        let after_close = body_start + close_rel + 4; // \n```
-        if after_close >= rest.len() {
-            break;
-        }
-        rest = &rest[after_close..];
-    }
-    out
 }
 
 fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
@@ -274,6 +235,19 @@ struct Args {
     /// referential prompt against full prior context.
     #[arg(long)]
     resume: bool,
+
+    /// Disable sandbox-exec for this invocation. The agent's bash will
+    /// run with the full operator privileges instead of the restricted
+    /// sandbox profile. Use when working OUTSIDE ~/lazar (e.g. running
+    /// lazar from a project directory and having it edit project files).
+    /// Also enabled via LAZAR_NO_SANDBOX=1 env var.
+    ///
+    /// SECURITY: with sandbox disabled, the agent can read, write, and
+    /// execute anywhere the operator can — including ~/.ssh, dotfiles,
+    /// system paths. Only enable when you trust the agent and the model.
+    /// The kernel emits a loud banner on every invocation when active.
+    #[arg(long)]
+    no_sandbox: bool,
 }
 
 pub(crate) fn lazar_home() -> PathBuf {
@@ -386,6 +360,19 @@ pub(crate) fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_pid: u32) {}
 
+/// Returns true when the operator has opted out of the sandbox for this
+/// invocation. The operator controls this via:
+///   --no-sandbox CLI flag (sets LAZAR_NO_SANDBOX=1 in env at startup)
+///   OR LAZAR_NO_SANDBOX=1 directly in env
+///
+/// The agent itself CANNOT flip this on. It's read from env each call,
+/// but env is set once by main() based on operator input — hooks and
+/// tool subprocesses can't change the parent process's env. So a
+/// fabricated "I'll set LAZAR_NO_SANDBOX" tool call is a no-op.
+pub(crate) fn no_sandbox_active() -> bool {
+    env_flag_enabled("LAZAR_NO_SANDBOX")
+}
+
 fn run_bash(cmd: &str) -> String {
     let limits = ToolLimits::from_env();
     let lazar_path = lazar_home();
@@ -402,22 +389,59 @@ fn run_bash(cmd: &str) -> String {
         .unwrap_or(0);
     let child_depth = current_depth.saturating_add(1);
 
-    let mut command = Command::new("/usr/bin/sandbox-exec");
+    let unsandboxed = no_sandbox_active();
+
+    // When sandbox is disabled, run bash directly with operator-level cwd.
+    // Use $PWD if available (where the operator invoked lazar from) so
+    // commands like `ls` / `cat ./file` work in the project directory
+    // instead of always being chained to $LAZAR_WORKSPACE.
+    let cwd = if unsandboxed {
+        env::var("PWD")
+            .ok()
+            .filter(|p| !p.is_empty() && Path::new(p).is_dir())
+            .unwrap_or_else(|| workspace.clone())
+    } else {
+        workspace.clone()
+    };
+
+    let mut command = if unsandboxed {
+        let mut c = Command::new("/bin/bash");
+        c.arg("-c").arg(cmd);
+        c
+    } else {
+        let mut c = Command::new("/usr/bin/sandbox-exec");
+        c.arg("-D")
+            .arg(format!("SKILLS_PATH={lazar}/skills"))
+            .arg("-D")
+            .arg(format!("MEMORY_PATH={lazar}/memory"))
+            .arg("-D")
+            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
+            .arg("-D")
+            .arg(format!("LOGS_PATH={lazar}/logs"))
+            .arg("-D")
+            .arg(format!(
+                "USER_HOME={}",
+                env::var("HOME").unwrap_or_else(|_| "/".to_string())
+            ))
+            .arg("-p")
+            .arg(SANDBOX_PROFILE)
+            .arg("/bin/bash")
+            .arg("-c")
+            .arg(cmd);
+        c
+    };
+
+    // When unsandboxed, use the operator's real HOME (so things like ~/.ssh,
+    // git config, gh CLI, claude/codex auth all work without redirection).
+    // When sandboxed, HOME is pinned to LAZAR_HOME (existing behavior).
+    let bash_home = if unsandboxed {
+        env::var("HOME").unwrap_or_else(|_| lazar.clone())
+    } else {
+        lazar.clone()
+    };
+
     command
-        .arg("-D")
-        .arg(format!("SKILLS_PATH={lazar}/skills"))
-        .arg("-D")
-        .arg(format!("MEMORY_PATH={lazar}/memory"))
-        .arg("-D")
-        .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-        .arg("-D")
-        .arg(format!("LOGS_PATH={lazar}/logs"))
-        .arg("-p")
-        .arg(SANDBOX_PROFILE)
-        .arg("/bin/bash")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(&workspace)
+        .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -426,7 +450,7 @@ fn run_bash(cmd: &str) -> String {
             "PATH",
             "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         )
-        .env("HOME", &lazar)
+        .env("HOME", &bash_home)
         .env("LAZAR_HOME", &lazar)
         .env("LAZAR_SKILLS", format!("{lazar}/skills"))
         .env("LAZAR_MEMORY", format!("{lazar}/memory"))
@@ -442,6 +466,13 @@ fn run_bash(cmd: &str) -> String {
             "LANG",
             env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
         );
+
+    // Propagate LAZAR_NO_SANDBOX so nested `lazar -p` calls inherit the
+    // mode (otherwise the child would re-sandbox and the operator's
+    // intent would be silently dropped).
+    if unsandboxed {
+        command.env("LAZAR_NO_SANDBOX", "1");
+    }
 
     if let Ok(model) = env::var("LAZAR_MODEL") {
         command.env("LAZAR_MODEL", model);
@@ -1231,16 +1262,77 @@ fn run_agent(
          Recursion depth is capped at {max_depth}; current depth is {depth}.\n\
          \n\
          BOUNDARIES\n\
-         Writes are limited by sandbox-exec to skills/, memory/, \
-         workspace/, logs/, and /tmp. Do not try to modify bin/ or src/, \
-         dotfiles, ssh keys, or anything outside ~/lazar. You will \
-         see 'Operation not permitted' if you try; learn from the failure \
-         and route around it via a skill.",
+         By default, writes are limited by sandbox-exec to skills/, \
+         memory/, workspace/, logs/, and /tmp. Do not try to modify bin/ \
+         or src/, dotfiles, ssh keys, or anything outside ~/lazar. You \
+         will see 'Operation not permitted' if you try; learn from the \
+         failure and route around it via a skill.\n\
+         \n\
+         EXCEPTION: if the operator passed --no-sandbox or set \
+         LAZAR_NO_SANDBOX=1, the sandbox is OFF for this invocation. \
+         You have full operator filesystem access. Use this responsibly: \
+         you can now write outside ~/lazar (e.g. project files in the \
+         operator's cwd), call CLIs that need ~/.ssh / git config / \
+         keychain, etc. Do NOT use this latitude to do anything the \
+         operator didn't ask for. The kernel printed a loud banner; \
+         the operator knows. Treat it as 'normal user shell access' \
+         and behave as a trusted developer, not a contractor with \
+         delegated authority. {sandbox_status_line}\n\
+         \n\
+         VERIFY CONTRACT (this is enforced by the kernel)\n\
+         When you claim that a tool produced an outcome (a file was \
+         created, rotated, deleted; a file has size N; a file contains \
+         text X), you MUST end your turn with a `[VERIFY]...[/VERIFY]` \
+         block declaring those claims as testable assertions. The kernel \
+         parses the block and runs actual filesystem checks (stat, exists, \
+         contains). If your claims fail the kernel's check, the operator \
+         sees an ❌ VERIFY FAILED banner — meaning you said one thing \
+         and the filesystem says another.\n\
+         \n\
+         Supported claim formats (one per line inside [VERIFY]...[/VERIFY]):\n\
+             exists=<path>             — file/dir exists\n\
+             not_exists=<path>         — file/dir absent\n\
+             size=<path>:<bytes>       — exact size in bytes\n\
+             size_at_least=<path>:<n>  — size >= n bytes\n\
+             size_at_most=<path>:<n>   — size <= n bytes\n\
+             contains=<path>:<substr>  — file contains substring\n\
+             mtime_within=<path>:<sec> — modified within last <sec> seconds\n\
+         \n\
+         Example — you ran `echo foo > /tmp/x` and want to claim it worked:\n\
+             [VERIFY]\n\
+             exists=/tmp/x\n\
+             contains=/tmp/x:foo\n\
+             size_at_least=/tmp/x:3\n\
+             [/VERIFY]\n\
+         \n\
+         If your turn does NOT make outcome claims (you're explaining, \
+         planning, asking, reading) you do NOT need a [VERIFY] block. \
+         The contract only fires when you assert state. If you don't know \
+         the state, don't assert it — say so and run a tool to check.\n\
+         \n\
+         Why this exists: an earlier session fabricated 'I rotated the \
+         log, here's the table of new sizes' without running any tools. \
+         The operator caught it manually with `ls -la`. The kernel now \
+         runs that `ls -la` itself based on your declared claims. There \
+         is no way to lie about file state — the kernel checks. Use \
+         [VERIFY] blocks to PROVE work, and you'll never get false \
+         fabrication warnings.\n\
+         \n\
+         The kernel also runs a pattern detector (past-tense action verbs, \
+         markdown state tables, 'Total time' reports) and warns when those \
+         patterns appear without enough tool execution OR a passing VERIFY \
+         block. The pattern warning is suppressed when a VERIFY block \
+         passes — proof of work overrides suspicion.",
         home_disp = home.display(),
         skills_disp = skills.display(),
         next_depth = depth + 1,
         max_depth = MAX_DEPTH,
-        depth = depth
+        depth = depth,
+        sandbox_status_line = if no_sandbox_active() {
+            "Current mode: SANDBOX OFF (--no-sandbox is active)."
+        } else {
+            "Current mode: sandboxed (default)."
+        },
     );
 
     // Append hook-injected runtime context to the system prompt. Hooks that
@@ -1404,73 +1496,6 @@ fn run_agent(
                 return Err(msg.into());
             }
         };
-
-        // ─── Bash-fence fallback ─────────────────────────────────────────
-        // Some models (especially non-Anthropic routes via ANTHROPIC_BASE_URL,
-        // weaker function-callers, or models that degrade after seeing
-        // tool_result history) emit shell commands as ```bash fenced markdown
-        // inside a text block instead of proper tool_use blocks, then return
-        // stop_reason=end_turn. The agent loop then halts even though the
-        // model clearly wanted to run a command. Detect that pattern and
-        // synthesize tool_use blocks so the loop can keep progressing.
-        // Disable with LAZAR_NO_BASH_FALLBACK=1.
-        let mut content = content;
-        let mut stop_reason_str = stop_reason_str;
-        let bash_fallback_off = env::var("LAZAR_NO_BASH_FALLBACK")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !bash_fallback_off && stop_reason_str == "end_turn" {
-            let has_tool_use = content
-                .as_array()
-                .map(|a| a.iter().any(|b| b["type"] == "tool_use"))
-                .unwrap_or(false);
-            if !has_tool_use {
-                let mut commands: Vec<String> = Vec::new();
-                if let Some(arr) = content.as_array() {
-                    for b in arr {
-                        if b["type"] == "text" {
-                            if let Some(t) = b["text"].as_str() {
-                                commands.extend(extract_bash_fences(t));
-                            }
-                        }
-                    }
-                }
-                if !commands.is_empty() {
-                    if verbose {
-                        eprintln!(
-                            "[lazar] bash-fence fallback: synthesizing {} tool_use call(s) from markdown",
-                            commands.len()
-                        );
-                    }
-                    if let Some(arr) = content.as_array_mut() {
-                        for (i, cmd) in commands.iter().enumerate() {
-                            let synth_id = format!("synth_bash_{}_{}", agent_turns, i);
-                            let block = json!({
-                                "type": "tool_use",
-                                "id": synth_id,
-                                "name": "execute",
-                                "input": {"command": cmd},
-                            });
-                            // Emit a stream tool_use event so the TUI shows the
-                            // synthesized call in the same shape it expects from
-                            // a normal streamed turn.
-                            if format == OutputFormat::StreamJson {
-                                emit_event(json!({
-                                    "type": "tool_use",
-                                    "id": &block["id"],
-                                    "name": "execute",
-                                    "input": {"command": cmd},
-                                    "synthesized": true,
-                                }));
-                            }
-                            arr.push(block);
-                        }
-                    }
-                    stop_reason_str = "tool_use".to_string();
-                }
-            }
-        }
-
         messages.push(json!({"role": "assistant", "content": content.clone()}));
         append_stream(json!({"kind": "assistant", "content": content.clone()}));
 
@@ -1481,6 +1506,84 @@ fn run_agent(
             append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason}));
             let duration_ms = started.elapsed().as_millis();
 
+            // ────────────────────────────────────────────────────────
+            // FABRICATION CHECK — kernel-level guardrail.
+            // Scan the assistant's final text for fabrication tells
+            // (past-tense action verbs, state tables, "Total time"
+            // outcome reports, etc) and check whether ANY tool ran in
+            // this turn. If text claims completed work but no tool
+            // executed, the kernel emits a loud warning to stderr.
+            // The model's output is preserved unmodified — the warning
+            // is added to the operator's view, not injected into the
+            // model's context.
+            // ────────────────────────────────────────────────────────
+            let final_text = verifier::extract_text(&content);
+            let tool_uses_this_turn = verifier::count_tool_uses(&content);
+
+            // Layer 1 — VERIFY-block engine (kernel runs the actual checks).
+            // The agent declares testable claims; the kernel runs them.
+            // This is the ironclad layer: model can't lie about file
+            // state because the kernel does the stat, not the model.
+            let claims = verifier::parse_verify_blocks(&final_text);
+            let verify_report = if !claims.is_empty() {
+                verifier::verify_all(&claims)
+            } else {
+                Default::default()
+            };
+            if !claims.is_empty() {
+                let banner = verifier::format_verify_banner(&verify_report);
+                if !banner.is_empty() {
+                    eprintln!("{banner}");
+                }
+                append_stream(json!({
+                    "kind": "verify_report",
+                    "report": verifier::report_to_event(&verify_report),
+                }));
+                if format == OutputFormat::StreamJson {
+                    emit_event(json!({
+                        "type": "verify_report",
+                        "report": verifier::report_to_event(&verify_report),
+                    }));
+                }
+            }
+
+            // Layer 2 — pattern detector (catches fabrication tells).
+            // Suppressed if a passing VERIFY block was declared (proof of
+            // work makes the past-tense phrasing legitimate).
+            let suspicions = verifier::scan(&final_text);
+            let pattern_flagged = verifier::should_flag(&suspicions, tool_uses_this_turn);
+            let suppress_pattern = verify_report.all_passed();
+            let flagged = pattern_flagged && !suppress_pattern;
+
+            if flagged {
+                let warning = verifier::format_warning(&suspicions, tool_uses_this_turn);
+                eprintln!("{warning}");
+
+                let kinds: Vec<&str> = suspicions
+                    .iter()
+                    .map(|s| s.kind.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                append_stream(json!({
+                    "kind": "fabrication_check",
+                    "flagged": true,
+                    "tool_uses_in_turn": tool_uses_this_turn,
+                    "suspicion_count": suspicions.len(),
+                    "suspicion_kinds": kinds,
+                }));
+                if format == OutputFormat::StreamJson {
+                    emit_event(json!({
+                        "type": "fabrication_check",
+                        "flagged": true,
+                        "tool_uses_in_turn": tool_uses_this_turn,
+                        "suspicion_count": suspicions.len(),
+                        "suspicion_kinds": kinds,
+                    }));
+                }
+            }
+            // ────────────────────────────────────────────────────────
+
             // agent-stop: top-level only.
             if depth == 0 {
                 hooks::fire(
@@ -1489,6 +1592,10 @@ fn run_agent(
                         "depth": depth,
                         "stop_reason": stop_reason,
                         "duration_ms": duration_ms,
+                        "fabrication_flagged": flagged,
+                        "verify_claims_count": claims.len(),
+                        "verify_all_passed": verify_report.all_passed(),
+                        "verify_any_failed": verify_report.any_failed(),
                     }),
                 );
             }
@@ -1762,6 +1869,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure hooks/ exists for any path that fires hooks. First-run
     // installs that predate this kernel won't have the directory yet.
     ensure_hooks_seeded();
+
+    // Operator-controlled sandbox bypass. Either the CLI flag or env var
+    // sets the env var that run_bash/run_hook read on every spawn. The
+    // agent itself cannot flip this on — env at spawn time is inherited
+    // from this main process, and the agent is a tool subprocess that
+    // can't mutate the parent's env.
+    if args.no_sandbox || env_flag_enabled("LAZAR_NO_SANDBOX") {
+        env::set_var("LAZAR_NO_SANDBOX", "1");
+        eprintln!();
+        eprintln!("════════════════════════════════════════════════════════════════");
+        eprintln!("⚠  SANDBOX DISABLED — agent has full operator filesystem access");
+        eprintln!("════════════════════════════════════════════════════════════════");
+        eprintln!("   Bash commands run with NO sandbox-exec wrapper.");
+        eprintln!("   Agent can read/write/exec anywhere you can — incl. ~/.ssh,");
+        eprintln!("   dotfiles, system paths. Trust the model and the prompt.");
+        eprintln!("════════════════════════════════════════════════════════════════");
+        eprintln!();
+        append_stream(json!({
+            "kind": "sandbox_disabled",
+            "source": if args.no_sandbox { "cli_flag" } else { "env_var" },
+        }));
+    }
 
     if args.tick {
         return run_tick(args.verbose);
