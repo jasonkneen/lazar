@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct Suspicion {
@@ -242,7 +242,7 @@ pub fn scan(text: &str) -> Vec<Suspicion> {
 /// assistant's text before printing. Loud, hard to miss.
 pub fn format_warning(suspicions: &[Suspicion], tool_uses_in_turn: usize) -> String {
     let mut out = String::new();
-    out.push_str("\n");
+    out.push('\n');
     out.push_str("════════════════════════════════════════════════════════════════\n");
     out.push_str("⚠  FABRICATION CHECK — KERNEL WARNING\n");
     out.push_str("════════════════════════════════════════════════════════════════\n");
@@ -459,7 +459,7 @@ fn normalize_claim_value(val: &str) -> String {
 fn parse_claim_line(line: &str) -> Option<VerifyClaim> {
     // Strip leading "- " or "* " in case the model writes a bullet list
     let line = line
-        .trim_start_matches(|c: char| matches!(c, '-' | '*' | '•'))
+        .trim_start_matches(['-', '*', '•'])
         .trim();
     let (key, val) = line.split_once('=')?;
     let key = key.trim();
@@ -647,7 +647,7 @@ pub fn verify_all(claims: &[VerifyClaim]) -> VerifyReport {
     }
 }
 
-fn expand_path(p: &PathBuf) -> PathBuf {
+fn expand_path(p: &Path) -> PathBuf {
     if let Some(s) = p.to_str() {
         if let Some(rest) = s.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME") {
@@ -665,7 +665,7 @@ fn expand_path(p: &PathBuf) -> PathBuf {
             }
         }
     }
-    p.clone()
+    p.to_path_buf()
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -683,7 +683,7 @@ pub fn format_verify_banner(report: &VerifyReport) -> String {
     }
     let mut out = String::new();
     if report.any_failed() {
-        out.push_str("\n");
+        out.push('\n');
         out.push_str("════════════════════════════════════════════════════════════════\n");
         out.push_str(&format!(
             "❌ VERIFY FAILED — {} of {} kernel-side checks failed\n",

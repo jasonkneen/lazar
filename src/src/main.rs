@@ -142,7 +142,7 @@ fn extract_bash_fences(text: &str) -> Vec<String> {
             "```shell\r\n",
         ] {
             if let Some(pos) = rest.find(tag) {
-                if found.map_or(true, |p| pos < p) {
+                if found.is_none_or(|p| pos < p) {
                     found = Some(pos);
                     tag_len = tag.len();
                 }
@@ -1313,10 +1313,13 @@ fn run_agent(
          \n\
          BOUNDARIES\n\
          By default, writes are limited by sandbox-exec to skills/, \
-         memory/, workspace/, logs/, and /tmp. Do not try to modify bin/ \
-         or src/, dotfiles, ssh keys, or anything outside ~/lazar. You \
-         will see 'Operation not permitted' if you try; learn from the \
-         failure and route around it via a skill.\n\
+         memory/, workspace/, logs/, /tmp, and specific session/auth \
+         subdirs under ~/.codex and ~/.claude (e.g. sessions/, todos/, \
+         auth.json). Do not try to modify bin/, src/, ~/.codex/config.toml, \
+         ~/.codex/AGENTS.md, ~/.claude/settings.json, ~/.claude/hooks/, \
+         ~/.claude/CLAUDE.md, ssh keys, or anything else outside these \
+         allowed zones. You will see 'Operation not permitted' if you try; \
+         learn from the failure and route around it via a skill.\n\
          \n\
          EXCEPTION: if the operator passed --no-sandbox or set \
          LAZAR_NO_SANDBOX=1, the sandbox is OFF for this invocation. \
@@ -2057,6 +2060,58 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::path::Path;
+
+    /// Regression guard: the sandbox profile must grant writes to the specific
+    /// session/auth subdirectories of ~/.codex and ~/.claude, but must NOT
+    /// contain the broad whole-directory grants that would allow a sandboxed
+    /// agent to overwrite config files (e.g. settings.json, CLAUDE.md,
+    /// AGENTS.md, hooks.json) that are later trusted by the operator's own
+    /// unsandboxed CLI sessions.
+    #[test]
+    fn sandbox_profile_narrows_codex_and_claude_write_grants() {
+        // Narrowed grants must be present.
+        assert!(
+            SANDBOX_PROFILE.contains("/.codex/sessions"),
+            "sandbox profile must allow writes to ~/.codex/sessions"
+        );
+        assert!(
+            SANDBOX_PROFILE.contains("/.codex/archived_sessions"),
+            "sandbox profile must allow writes to ~/.codex/archived_sessions"
+        );
+        assert!(
+            SANDBOX_PROFILE.contains("/.codex/log"),
+            "sandbox profile must allow writes to ~/.codex/log"
+        );
+        assert!(
+            SANDBOX_PROFILE.contains("/.claude/projects"),
+            "sandbox profile must allow writes to ~/.claude/projects"
+        );
+        assert!(
+            SANDBOX_PROFILE.contains("/.claude/sessions"),
+            "sandbox profile must allow writes to ~/.claude/sessions"
+        );
+        assert!(
+            SANDBOX_PROFILE.contains("/.claude/todos"),
+            "sandbox profile must allow writes to ~/.claude/todos"
+        );
+
+        // The broad whole-directory grants must NOT be present.
+        // These exact SBPL patterns would grant write access to the entire
+        // ~/.codex or ~/.claude tree, including config files that should
+        // remain read-only from a sandboxed agent's perspective.
+        let broad_codex = r#"(subpath (string-append (param "USER_HOME") "/.codex"))"#;
+        let broad_claude = r#"(subpath (string-append (param "USER_HOME") "/.claude"))"#;
+        assert!(
+            !SANDBOX_PROFILE.contains(broad_codex),
+            "sandbox profile must NOT grant broad write to entire ~/.codex — \
+             use specific subdirs only to prevent config injection"
+        );
+        assert!(
+            !SANDBOX_PROFILE.contains(broad_claude),
+            "sandbox profile must NOT grant broad write to entire ~/.claude — \
+             use specific subdirs only to prevent config injection"
+        );
+    }
 
     #[test]
     fn env_flag_accepts_only_explicit_truthy_values() {

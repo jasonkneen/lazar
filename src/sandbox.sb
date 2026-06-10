@@ -22,20 +22,45 @@
 ;; everything that matters.
 (allow file-read*)
 
-;; writes: ONLY the agent's writable zones + tmp + agent-CLI config dirs.
-;; bin/ and src/ are NOT in this list, so the agent cannot modify
-;; the runner. Every path is passed in via -D from the runner.
+;; writes: ONLY the agent's writable zones + tmp + narrowed agent-CLI
+;; session/auth dirs. bin/ and src/ are NOT in this list, so the agent
+;; cannot modify the runner. Every path is passed in via -D from the runner.
 ;;
 ;; USER_HOME is the operator's real home (e.g. /Users/jkneen), distinct
-;; from LAZAR_HOME. Allowing writes to ~/.codex and ~/.claude lets
-;; sub-agent CLIs (codex, claude-code) update their session/auth state.
+;; from LAZAR_HOME. We grant writes to specific session/auth/log
+;; subdirectories under ~/.codex and ~/.claude so sub-agent CLIs
+;; (codex, claude-code) can update their session/auth state — but we
+;; deliberately DENY writes to config files such as ~/.codex/config.toml,
+;; ~/.codex/AGENTS.md, ~/.codex/hooks.json, ~/.claude/settings.json,
+;; ~/.claude/hooks/, and ~/.claude/CLAUDE.md. A sandboxed agent writing
+;; those files could inject code that runs in the operator's own
+;; unsandboxed CLI sessions, widening privilege beyond this sandbox.
 (allow file-write*
   (subpath (param "SKILLS_PATH"))
   (subpath (param "MEMORY_PATH"))
   (subpath (param "WORKSPACE_PATH"))
   (subpath (param "LOGS_PATH"))
-  (subpath (string-append (param "USER_HOME") "/.codex"))
-  (subpath (string-append (param "USER_HOME") "/.claude"))
+  ;; codex CLI: session/auth/log state only.
+  (subpath (string-append (param "USER_HOME") "/.codex/sessions"))
+  (subpath (string-append (param "USER_HOME") "/.codex/archived_sessions"))
+  (subpath (string-append (param "USER_HOME") "/.codex/log"))
+  (regex (string-append "^" (param "USER_HOME") "/\\.codex/history\\.jsonl$"))
+  (regex (string-append "^" (param "USER_HOME") "/\\.codex/version\\.json$"))
+  (regex (string-append "^" (param "USER_HOME") "/\\.codex/auth\\.json$"))
+  ;; claude CLI: session transcripts, todos, telemetry, shell snapshots,
+  ;; ide locks, history — NOT settings.json / hooks/ / agents/ / CLAUDE.md.
+  (subpath (string-append (param "USER_HOME") "/.claude/projects"))
+  (subpath (string-append (param "USER_HOME") "/.claude/todos"))
+  (subpath (string-append (param "USER_HOME") "/.claude/statsig"))
+  (subpath (string-append (param "USER_HOME") "/.claude/shell-snapshots"))
+  (subpath (string-append (param "USER_HOME") "/.claude/session-env"))
+  (subpath (string-append (param "USER_HOME") "/.claude/sessions"))
+  (subpath (string-append (param "USER_HOME") "/.claude/debug"))
+  (subpath (string-append (param "USER_HOME") "/.claude/ide"))
+  (subpath (string-append (param "USER_HOME") "/.claude/paste-cache"))
+  (subpath (string-append (param "USER_HOME") "/.claude/file-history"))
+  (regex (string-append "^" (param "USER_HOME") "/\\.claude/history\\.jsonl$"))
+  (regex (string-append "^" (param "USER_HOME") "/\\.claude/\\.credentials\\.json$"))
   (subpath "/private/tmp")
   (subpath "/private/var/tmp")
   (subpath "/private/var/folders"))

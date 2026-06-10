@@ -9,7 +9,9 @@
 //!
 //! Hooks run through the same sandbox profile as the agent's own bash, so
 //! they can read everywhere but only write to skills/, memory/, workspace/,
-//! logs/, and /tmp. The kernel itself is immutable to them.
+//! logs/, /tmp, and specific session/auth subdirectories under ~/.codex and
+//! ~/.claude (not their full config trees). The kernel itself is immutable to
+//! them.
 
 use serde_json::{json, Value};
 use std::{
