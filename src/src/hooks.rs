@@ -303,6 +303,29 @@ fn run_hook(
 
     if unsandboxed {
         command.env("LAZAR_NO_SANDBOX", "1");
+
+        // See main.rs for rationale: when operator opts out of sandbox,
+        // hook scripts also need real shell env to interact with the system.
+        const PASSTHROUGH_VARS: &[&str] = &[
+            "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+            "GPG_TTY", "GNUPGHOME",
+            "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN",
+            "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+            "GOOGLE_API_KEY", "MISTRAL_API_KEY", "TOGETHER_API_KEY",
+            "PERPLEXITY_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
+            "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+            "EDITOR", "VISUAL", "PAGER",
+            "LC_ALL", "LC_CTYPE",
+            "COLORTERM", "CLICOLOR", "FORCE_COLOR", "NO_COLOR",
+            "USER", "LOGNAME",
+            "TMPDIR",
+        ];
+        for var in PASSTHROUGH_VARS {
+            if let Ok(val) = env::var(var) {
+                command.env(var, val);
+            }
+        }
     }
 
     #[cfg(unix)]

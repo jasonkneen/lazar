@@ -54,6 +54,7 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 200_000;
 const DEFAULT_MAX_AGENT_TURNS: u32 = 50;
+const DEFAULT_MAX_TEXT_ONLY_TURNS: u32 = 20;
 const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
 const TOOL_READ_CHUNK_BYTES: usize = 8192;
 
@@ -522,6 +523,31 @@ fn run_bash(cmd: &str) -> String {
     // intent would be silently dropped).
     if unsandboxed {
         command.env("LAZAR_NO_SANDBOX", "1");
+
+        // When unsandboxed, operator explicitly opted out of isolation.
+        // Pass through credentials and config that real shells/CLIs need:
+        // SSH agent, GPG, GitHub/GitLab tokens, common LLM API keys,
+        // editor/pager preferences, locale, color settings.
+        const PASSTHROUGH_VARS: &[&str] = &[
+            "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+            "GPG_TTY", "GNUPGHOME",
+            "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN",
+            "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
+            "GOOGLE_API_KEY", "MISTRAL_API_KEY", "TOGETHER_API_KEY",
+            "PERPLEXITY_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
+            "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
+            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+            "EDITOR", "VISUAL", "PAGER",
+            "LC_ALL", "LC_CTYPE",
+            "COLORTERM", "CLICOLOR", "FORCE_COLOR", "NO_COLOR",
+            "USER", "LOGNAME",
+            "TMPDIR",
+        ];
+        for var in PASSTHROUGH_VARS {
+            if let Ok(val) = env::var(var) {
+                command.env(var, val);
+            }
+        }
     }
 
     if let Ok(model) = env::var("LAZAR_MODEL") {
@@ -1054,7 +1080,33 @@ fn parse_sse_reader<R: BufRead>(
     }
 
     if !saw_message_stop {
-        return Err("SSE stream ended before message_stop".into());
+        // SSE stream ended before message_stop.
+        //
+        // Some upstreams (notably MiniMax) occasionally close the SSE socket
+        // without sending a final `message_stop`, especially on longer outputs
+        // or near rate limits. Anthropic always closes cleanly.
+        //
+        // If we received a `message_delta` that set a stop_reason, treat this
+        // as a recoverable partial response and surface it to the agent loop
+        // with the last seen stop_reason. The consumer (lazartui / codesurf-cli
+        // lazar extension) gets its `invoke_end` instead of hanging on a
+        // stream that will never deliver one.
+        //
+        // If we never saw a stop_reason, it's a genuine mid-stream abort —
+        // return an error but include the partial content in the message so
+        // the operator can see what was received.
+        if stop_reason.is_empty() {
+            return Err(format!(
+                "SSE stream ended before message_stop and no stop_reason was set; partial content had {} block(s)",
+                blocks.len()
+            )
+            .into());
+        }
+        // Recoverable partial response. Continue as if message_stop arrived.
+        eprintln!(
+            "[lazar] WARN: SSE stream ended before message_stop; recovering with stop_reason={stop_reason:?}, {} block(s) already accumulated",
+            blocks.len()
+        );
     }
 
     if format == OutputFormat::Text && printed_any_text {
@@ -1475,6 +1527,15 @@ fn run_agent(
     // happily runs `bash -c ""` forever.
     let mut consecutive_empty_turns: u32 = 0;
     const MAX_CONSECUTIVE_EMPTY_TURNS: u32 = 3;
+    // end_turn with no tool_use — model talked instead of acting. Keep looping
+    // in-process instead of exiting and forcing the TUI to inject fake prompts.
+    let mut consecutive_text_only_turns: u32 = 0;
+    let max_text_only_turns = env::var("LAZAR_MAX_TEXT_ONLY_TURNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|turns: &u32| *turns > 0)
+        .unwrap_or(DEFAULT_MAX_TEXT_ONLY_TURNS);
+    let auto_continue = !env_flag_enabled("LAZAR_NO_AUTO_CONTINUE");
     let max_agent_turns = env::var("LAZAR_MAX_TURNS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1749,6 +1810,29 @@ fn run_agent(
                 println!("{result}");
             }
 
+            if auto_continue
+                && tool_uses_this_turn == 0
+                && consecutive_text_only_turns < max_text_only_turns
+            {
+                consecutive_text_only_turns += 1;
+                let nudge = "Continue. Use the bash tool to execute the next step. Do not end your turn with text only.";
+                messages.push(json!({"role": "user", "content": nudge}));
+                append_stream(json!({"kind": "user", "content": nudge}));
+                if format == OutputFormat::StreamJson {
+                    emit_event(json!({
+                        "type": "user_message",
+                        "content": nudge,
+                        "auto_continue": true,
+                    }));
+                }
+                if verbose {
+                    eprintln!(
+                        "[lazar] end_turn without tools; auto-continuing ({consecutive_text_only_turns}/{max_text_only_turns})"
+                    );
+                }
+                continue;
+            }
+
             if verbose {
                 eprintln!("[lazar] invoke_end stop_reason={stop_reason} duration={duration_ms}ms");
             }
@@ -1896,6 +1980,7 @@ fn run_agent(
             }
         } else if had_any_valid_call {
             consecutive_empty_turns = 0;
+            consecutive_text_only_turns = 0;
         }
 
         if results.is_empty() {
@@ -2174,11 +2259,30 @@ mod tests {
     }
 
     #[test]
-    fn sse_parser_rejects_eof_before_message_stop() {
-        let data = b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n";
+    fn sse_parser_recovers_eof_after_stop_reason() {
+        let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+data: {"type":"content_block_stop","index":0}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+"#;
+
+        let (content, stop_reason) =
+            parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "partial");
+    }
+
+    #[test]
+    fn sse_parser_rejects_eof_without_stop_reason() {
+        let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+"#;
         let err = parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap_err();
 
         assert!(err.to_string().contains("ended before message_stop"));
+        assert!(err.to_string().contains("no stop_reason"));
     }
 
     #[test]

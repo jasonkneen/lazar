@@ -75,6 +75,20 @@ if ! bash "$LAZAR_HOME/scripts/kernel-build.sh"; then
     exit 1
 fi
 
+# Patch-specific verification — runs $PROPOSAL/verify.sh if present.
+# Failure here triggers full rollback (source + rebuild old binary).
+if ! bash "$LAZAR_HOME/scripts/kernel-verify.sh" "$NAME"; then
+    echo "[kernel-apply] verification failed; rolling back source and rebuilding" >&2
+    chmod -R u+w "$LAZAR_HOME/src" 2>/dev/null || true
+    rm -rf "$LAZAR_HOME/src"
+    cp -R "$BACKUP" "$LAZAR_HOME/src"
+    if ! bash "$LAZAR_HOME/scripts/kernel-build.sh"; then
+        echo "[kernel-apply] CRITICAL: rollback rebuild also failed — kernel binary may be stale" >&2
+        echo "[kernel-apply] backup source is at: $BACKUP" >&2
+    fi
+    exit 1
+fi
+
 echo "[kernel-apply] applied proposal: $NAME"
 echo "[kernel-apply] backup preserved at: $BACKUP"
 echo "[kernel-apply] proposal preserved at: $PROPOSAL"
