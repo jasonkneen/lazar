@@ -1360,29 +1360,15 @@ fn run_agent(
          \"fine\") against the actual prior turn instead of inferring from \
          recent tool output.\n\
          \n\
-         RECURSION FOR REFERENTIAL PROMPTS (use this when the operator forgot --session)\n\
+         REFERENTIAL PROMPTS (when the operator forgot --session)\n\
          If you receive a short, ambiguous, or referential prompt (\"yes\", \
          \"do that\", \"ok\", \"fine\", \"continue\") AND you have no prior \
-         messages in this invocation (no --session/--resume was passed), \
-         DO NOT infer the referent from recent tool output. That fill-in \
-         pattern is the documented #1 source of \"executes the wrong thing \
-         confidently\" errors. Instead:\n\
-         \n\
-         1. PREFER asking the operator a one-line clarifying question and \
-            ending your turn. Confident-but-wrong is worse than confirming.\n\
-         \n\
-         2. OR, if you genuinely think you can disambiguate by reading the \
-            most recent session, recurse on yourself with --resume:\n\
-                execute `lazar --resume -p \"<the same referential prompt>\" \
-                --output-format text`\n\
-            The nested call inherits the most recent session log and has \
-            real conversation history. Use its answer as your own. This \
-            costs an API call but converts a hallucination into a real \
-            answer.\n\
-         \n\
-         Note: nested `lazar -p` calls require LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1; \
-         if recursion fails with a missing-key error, fall back to (1) — ask \
-         the operator. Do NOT silently guess.\n\
+         messages in this invocation, DO NOT infer the referent from recent \
+         tool output. That fill-in pattern is the documented #1 source of \
+         \"executes the wrong thing confidently\" errors. Ask the operator a \
+         one-line clarifying question and end your turn. Confident-but-wrong \
+         is worse than confirming. (Raw self-recursion via `lazar -p` is \
+         disabled — a pre-tool hook vetoes it.)\n\
          \n\
          BUT every prompt, response, tool call, and tool result you (and \
          past-you) ever produced is appended as JSONL to:\n\
@@ -1420,12 +1406,12 @@ fn run_agent(
          Then read the relevant SKILL.md before acting. Skills carry the \
          hard-won detail you need.\n\
          \n\
-         RECURSION\n\
-         Tool subprocesses do not inherit ANTHROPIC_API_KEY by default. \
-         If the operator set LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1, \
-         nested calls can use: execute `LAZAR_DEPTH={next_depth} lazar -p \"...\"`. \
-         Otherwise treat nested `lazar -p` API calls as unavailable and ask \
-         the user to re-run with that opt-in if recursion is essential.\n\
+         DELEGATION (sub-agents)\n\
+         To delegate work to a sub-agent, use the subagent core skill: \
+         `bash skills/_meta/subagent/spawn.sh <task-id> <prompt-file>`. \
+         It lints the prompt, bounds retries, kills wedged children, and \
+         gates success by re-checking your declared claims. Raw `lazar -p` \
+         calls are vetoed by a pre-tool hook — read _meta/subagent/SKILL.md. \
          Recursion depth is capped at {max_depth}; current depth is {depth}.\n\
          \n\
          BOUNDARIES\n\
@@ -1498,7 +1484,6 @@ fn run_agent(
          passes — proof of work overrides suspicion.",
         home_disp = home.display(),
         skills_disp = skills.display(),
-        next_depth = depth + 1,
         max_depth = MAX_DEPTH,
         depth = depth,
         sandbox_status_line = if no_sandbox_active() {

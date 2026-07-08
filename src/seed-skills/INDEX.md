@@ -1,3 +1,7 @@
+## Core (operating basics — outrank all other skills)
+- _meta/subagent — the only sanctioned way to delegate; spawn.sh wrapper, raw lazar -p vetoed
+- soul / memory / verify — see memory/PINNED.md
+
 # lazar skill index
 
 One line per skill. Read the SKILL.md inside each folder for usage.
