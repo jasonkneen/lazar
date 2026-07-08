@@ -101,3 +101,8 @@ If a key is missing from Keychain, check (names only):
 bash "$LAZAR_HOME/skills/env-vars/keychain-list.sh"
 bash "$LAZAR_HOME/skills/env-vars/keychain-verify.sh"
 ```
+
+## Launch defaults (lazar / glazar / lazartui)
+
+All three load keys via `scripts/lazar-env.sh` and default to **MiniMax-M3 direct**.
+Switch provider: `LAZAR_BACKEND=xai lazar -p "..."` or `lazar-backend openrouter`.
