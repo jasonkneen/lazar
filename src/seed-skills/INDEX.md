@@ -6,7 +6,7 @@ One line per skill. Read the SKILL.md inside each folder for usage.
 - _meta/find-capability — locate or build a capability for a need
 - _meta/shell-handoff — make a skill invokable from the user's shell via aliases.sh (the right way; sandbox blocks writes to PATH)
 - _meta/load-context — safely read prior conversation from logs/stream.jsonl WITHOUT blowing the context window (NEVER cat the whole log)
-- _meta/log-rotation — kernel auto-rotates at LAZAR_LOG_MAX_BYTES; this skill is for richer per-archive summaries (top prompts/commands), compression, and pruning
+- _meta/log-rotation — enrich kernel-written log summaries with top prompts/commands; logs/ is trusted kernel-owned state, so skills read archives but write only to memory/
 - _meta/archive-search — L3 memory tier: search rotated stream.jsonl.*.bak archives safely, only after L1 (current) and L2 (summaries) don't have the answer
 - _meta/distill — opt-in LLM curation: extract durable learnings (gotchas, conventions, recipes, preferences) from a rotated archive into memory/distilled/. Costs an LLM call per archive; richer than mechanical summaries.
 - _meta/health-check — full self-test: validates kernel locked, env vars, sandbox boundaries, auto-rotation, memory persistence, recursion, end-to-end TS+Python builds. Runs in temp workspace, cleans up, prints PASS/FAIL summary.

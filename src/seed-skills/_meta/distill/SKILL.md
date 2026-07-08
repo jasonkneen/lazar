@@ -58,11 +58,11 @@ Transcript:
 $SAMPLE" > /tmp/distill-out.md 2>/dev/null
 
 # If the agent said nothing durable, bail
-grep -qi "nothing durable" /tmp/distill-out.md && { echo "no durable learnings found"; exit 0; }
+rg -qi "nothing durable" /tmp/distill-out.md && { echo "no durable learnings found"; exit 0; }
 
 # Write to memory, tagged with source + date
 mkdir -p $LAZAR_HOME/memory/distilled
-TS=$(basename "$ARCHIVE" | grep -oE '[0-9]+')
+TS=$(basename "$ARCHIVE" | rg -o '[0-9]+')
 DATE=$(date -u +%Y-%m-%d)
 
 # Split the output by section, append each to its category file
@@ -116,7 +116,7 @@ Distilled bullets carry `(distilled <date>, from archive ...)` tags. To prune st
 find $LAZAR_HOME/memory/distilled -name '*.md' -exec sed -i '' '/distilled 202[0-5]-/d' {} +
 ```
 
-Or do this lazily: when reading a `distilled/` file at task start, the agent can filter on date and warn the user about stale entries. Don't over-engineer the lifecycle — markdown grep is fine.
+Or do this lazily: when reading a `distilled/` file at task start, the agent can filter on date and warn the user about stale entries. Don't over-engineer the lifecycle — markdown search with `rg` is fine.
 
 ## Anti-patterns
 

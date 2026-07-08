@@ -9,7 +9,7 @@ PAYLOAD=$(cat)
 COMMAND=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"command":"\([^"]*\)".*/\1/p')
 
 # Deny anything that looks like rm -rf / or rm -rf $HOME
-if printf '%s' "$COMMAND" | grep -Eq 'rm[[:space:]]+-rf?[[:space:]]+/(\s|$)|rm[[:space:]]+-rf?[[:space:]]+\$?HOME|rm[[:space:]]+-rf?[[:space:]]+~/?(\s|$)'; then
+if printf '%s' "$COMMAND" | rg -q 'rm[[:space:]]+-rf?[[:space:]]+/(\s|$)|rm[[:space:]]+-rf?[[:space:]]+\$?HOME|rm[[:space:]]+-rf?[[:space:]]+~/?(\s|$)'; then
     cat <<'EOF'
 {"action":"veto","reason":"command appears to delete the system root or home directory; refused by pre-tool hook"}
 EOF
@@ -17,7 +17,7 @@ EOF
 fi
 
 # Deny piping curl|bash from arbitrary URLs.
-if printf '%s' "$COMMAND" | grep -Eq 'curl[^|]*\|[[:space:]]*(bash|sh|zsh)'; then
+if printf '%s' "$COMMAND" | rg -q 'curl[^|]*\|[[:space:]]*(bash|sh|zsh)'; then
     cat <<'EOF'
 {"action":"veto","reason":"refusing to pipe network input to a shell; download, inspect, then run"}
 EOF

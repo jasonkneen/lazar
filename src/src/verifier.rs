@@ -257,11 +257,7 @@ pub fn format_warning(suspicions: &[Suspicion], tool_uses_in_turn: usize) -> Str
     ));
     out.push_str("Suspicious phrases:\n");
     for (i, s) in suspicions.iter().enumerate().take(8) {
-        let preview = if s.matched_text.len() > 100 {
-            format!("{}…", &s.matched_text[..100])
-        } else {
-            s.matched_text.clone()
-        };
+        let preview = short(&s.matched_text, 100);
         out.push_str(&format!("  {}. [{}] {}\n", i + 1, s.kind.as_str(), preview));
     }
     if suspicions.len() > 8 {
@@ -592,7 +588,7 @@ pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
             const READ_CAP: usize = 65_536;
             match fs::read_to_string(&p) {
                 Ok(s) => {
-                    let head = if s.len() > READ_CAP { &s[..READ_CAP] } else { &s };
+                    let head = head_bytes(&s, READ_CAP);
                     let ok = head.contains(needle.as_str());
                     ClaimResult {
                         claim: claim.clone(),
@@ -672,8 +668,22 @@ fn short(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max])
+        format!("{}…", head_bytes(s, max))
     }
+}
+
+/// Truncate to at most `cap` bytes without splitting a UTF-8 sequence.
+/// Slicing at a raw byte index panics when the index lands inside a
+/// multibyte char (e.g. '─' from TUI banners at the 64KB read cap).
+fn head_bytes(s: &str, cap: usize) -> &str {
+    if s.len() <= cap {
+        return s;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// Format a verify report as a banner. Loud on FAIL, quiet on PASS.
@@ -930,6 +940,40 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(pass.passed);
         assert!(!fail.passed);
+    }
+
+    #[test]
+    fn contains_claim_survives_multibyte_char_at_read_cap() {
+        // Regression: a '─' straddling the 64KB cap panicked
+        // ("end byte index 65536 is not a char boundary").
+        let path = std::env::temp_dir().join(format!(
+            "lazar-contains-mb-test-{}-{}",
+            std::process::id(),
+            now_nanos_local()
+        ));
+        let mut content = "x".repeat(65_534);
+        content.push('─'); // 3 bytes: occupies 65534..65537
+        content.push_str("tail marker");
+        std::fs::write(&path, content).unwrap();
+        let result = check_claim(&VerifyClaim::Contains(path.clone(), "x".into()));
+        std::fs::remove_file(&path).ok();
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn head_bytes_backs_off_to_char_boundary() {
+        let mut s = "x".repeat(65_534);
+        s.push('─');
+        assert_eq!(head_bytes(&s, 65_536).len(), 65_534);
+        assert_eq!(head_bytes("ab", 10), "ab");
+    }
+
+    #[test]
+    fn short_never_splits_multibyte() {
+        let s = "aaaa─bbbb"; // '─' spans bytes 4..7
+        let t = short(s, 5);
+        assert!(t.starts_with("aaaa"));
+        assert!(t.ends_with('…'));
     }
 
     fn now_nanos_local() -> u128 {

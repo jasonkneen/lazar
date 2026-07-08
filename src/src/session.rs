@@ -5,7 +5,7 @@
 //!      prepended to the message array. The agent sees actual conversation
 //!      history, not just ambient state.
 //!   2. New events (user prompt, assistant turns, tool results) are
-//!      appended to that session log AS WELL AS to stream.jsonl.
+//!      appended to that kernel-owned session log AS WELL AS to stream.jsonl.
 //!
 //! This fixes the multi-turn referential bug: "yes" / "do that" / "fine"
 //! now resolve against the actual prior turn instead of being inferred
@@ -62,7 +62,8 @@ pub fn validate_session_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Path to the session log for this id. Caller is responsible for
+/// Path to the trusted, kernel-owned session log for this id. The sandbox
+/// profile must not grant tools write access to this tree. Caller is responsible for
 /// validating the id first.
 pub fn session_log_path(id: &str) -> PathBuf {
     lazar_home()

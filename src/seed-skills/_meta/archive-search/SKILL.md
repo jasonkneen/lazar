@@ -13,7 +13,7 @@ This is the **L3 tier** of lazar's three-tier memory. Use it when L1 (current lo
 ## Hard rules
 
 - **NEVER** `cat $LAZAR_HOME/logs/stream.jsonl.*.bak`. Archives can be 10MB each — globbing them all into one cat will absolutely blow context.
-- **Always grep with bounds.** Process one archive at a time, pipe through `tail -c` or `head -n`.
+- **Always use `rg` with bounds.** Process one archive at a time, pipe through `tail -c` or `head -n`.
 - **Read L2 first.** Each `.bak` archive has a sibling summary at `memory/log-summaries/<ts>.md`. Read those to figure out *which* archive to search before touching one.
 
 ## Recipes
@@ -31,20 +31,20 @@ The filename embeds a unix timestamp: `stream.jsonl.<ts>.bak`. Bigger number = n
 
 ### Search ONE archive for a topic
 
-    grep -i "topic-keyword" $LAZAR_HOME/logs/stream.jsonl.<TS>.bak | tail -n 50
+    rg -i "topic-keyword" $LAZAR_HOME/logs/stream.jsonl.<TS>.bak | tail -n 50
 
 ### Find a specific user prompt across all archives (bounded)
 
     for f in $LAZAR_HOME/logs/stream.jsonl.*.bak; do
       jq -r 'select(.kind == "user") | "\(.ts_ms) \(.content)"' "$f" 2>/dev/null \
-        | grep -i "your-search" \
+        | rg -i "your-search" \
         | tail -n 5
     done | tail -n 30
 
 ### Find when a particular file was first touched
 
     for f in $LAZAR_HOME/logs/stream.jsonl.*.bak $LAZAR_HOME/logs/stream.jsonl; do
-      grep -l "/path/to/file" "$f" 2>/dev/null
+      rg -l "/path/to/file" "$f" 2>/dev/null
     done | head -n 1
 
 ### Pull the full context of a specific invocation by ts_ms range
@@ -59,24 +59,21 @@ If you know an invocation happened around timestamp `T`, slice the relevant arch
       }
     ' $LAZAR_HOME/logs/stream.jsonl.<TS>.bak | tail -c 50000
 
-### Compressed archives
+### Pruned archives
 
-If `_meta/log-rotation` step "Compress old archives" was run, archives end in `.bak.gz`. Use `zgrep` and `zcat`:
-
-    zgrep -i "topic" $LAZAR_HOME/logs/stream.jsonl.<TS>.bak.gz | tail -n 50
-    zcat $LAZAR_HOME/logs/stream.jsonl.<TS>.bak.gz | jq -r 'select(.kind == "user") | .content' | tail -n 30
+The kernel may prune old full-fidelity archives according to `LAZAR_LOG_ARCHIVE_KEEP`. If a summary points at an archive that no longer exists, use the summary as the durable record and ask the user before widening the search elsewhere.
 
 ## Workflow when the user asks about old context
 
 1. `cat $LAZAR_HOME/memory/log-summaries/*.md | head -n 100` — see what time periods are summarized.
 2. Identify the right summary by date or topic. Note its archive filename (in the summary header).
-3. Grep that single archive with bounded output.
+3. Search that single archive with bounded `rg` output.
 4. If multiple archives might contain it, iterate over them ONE AT A TIME with `for f in ...; do ... done` and tail the cumulative output.
 
 ## Anti-patterns
 
 - Globbing all archives into a single `cat` or `jq`. Always per-file with bounds.
-- Using `grep -r` without piping into `head` or `tail` — recursive grep across 100MB of archives is slow.
+- Running broad recursive `rg` without piping into `head` or `tail` — recursive search across 100MB of archives is slow.
 - Reading archives when L2 summaries already answered the question.
 - Forgetting to read summaries first and going straight to archive search.
 

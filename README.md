@@ -9,7 +9,7 @@ This is the TUI it built for me -- yours will not be the same as this
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-One tool: `execute(command)` — bash, sandboxed.
+One tool: `bash(command)` — bash, sandboxed.
 One protocol: skills as filesystem entries.
 Everything else is emergent.
 
@@ -26,10 +26,10 @@ Everything else is emergent.
 └── logs/stream.jsonl      append-only event stream (kernel auto-rotates at ~10MB)
 ```
 
-The kernel is a small Rust runner. It does three things:
+The kernel is a small Rust runner, not an autopilot or self-modifier. It does three things:
 
 1. Takes a prompt via `-p`.
-2. Calls Claude (SSE-streamed) with one tool, `execute(command)`.
+2. Calls Claude (SSE-streamed) with one tool, `bash(command)`.
 3. Runs the bash through `sandbox-exec` and feeds the output back.
 
 That's it. State (memory, skills) lives on disk. Capabilities are markdown files
@@ -41,7 +41,26 @@ The kernel also speaks structured `--output-format stream-json` for
 programmatic consumers (TUIs, log analyzers), records every event to
 an append-only `logs/stream.jsonl`, and ships a few helper scripts
 (`scripts/kernel-*.sh`, `scripts/lazar-chat.sh`). Everything beyond
-that lives as skills.
+that lives as skills. Kernel changes are intentionally outside the agent's runtime
+write path and must be staged and applied through the proposal ceremony.
+
+## Kernel guardrails
+
+The Rust kernel is the protected core. Runtime automation, hooks, skills, and
+model-issued bash may read it, but sandboxed runtime commands must not write to
+`src/` or `bin/`. There is no Rust-side autopilot/self-evolver that patches or
+rebuilds the kernel on its own.
+
+Kernel changes follow the proposal flow:
+
+1. Stage a full proposed source tree under `workspace/proposals/<name>/src/`.
+2. Review the diff produced by `scripts/kernel-apply.sh <name>`.
+3. Confirm from an interactive operator terminal.
+4. Let the script back up current source, apply with delete semantics, rebuild,
+   and re-lock the installed binary.
+
+This keeps the core kernel operator-reviewed even though normal Lazar work can
+continue in writable areas such as `skills/`, `memory/`, and `workspace/`.
 
 ## Setup
 
@@ -190,7 +209,7 @@ That creates a timestamped `src.backup.*` first. Runtime state is still preserve
 Every bash command runs through `sandbox-exec` with this policy:
 
 - **Reads:** open. The agent can read its own kernel and source.
-- **Writes:** only `skills/`, `memory/`, `workspace/`, `logs/`, and `/tmp`.
+- **Writes:** only `skills/`, `memory/`, `workspace/`, `/tmp`, and selected session/auth subdirectories. `logs/` is trusted kernel-owned state: tools/skills may read it, not mutate it.
 - **Network:** open (for API calls and skills like web-search).
 - **Process spawn:** open (for CLI tools and optional `lazar -p` recursion; nested API recursion requires `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1`).
 
@@ -200,6 +219,5 @@ Writes outside the allowed zones return `Operation not permitted`. The agent see
 
 - The runner never "knows about" specific capabilities. A new skill becomes available the moment its SKILL.md exists; no recompile, no registration code.
 - Seed skills are baked into the binary so reset is fully self-sufficient — even if `src/` is gone, reset still works.
-- The kernel logs every invocation to `logs/<unix-millis>.json` for replay and debugging.
-- The kernel appends every invocation to `logs/stream.jsonl` for replay and debugging, and auto-rotates that log before it grows past `LAZAR_LOG_MAX_BYTES`.
+- The kernel appends every invocation to `logs/stream.jsonl` for replay and debugging, auto-rotates that log before it grows past `LAZAR_LOG_MAX_BYTES`, and owns archive pruning.
 - Human output streams text live. `--output-format stream-json` emits structured JSONL events for TUIs and other programmatic consumers.

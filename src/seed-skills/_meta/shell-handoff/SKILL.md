@@ -59,7 +59,7 @@ Workspace is in the writable allowlist. `--reset-all` wipes workspace, so aliase
 
 Before appending, check whether the alias is already there:
 
-    grep -q "^alias <name>=" $LAZAR_HOME/workspace/aliases.sh || \
+    rg -q "^alias <name>=" $LAZAR_HOME/workspace/aliases.sh || \
       cat >> $LAZAR_HOME/workspace/aliases.sh <<'EOF'
     ...
     EOF
