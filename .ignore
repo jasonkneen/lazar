@@ -1,0 +1,30 @@
+# ripgrep/fd ignore file (git does NOT read this — .gitignore is separate).
+# Purpose: make lazar SEE its own work with bare `rg`. lazar's working dirs
+# (workspace/ memory/ skills/ logs/) are gitignored as runtime state, and rg
+# respects .gitignore — so before this file, a bare `rg` was blind to lazar's
+# own files (it insisted a real pricing-component page didn't exist, 2026-07-08).
+# This file (higher precedence than .gitignore) re-includes those work dirs for
+# search, while still excluding the multi-GB caches/artifacts so searches stay
+# fast and relevant. git tracking is unchanged.
+
+# Re-include lazar's real work dirs (override .gitignore, for rg only).
+!workspace/
+!memory/
+!skills/
+!logs/
+
+# ...but keep the heavy caches/artifacts out of searches.
+workspace/cargo-target/
+workspace/.cargo-target/
+workspace/gocache/
+workspace/.gocache/
+workspace/gomodcache/
+workspace/.gomodcache/
+workspace/gopath/
+workspace/.gopath/
+workspace/kernel-backups/
+workspace/web-fetch-cache/
+workspace/.cargo-target*/
+src/target/
+logs/*.bak
+logs/*.bak.gz
