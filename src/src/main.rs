@@ -1596,6 +1596,15 @@ fn run_agent(
         .and_then(|s| s.parse().ok())
         .filter(|turns: &u32| *turns > 0)
         .unwrap_or(DEFAULT_MAX_AGENT_TURNS);
+    // Model output cap. The old hardcoded 8192 (~30KB) truncated large single
+    // writes mid-string → unparseable tool_use → "empty tool call" abort.
+    // Configurable now, with a higher default so big files don't require
+    // chunking as aggressively. Env-tunable per model's real output ceiling.
+    let max_tokens: u32 = env::var("LAZAR_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|t: &u32| *t > 0)
+        .unwrap_or(16384);
     let max_tool_calls = env::var("LAZAR_MAX_TOOL_CALLS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1616,7 +1625,7 @@ fn run_agent(
 
         let body = json!({
             "model": model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "system": system,
             "tools": [tool],
             "messages": messages,
