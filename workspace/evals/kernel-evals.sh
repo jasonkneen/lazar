@@ -63,6 +63,8 @@ if [ -x "$HOOK" ]; then
   echo "$V" | rg -q '"action":"veto"' && ok "veto blocks raw lazar -p (live hook)" || no "veto block" "$V"
   A=$(printf '{"command":"bash skills/_meta/subagent/spawn.sh t /tmp/p"}' | bash "$HOOK" 2>&1)
   echo "$A" | rg -q '"action":"continue"' && ok "veto allows spawn.sh wrapper" || no "veto allow" "$A"
+  B=$(printf '{"command":"echo subagent/spawn.sh; lazar -p evil"}' | bash "$HOOK" 2>&1)
+  echo "$B" | rg -q '"action":"veto"' && ok "veto blocks decoy spawn.sh + raw lazar -p" || no "veto decoy bypass" "$B"
 else
   sk "spawn-veto" "hook not installed"
 fi

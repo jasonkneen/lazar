@@ -9,9 +9,10 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/logs" "$T/memory/distilled"
 
 # Synthetic log: a real prompt, a file-writing command, and a distilled file that must survive.
+# Paths use $T (LAZAR_HOME) so harvest's portable LAZAR_HOME-zone matcher hits them.
 cat > "$T/logs/stream.jsonl" <<EOF
 {"kind":"user","content":"build the pricing page","ts_ms":1783000000000}
-{"kind":"tool_result","command":"cat > /Users/x/lazar/workspace/pricing/index.html <<E","ts_ms":1783000001000}
+{"kind":"tool_result","command":"cat > $T/workspace/pricing/index.html <<E","ts_ms":1783000001000}
 {"kind":"user","content":"You said you would do something","ts_ms":1783000002000}
 EOF
 echo "keep me" > "$T/memory/distilled/stream.jsonl.999.bak.md"

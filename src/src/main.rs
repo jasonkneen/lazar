@@ -758,8 +758,9 @@ fn write_new_no_follow(path: &Path, label: &str, contents: &str) -> std::io::Res
 /// archive and a minimal summary is written into memory/log-summaries/ so the
 /// agent has a navigable index of past archives. Skills like _meta/log-rotation
 /// can layer richer summaries on top. After rotation hooks run, the kernel prunes
-/// old archives according to LAZAR_LOG_ARCHIVE_KEEP (default 5, 0 disables).
-/// This keeps the log from growing unbounded while preserving memory summaries.
+/// old *harvested* archives according to LAZAR_LOG_ARCHIVE_KEEP (default 5,
+/// 0 disables). Unharvested archives are never deleted — harvest first
+/// (memory/.harvested), then prune keeps disk bounded.
 /// Result of a successful log rotation. Returned to the caller so it can
 /// fire the `log-rotation` hook AFTER releasing the stream lock — firing
 /// inside the lock would deadlock because hooks themselves write hook_start
@@ -864,7 +865,27 @@ fn log_archive_timestamp(path: &Path) -> Option<u128> {
     stem.split('.').next()?.parse().ok()
 }
 
-fn archives_to_prune(logs: &Path, keep: usize) -> Vec<PathBuf> {
+/// Load archive basenames recorded by `_meta/log-harvest` in
+/// `memory/.harvested`. Only harvested archives are eligible for prune —
+/// unharvested history is never deleted solely because keep was exceeded.
+fn harvested_archive_names(home: &Path) -> std::collections::HashSet<String> {
+    let path = home.join("memory").join(".harvested");
+    match fs::read_to_string(path) {
+        Ok(s) => s
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+fn archives_to_prune(
+    logs: &Path,
+    keep: usize,
+    harvested: &std::collections::HashSet<String>,
+) -> Vec<PathBuf> {
     if keep == 0 {
         return Vec::new();
     }
@@ -879,6 +900,10 @@ fn archives_to_prune(logs: &Path, keep: usize) -> Vec<PathBuf> {
                 }
                 let ts = log_archive_timestamp(&path)?;
                 let name = path.file_name()?.to_str()?.to_string();
+                // Never prune unharvested archives — durable journal first.
+                if !harvested.contains(&name) {
+                    return None;
+                }
                 Some((ts, name, path))
             })
             .collect(),
@@ -909,7 +934,8 @@ fn log_archive_keep_limit() -> usize {
 }
 
 fn prune_log_archives(logs: &Path) {
-    for archive in archives_to_prune(logs, log_archive_keep_limit()) {
+    let harvested = harvested_archive_names(&lazar_home());
+    for archive in archives_to_prune(logs, log_archive_keep_limit(), &harvested) {
         if let Err(e) = fs::remove_file(&archive) {
             eprintln!(
                 "[lazar] WARN: failed to prune old log archive {}: {e}",
@@ -2370,8 +2396,15 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         fs::write(&old_bak, "old").unwrap();
         fs::write(&mid_gz, "mid").unwrap();
         fs::write(&new_bak, "new").unwrap();
+        let harvested: std::collections::HashSet<String> = [
+            "stream.jsonl.100.1.bak".into(),
+            "stream.jsonl.200.1.bak.gz".into(),
+            "stream.jsonl.300.1.bak".into(),
+        ]
+        .into_iter()
+        .collect();
 
-        let to_prune = archives_to_prune(logs, 2);
+        let to_prune = archives_to_prune(logs, 2, &harvested);
 
         assert_eq!(to_prune, vec![old_bak]);
     }
@@ -2382,8 +2415,14 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let logs = dir.path();
         fs::write(logs.join("stream.jsonl.100.1.bak"), "old").unwrap();
         fs::write(logs.join("stream.jsonl.200.1.bak.gz"), "new").unwrap();
+        let harvested: std::collections::HashSet<String> = [
+            "stream.jsonl.100.1.bak".into(),
+            "stream.jsonl.200.1.bak.gz".into(),
+        ]
+        .into_iter()
+        .collect();
 
-        let to_prune = archives_to_prune(logs, 0);
+        let to_prune = archives_to_prune(logs, 0, &harvested);
 
         assert!(to_prune.is_empty());
     }
@@ -2401,10 +2440,33 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let sessions = logs.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         fs::write(sessions.join("stream.jsonl.050.1.bak"), "session").unwrap();
+        let harvested: std::collections::HashSet<String> = [
+            "stream.jsonl.100.1.bak".into(),
+            "stream.jsonl.200.1.bak".into(),
+        ]
+        .into_iter()
+        .collect();
 
-        let to_prune = archives_to_prune(logs, 1);
+        let to_prune = archives_to_prune(logs, 1, &harvested);
 
         assert_eq!(to_prune, vec![old_bak]);
+    }
+
+    #[test]
+    fn archives_to_prune_skips_unharvested() {
+        let dir = TempTestDir::new("archive-retention-unharvested");
+        let logs = dir.path();
+        let old_bak = logs.join("stream.jsonl.100.1.bak");
+        let new_bak = logs.join("stream.jsonl.200.1.bak");
+        fs::write(&old_bak, "old").unwrap();
+        fs::write(&new_bak, "new").unwrap();
+        // Only the newest is harvested — old unharvested must not be pruned.
+        let harvested: std::collections::HashSet<String> =
+            ["stream.jsonl.200.1.bak".into()].into_iter().collect();
+
+        let to_prune = archives_to_prune(logs, 1, &harvested);
+
+        assert!(to_prune.is_empty(), "unharvested old archive must be kept");
     }
 
     struct TempTestDir {

@@ -69,7 +69,11 @@ fn awaiting_operator(lower: &str) -> bool {
 }
 
 /// trailing_intent is true when the LAST sentence announces an action the
-/// model has not performed ("i'll check…", "let me run…", "going to fix…").
+/// model has not performed ("i'll check…", "let me run…").
+///
+/// Phrases are checked as whole-token prefixes (start of sentence or after
+/// whitespace) so bare substrings like "now i" / "next i" do not fire on
+/// "Now it works" / "Next item is complete".
 fn trailing_intent(lower: &str) -> bool {
     let tail = last_sentence(lower)
         .trim_end_matches([':', ';'])
@@ -78,15 +82,13 @@ fn trailing_intent(lower: &str) -> bool {
     if tail.is_empty() {
         return false;
     }
-    const INTENT_PHRASES: &[&str] = &[
+    const INTENT_PREFIXES: &[&str] = &[
         "i'll ",
         "i will ",
         "let me ",
         "i'm going to ",
         "im going to ",
-        "going to ",
-        "now i",
-        "next i",
+        "i am going to ",
         "checking now",
         "running now",
         "reading now",
@@ -95,8 +97,33 @@ fn trailing_intent(lower: &str) -> bool {
         "give me a moment",
         "do it now",
         "do that now",
+        "now i'll ",
+        "now i will ",
+        "now let me ",
+        "next i'll ",
+        "next i will ",
+        "next let me ",
     ];
-    INTENT_PHRASES.iter().any(|p| tail.contains(p))
+    INTENT_PREFIXES.iter().any(|p| phrase_at_boundary(&tail, p))
+}
+
+/// True if `phrase` appears at the start of `s` or immediately after a space.
+fn phrase_at_boundary(s: &str, phrase: &str) -> bool {
+    if s.starts_with(phrase) {
+        return true;
+    }
+    let mut search_from = 0;
+    while let Some(rel) = s[search_from..].find(phrase) {
+        let i = search_from + rel;
+        if i > 0 && s.as_bytes()[i - 1] == b' ' {
+            return true;
+        }
+        search_from = i + 1;
+        if search_from >= s.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// last_sentence returns the trimmed final sentence, splitting on . ! ? and
@@ -125,6 +152,8 @@ mod tests {
         assert!(looks_stalled("I'll check the README."));
         assert!(looks_stalled("Found the issue. Let me run the tests:"));
         assert!(looks_stalled("I'm going to restart the heartbeat now"));
+        assert!(looks_stalled("Now I'll check the README."));
+        assert!(looks_stalled("Next I'll open the file."));
     }
 
     #[test]
@@ -169,6 +198,16 @@ mod tests {
         assert!(!looks_stalled("Done. All 63 tests pass."));
         let long = format!("{} I'll continue.", "x".repeat(1300));
         assert!(!looks_stalled(&long));
+    }
+
+    #[test]
+    fn never_nudges_substring_false_positives() {
+        // Old bare "now i" / "next i" / "going to " substrings fired mid-word.
+        assert!(!looks_stalled("Now it works fine."));
+        assert!(!looks_stalled("Next item is complete."));
+        assert!(!looks_stalled("Done. Going to the office tomorrow."));
+        assert!(!looks_stalled("Now is the time to rest."));
+        // First-person "I'm going to …" remains a stall (agent domain).
     }
 
     #[test]

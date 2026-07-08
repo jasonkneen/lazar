@@ -31,31 +31,39 @@ echo "$CEIL_OUT" | rg -q 'ceiling' && ok "per-task ceiling stops respawn" || no 
 
 # --- Task 3: spawn + claim re-check via stub lazar ---
 mkdir -p "$TMP/bin"
-cat > "$TMP/bin/lazar" <<'STUB'
+CHILD_OUT="$TMP/spawn_selftest_out"
+cat > "$TMP/bin/lazar" <<STUB
 #!/usr/bin/env bash
-case "$*" in
-  *GOOD*) echo DONE > /tmp/spawn_selftest_out ;;
+case "\$*" in
+  *GOOD*) echo DONE > "$CHILD_OUT" ;;
 esac
 echo '{"type":"verify_report","report":{"all_passed":true}}'
 STUB
 chmod +x "$TMP/bin/lazar"
 export LAZAR_SPAWN_CEILING=2 LAZAR_SPAWN_BUDGET=20
-rm -f /tmp/spawn_selftest_out
-printf 'GOOD write DONE to /tmp/spawn_selftest_out\nSUCCESS: file present\nEXPECT-VERIFY:\n  contains=/tmp/spawn_selftest_out:DONE\n' > "$TMP/win.txt"
+rm -f "$CHILD_OUT"
+printf 'GOOD write DONE to %s\nSUCCESS: file present\nEXPECT-VERIFY:\n  contains=%s:DONE\n' "$CHILD_OUT" "$CHILD_OUT" > "$TMP/win.txt"
 OUT=$(LAZAR_BIN="$TMP/bin/lazar" "$SPAWN" twin "$TMP/win.txt" 2>&1)
-echo "$OUT" | rg -q '"matched":true' && ok "matched claim -> ok" || no "expected matched:true, got: $OUT"
+echo "$OUT" | rg -q '"matched":true' && echo "$OUT" | rg -q '"child_rc"' && ok "matched claim -> ok + child_rc" || no "expected matched:true with child_rc, got: $OUT"
 
-rm -f /tmp/spawn_selftest_miss
-printf 'BAD do nothing for /tmp/spawn_selftest_miss\nSUCCESS: file present\nEXPECT-VERIFY:\n  exists=/tmp/spawn_selftest_miss\n' > "$TMP/miss.txt"
+MISS_OUT="$TMP/spawn_selftest_miss"
+rm -f "$MISS_OUT"
+printf 'BAD do nothing for %s\nSUCCESS: file present\nEXPECT-VERIFY:\n  exists=%s\n' "$MISS_OUT" "$MISS_OUT" > "$TMP/miss.txt"
 OUT=$(LAZAR_BIN="$TMP/bin/lazar" "$SPAWN" tmiss "$TMP/miss.txt" 2>&1)
 echo "$OUT" | rg -q '"matched":false' && ok "unmet claim -> not matched" || no "expected matched:false, got: $OUT"
 
 # --- Task 4: veto hook (isolation — never activated during test) ---
 HOOK="$LAZAR_HOME/hooks/pre-tool.d/10-spawn-discipline.strict.sh"
+# Prefer seed path when live hooks not installed (dev tree).
+[ -x "$HOOK" ] || HOOK="$LAZAR_HOME/src/seed-hooks/pre-tool.d/10-spawn-discipline.strict.sh"
 if [ -x "$HOOK" ]; then
   printf '{"command":"LAZAR_DEPTH=1 lazar -p \\"do a thing\\""}' | "$HOOK" | rg -q '"action":"veto"' && ok "raw lazar -p vetoed" || no "raw spawn should be vetoed"
   printf '{"command":"bash skills/_meta/subagent/spawn.sh t1 /tmp/p.txt"}' | "$HOOK" | rg -q '"action":"continue"' && ok "spawn.sh allowed" || no "spawn.sh should be allowed"
   printf '{"command":"ls -la"}' | "$HOOK" | rg -q '"action":"continue"' && ok "ordinary command allowed" || no "ordinary command should continue"
+  # Regression: allowlist short-circuit must not bypass veto.
+  printf '{"command":"echo skills/_meta/subagent/spawn.sh; lazar -p evil"}' | "$HOOK" | rg -q '"action":"veto"' && ok "decoy spawn.sh + lazar -p vetoed" || no "decoy bypass should be vetoed"
+  printf '{"command":"bin/lazar --prompt hi"}' | "$HOOK" | rg -q '"action":"veto"' && ok "long-form --prompt vetoed" || no "--prompt should be vetoed"
+  printf 'not-json-at-all' | "$HOOK" | rg -q '"action":"veto"' && ok "unparseable payload fail-closed" || no "bad JSON should veto"
 else
   echo "[SKIP] veto hook not present yet"
 fi

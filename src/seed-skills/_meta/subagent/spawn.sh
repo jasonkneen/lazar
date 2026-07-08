@@ -40,8 +40,11 @@ mkdir -p "$STATE"
 CEILING="${LAZAR_SPAWN_CEILING:-2}"
 BUDGET="${LAZAR_SPAWN_BUDGET:-10}"
 
-# --- Session budget (absolute backstop, keyed on parent pid) ---
-SESS="$STATE/.session-${PPID}-spawns"
+# --- Session budget (absolute backstop; prefer session id when set) ---
+SESS_KEY="${LAZAR_SESSION_ID:-ppid-$PPID}"
+# sanitize for filename
+SESS_KEY=$(printf '%s' "$SESS_KEY" | tr -c 'A-Za-z0-9._-' '_')
+SESS="$STATE/.session-${SESS_KEY}-spawns"
 COUNT=$(cat "$SESS" 2>/dev/null || echo 0)
 [ "$COUNT" -ge "$BUDGET" ] && emit_err "session spawn budget ($BUDGET) exhausted — stop and reassess"
 
@@ -105,12 +108,14 @@ fi
 FAILED_JSON=$(printf '%s\n' "${FAILED[@]:-}" | jq -R . | jq -s 'map(select(length>0))')
 
 if [ "$MATCHED" = "true" ]; then
-  printf '{"status":"ok","task":%s,"matched":true,"output":%s}\n' \
-    "$(printf '%s' "$TASK_ID"|jq -R .)" "$(printf '%s' "$OUTFILE"|jq -R .)"
+  # Surface child_rc even on claim match so a crashed child with pre-existing
+  # artifacts is visible (wrapper is still the judge for matched).
+  printf '{"status":"ok","task":%s,"matched":true,"child_rc":%s,"output":%s}\n' \
+    "$(printf '%s' "$TASK_ID"|jq -R .)" "$RC" "$(printf '%s' "$OUTFILE"|jq -R .)"
   exit 0
 else
   echo $((FAILS+1)) > "$CFILE"
-  printf '{"status":"fail","task":%s,"matched":false,"failed_claims":%s,"output":%s}\n' \
-    "$(printf '%s' "$TASK_ID"|jq -R .)" "$FAILED_JSON" "$(printf '%s' "$OUTFILE"|jq -R .)"
+  printf '{"status":"fail","task":%s,"matched":false,"child_rc":%s,"failed_claims":%s,"output":%s}\n' \
+    "$(printf '%s' "$TASK_ID"|jq -R .)" "$RC" "$FAILED_JSON" "$(printf '%s' "$OUTFILE"|jq -R .)"
   exit 2
 fi

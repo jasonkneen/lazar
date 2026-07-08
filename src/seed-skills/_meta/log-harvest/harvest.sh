@@ -52,10 +52,10 @@ harvest_one(){
     | awk 'NF' | awk '!seen[$0]++' | head -40 \
     | sed 's/^/  - /; s/\(.\{140\}\).*/\1…/')
 
-  # Files lazar created/edited (paths under lazar/, deduped)
+  # Files lazar created/edited under LAZAR_HOME zones (portable — not /Users/-only)
   files=$(printf '%s\n' "$data" \
     | jq -R -rc 'fromjson? | (.command // .requested_command // "") ' 2>/dev/null \
-    | grep -oE '/Users/[^ "]*/(workspace|memory|skills|hooks|src)/[^ ")'\''`]*\.(html|css|js|ts|md|sh|py|go|rs|json)' \
+    | grep -oE "${LAZAR_HOME}/(workspace|memory|skills|hooks|src)/[^ \")'\''\`]*\.(html|css|js|ts|md|sh|py|go|rs|json)" \
     | grep -v '/logs/' | awk '!seen[$0]++' | head -80 | sed 's/^/  - /')
 
   [ -z "$prompts" ] && [ -z "$files" ] && return 1

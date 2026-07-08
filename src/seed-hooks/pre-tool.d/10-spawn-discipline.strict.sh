@@ -10,17 +10,18 @@
 # .strict. => fail-closed: if this hook itself errors, the kernel treats it as
 # a veto, so spawning is blocked rather than silently allowed.
 PAYLOAD=$(cat)
-COMMAND=$(printf '%s' "$PAYLOAD" | jq -r '.command // ""' 2>/dev/null)
-[ -z "$COMMAND" ] && COMMAND=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"command":"\(.*\)".*/\1/p')
-
-# Allowlist: the sanctioned wrapper.
-if printf '%s' "$COMMAND" | rg -q 'subagent/spawn\.sh'; then
-  echo '{"action":"continue"}'
+COMMAND=$(printf '%s' "$PAYLOAD" | jq -r '.command // empty' 2>/dev/null)
+if [ -z "$COMMAND" ]; then
+  # Fail closed on unparseable payload — never fall back to greedy sed.
+  cat <<'EOF'
+{"action":"veto","reason":"spawn-discipline: could not parse pre-tool command JSON"}
+EOF
   exit 0
 fi
 
-# Veto any invocation of the lazar binary with -p (a raw sub-agent spawn).
-if printf '%s' "$COMMAND" | rg -q '(^|[[:space:]]|/)lazar[[:space:]]+([^[:space:]]+[[:space:]]+)*-p([[:space:]]|=|$)'; then
+# Raw `lazar -p` / `lazar --prompt` is always vetoed. Do NOT short-circuit on
+# a spawn.sh substring first — that was a bypass ("echo spawn.sh; lazar -p …").
+if printf '%s' "$COMMAND" | rg -q '(^|[[:space:]/;])lazar([[:space:]]+[^[:space:]]+)*[[:space:]]+(-p|--prompt)([[:space:]]|=|$)'; then
   cat <<'EOF'
 {"action":"veto","reason":"raw `lazar -p` spawns are disabled — delegate via the subagent core skill: bash skills/_meta/subagent/spawn.sh <task-id> <prompt-file>"}
 EOF
