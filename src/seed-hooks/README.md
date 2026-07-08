@@ -38,7 +38,7 @@ hooks/
 ├── session-end.d/
 │   └── 00-example-distill.sh.disabled
 ├── log-rotation.d/
-│   └── 00-example-compress-archives.sh.disabled
+│   └── 00-example-summarize-archive.sh.disabled
 ├── agent-stop.d/
 └── tick.d/
     └── 00-example-daily-distill.sh.disabled
@@ -95,18 +95,17 @@ Hooks run through the same `sandbox-exec` profile as agent bash. They can
 - `$LAZAR_SKILLS`
 - `$LAZAR_MEMORY`
 - `$LAZAR_WORKSPACE`
-- `$LAZAR_LOGS`
 - `/tmp`
 
-This means a buggy or malicious hook cannot modify `bin/`, `src/`, or
-anything in your home directory outside `~/lazar`. Same boundary as the
-agent's own code execution.
+This means a buggy or malicious hook cannot modify `bin/`, `src/`, trusted
+`logs/`, or anything in your home directory outside the explicit writable
+zones. Hooks may read `$LAZAR_LOGS`; archive mutation is kernel-owned.
 
 ## Timeouts
 
 Each hook gets up to **5 seconds** by default. Override with
-`LAZAR_HOOK_TIMEOUT_SECS=N`. A timed-out hook is killed and treated as
-`continue`.
+`LAZAR_HOOK_TIMEOUT_SECS=N`. Timed-out hooks normally continue; strict
+pre-tool hooks fail closed with a veto.
 
 ## Errors
 

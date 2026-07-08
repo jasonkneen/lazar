@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# log-rotation example: inspect the just-rotated archive and write a small
+# marker under memory/. Archive retention is kernel-owned; compression is not
+# part of the small kernel, and sandboxed hooks cannot mutate logs/.
+# Activate by removing .disabled and chmod +x.
+
+PAYLOAD=$(cat)
+ARCHIVE=$(printf '%s' "$PAYLOAD" | sed -n 's/.*"archive":"\([^"]*\)".*/\1/p')
+
+mkdir -p "$LAZAR_MEMORY/log-summaries"
+if [ -n "$ARCHIVE" ]; then
+    NAME=$(basename "$ARCHIVE" .bak | sed 's/^stream\.jsonl\.//')
+    NOTE="$LAZAR_MEMORY/log-summaries/${NAME}.hook.md"
+    {
+        echo "# log-rotation hook note ${NAME}"
+        echo ""
+        echo "archive: $ARCHIVE"
+        echo "hook: 00-example-summarize-archive.sh.disabled"
+        echo "note: logs are kernel-owned; this hook writes memory only"
+    } > "$NOTE"
+fi
+
+echo '{"action":"continue"}'

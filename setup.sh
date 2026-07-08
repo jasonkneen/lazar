@@ -44,11 +44,11 @@ if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
         if command -v rsync >/dev/null 2>&1; then
             rsync -a --delete --exclude target/ "$SCRIPT_DIR/src/" "$LAZAR_HOME/src/"
         else
-            rm -rf "$LAZAR_HOME/src/.update-tmp"
-            cp -R "$SCRIPT_DIR/src" "$LAZAR_HOME/src/.update-tmp"
-            rm -rf "$LAZAR_HOME/src/.update-tmp/target"
-            cp -R "$LAZAR_HOME/src/.update-tmp/." "$LAZAR_HOME/src/"
-            rm -rf "$LAZAR_HOME/src/.update-tmp"
+            TMP_SRC="$LAZAR_HOME/src.update-tmp.$(date +%Y%m%d-%H%M%S).$$"
+            cp -R "$SCRIPT_DIR/src" "$TMP_SRC"
+            rm -rf "$TMP_SRC/target"
+            rm -rf "$LAZAR_HOME/src"
+            mv "$TMP_SRC" "$LAZAR_HOME/src"
         fi
     else
         echo "[lazar] existing source preserved at $LAZAR_HOME/src"

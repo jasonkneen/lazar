@@ -30,7 +30,7 @@ Use this 90% of the time. The double-tail bounds both lines and bytes against pa
 
 ### Last N user prompts only (lightweight context check)
 
-    grep '"kind":"user"' $LAZAR_HOME/logs/stream.jsonl | tail -n 5
+    rg '"kind":"user"' $LAZAR_HOME/logs/stream.jsonl | tail -n 5
 
 ### The most recent invocation (start to finish)
 
@@ -39,7 +39,7 @@ Use this 90% of the time. The double-tail bounds both lines and bytes against pa
 
 ### Search for a topic across all history
 
-    grep -i "topic-name" $LAZAR_HOME/logs/stream.jsonl | tail -n 50
+    rg -i "topic-name" $LAZAR_HOME/logs/stream.jsonl | tail -n 50
 
 ### Filter by event kind
 
@@ -50,7 +50,7 @@ Use this 90% of the time. The double-tail bounds both lines and bytes against pa
 
 L2 has two flavors, both under `$LAZAR_HOME/memory/`:
 
-**Mechanical summaries** at `memory/log-summaries/<ts>.md`, written automatically by `_meta/log-rotation`. Each one tells you what time period a `.bak` archive covers, the top user prompts, and the most-used commands. Cheap, broad, always present.
+**Mechanical summaries** at `memory/log-summaries/<ts>.md`, written automatically by the kernel at rotation time and optionally enriched by `_meta/log-rotation`. Each one tells you which archive existed and gives a durable navigation record even if old full-fidelity archives have been pruned.
 
     ls -la $LAZAR_HOME/memory/log-summaries/
     cat $LAZAR_HOME/memory/log-summaries/*.md | head -n 100
@@ -63,7 +63,7 @@ Use the summaries to figure out *which* archive is worth searching, and the dist
 
 ## When L2 points at an archive — go to L3 (`_meta/archive-search`)
 
-If a summary indicates the relevant history is in a specific `.bak` file, read `_meta/archive-search/SKILL.md` for safe per-archive search recipes. **Do not** try to grep all archives in one go — that's how you blow context.
+If a summary indicates the relevant history is in a specific `.bak` file, read `_meta/archive-search/SKILL.md` for safe per-archive search recipes. **Do not** try to `rg` all archives in one go — that's how you blow context.
 
 ## Principle
 

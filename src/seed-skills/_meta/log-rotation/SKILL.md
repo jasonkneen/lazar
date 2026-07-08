@@ -1,109 +1,80 @@
 # log-rotation
 
-Add a *richer* summary to a log archive — top user prompts, top tool commands, file-touch index — beyond what the kernel writes automatically. Optionally compress old archives and prune very old ones.
+Add a richer memory summary for a rotated Lazar stream archive.
 
-**The kernel auto-rotates `stream.jsonl` when it exceeds `LAZAR_LOG_MAX_BYTES` (default 10MB).** That's the safety floor — you do NOT need this skill to keep the log from breaking the agent. The kernel writes a minimal summary (archive name, size, timestamp) into `memory/log-summaries/<ts>.md` whenever it rotates.
+**The kernel auto-rotates `stream.jsonl` when it exceeds `LAZAR_LOG_MAX_BYTES` (default 10MB).** That is the safety floor. The kernel owns `logs/`: sandboxed tools and hooks may read logs, but must not write, compress, prune, or repair them.
 
-This skill is for the polish layer on top: when you want a per-archive summary that includes top-30 user prompts and top-20 tool commands, or you want to compress/prune archives.
+The kernel writes a minimal summary into `memory/log-summaries/<ts>.md` whenever it rotates. This skill is the polish layer on top: read one archive with bounded commands and append useful human navigation details to memory.
 
 ## When to use
 
 - After kernel auto-rotation, if you want richer summaries than the minimal kernel header.
-- When you want to compress old `.bak` archives to save disk.
-- When you want to prune the oldest archives (>5 in keep-list).
+- When a `memory/log-summaries/<ts>.md` file exists but needs top prompts, top commands, or a small file-touch index.
 - The user explicitly asks "summarize the last session" or similar.
 
-Do NOT run this on every prompt. Once-per-archive is plenty. The kernel's auto-rotation keeps the log safe regardless.
+Do NOT run this on every prompt. Once per archive is plenty.
 
 ## Hard rules
 
-- Rotation itself is non-destructive — moves the live log to `.bak`, never deletes.
-- `mv` is atomic on the same filesystem — safe under concurrent writes. The next `append_stream` call from the kernel creates a fresh empty `stream.jsonl`.
-- Don't manually rotate just for the sake of it. Let the kernel handle the size threshold; this skill enriches archives, it doesn't replace the floor.
+- `logs/` is trusted kernel-owned state. Do not `mv`, `gzip`, `rm`, truncate, or write anything under `$LAZAR_HOME/logs` from a sandboxed skill or hook.
+- Rotation itself is kernel-owned and non-destructive at the moment it happens: the live log moves to `.bak`, and the next append creates a fresh `stream.jsonl`.
+- Full-fidelity archive retention is kernel policy, controlled by `LAZAR_LOG_ARCHIVE_KEEP`. Summaries in `memory/log-summaries/` are the durable navigation layer.
+- Write enriched summaries only under `$LAZAR_MEMORY`, usually `memory/log-summaries/` or `memory/distilled/`.
+- Always bound archive reads. Never `cat` a whole archive.
 
 ## Recipes
 
-### Check size (cheap, do this first)
+### Check current stream size
 
     LOG=$LAZAR_HOME/logs/stream.jsonl
     [ -f "$LOG" ] && wc -c "$LOG"
 
-### Rotate if over threshold (and write a summary to memory/)
+### Pick the newest rotated archive
 
-    LOG=$LAZAR_HOME/logs/stream.jsonl
-    THRESHOLD=10485760  # 10 MB
+    ARCHIVE=$(ls -t $LAZAR_HOME/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
+    [ -n "$ARCHIVE" ] || { echo "no raw archive found"; exit 0; }
 
-    if [ -f "$LOG" ]; then
-      SIZE=$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null)
-      if [ "${SIZE:-0}" -gt "$THRESHOLD" ]; then
-        TS=$(date +%s)
-        ARCHIVE="${LOG}.${TS}.bak"
-        mv "$LOG" "$ARCHIVE"
-        echo "rotated: ${LOG} -> ${ARCHIVE} (was ${SIZE} bytes)"
+If an archive has already been pruned by the kernel, use the matching `memory/log-summaries/<ts>.md` summary as the durable record.
 
-        # CRITICAL: write a summary into memory/ so long-term recall stays cheap.
-        # This is the L2 tier — the agent reads these instead of scanning .bak files.
-        mkdir -p $LAZAR_HOME/memory/log-summaries
-        SUM=$LAZAR_HOME/memory/log-summaries/${TS}.md
-        FIRST_TS=$(head -n 1 "$ARCHIVE" | jq -r '.ts_ms // empty' 2>/dev/null || echo "?")
-        LAST_TS=$(tail -n 1  "$ARCHIVE" | jq -r '.ts_ms // empty' 2>/dev/null || echo "?")
-        N_INVOKES=$(grep -c '"kind":"invoke_start"' "$ARCHIVE" 2>/dev/null || echo 0)
-        N_TOOLS=$(grep -c   '"kind":"tool_result"'  "$ARCHIVE" 2>/dev/null || echo 0)
+### Enrich the summary for one archive
 
-        cat > "$SUM" <<EOF
-# log-summary $(date -u -r "$TS" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%Y-%m-%d)
+    ARCHIVE=$LAZAR_HOME/logs/stream.jsonl.<TS>.bak
+    TS=$(basename "$ARCHIVE" .bak | sed 's/^stream\.jsonl\.//')
+    SUM=$LAZAR_HOME/memory/log-summaries/${TS}.md
+    mkdir -p "$LAZAR_HOME/memory/log-summaries"
 
-archive: $ARCHIVE
-size: ${SIZE} bytes
-first_ts_ms: ${FIRST_TS}
-last_ts_ms: ${LAST_TS}
-invocations: ${N_INVOKES}
-tool_calls: ${N_TOOLS}
+    {
+      echo ""
+      echo "## User prompts (last 30)"
+      echo ""
+      jq -r 'select(.kind == "user") | .content' "$ARCHIVE" 2>/dev/null \
+        | tail -n 30 \
+        | sed 's/^/- /' \
+        || true
 
-## User prompts (last 30)
+      echo ""
+      echo "## Tool commands (top 20 by frequency)"
+      echo ""
+      jq -r 'select(.kind == "tool_result") | .command' "$ARCHIVE" 2>/dev/null \
+        | awk '{print $1}' \
+        | sort | uniq -c | sort -rn \
+        | head -n 20 \
+        | sed 's/^/    /' \
+        || true
+    } >> "$SUM"
 
-EOF
-        jq -r 'select(.kind == "user") | .content' "$ARCHIVE" 2>/dev/null \
-          | tail -n 30 \
-          | sed 's/^/- /' \
-          >> "$SUM" || true
-
-        echo "" >> "$SUM"
-        echo "## Tool commands (top 20 by frequency)" >> "$SUM"
-        echo "" >> "$SUM"
-        jq -r 'select(.kind == "tool_result") | .command' "$ARCHIVE" 2>/dev/null \
-          | awk '{print $1}' \
-          | sort | uniq -c | sort -rn \
-          | head -n 20 \
-          | sed 's/^/    /' \
-          >> "$SUM" || true
-
-        echo "summary: $SUM"
-      else
-        echo "no rotation needed (${SIZE:-0} bytes, threshold ${THRESHOLD})"
-      fi
-    fi
-
-### Compress old archives (optional, saves disk)
-
-    for f in $LAZAR_HOME/logs/stream.jsonl.*.bak; do
-      [ -f "$f" ] && [ ! -f "${f}.gz" ] && gzip "$f"
-    done
-
-### Prune very old archives (optional, conservative — keeps last 5)
-
-    ls -t $LAZAR_HOME/logs/stream.jsonl.*.bak* 2>/dev/null | tail -n +6 | xargs -r rm
+    echo "summary: $SUM"
 
 ## Pairing with load-context and archive-search
 
 The three tiers of memory:
 
-- **L1**: `$LAZAR_HOME/logs/stream.jsonl` (current, raw) — bounded `tail`/`grep` via `_meta/load-context`.
-- **L2**: `$LAZAR_HOME/memory/log-summaries/<ts>.md` (durable summaries this skill writes at rotation) — read these first when looking back, they tell you which archive to dig into.
-- **L3**: `$LAZAR_HOME/logs/stream.jsonl.*.bak` (full forensic record) — searched via `_meta/archive-search` only when L1+L2 don't have what's needed.
+- **L1**: `$LAZAR_HOME/logs/stream.jsonl` (current, raw) — bounded `tail`/`rg` via `_meta/load-context`.
+- **L2**: `$LAZAR_HOME/memory/log-summaries/<ts>.md` — minimal entries written by the kernel, optionally enriched by this skill.
+- **L3**: `$LAZAR_HOME/logs/stream.jsonl.*.bak` (recent full-fidelity archives) — searched via `_meta/archive-search` only when L1+L2 don't have what's needed. Kernel retention may prune old L3 archives.
 
-Never `cat` an archive. Always grep with bounds. If you compress archives with gzip, note it in memory so future-you uses `zgrep`/`zcat`.
+Never `cat` an archive. Always use `rg`, `jq`, `head`, or `tail` with explicit bounds.
 
 ## Principle
 
-The kernel just records. Hygiene is the agent's responsibility, expressed as this skill. Treat rotation like rotating syslog or nginx access logs — boring infrastructure, but boringly reliable.
+The kernel records and rotates. Skills interpret and summarize. Keep it that way: no log mutation from sandboxed skills.

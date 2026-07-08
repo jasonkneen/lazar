@@ -91,7 +91,7 @@ fi
 patch_rc() {
     local rc="$1"
     [ -f "$rc" ] || return 0
-    grep -q "clawd/lazar" "$rc" 2>/dev/null || return 0
+    rg -q "clawd/lazar" "$rc" 2>/dev/null || return 0
 
     local tmp backup
     tmp=$(mktemp "${TMPDIR:-/tmp}/lazar-rc.XXXXXX")

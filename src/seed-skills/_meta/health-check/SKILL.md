@@ -42,7 +42,7 @@ echo "── 1. static checks ────────────────�
 [ -f "$LAZAR_HOME/bin/lazar" ] && pass "kernel binary at bin/lazar" || fail "no kernel binary"
 
 # kernel locked (macOS chflags uchg)
-ls -lO "$LAZAR_HOME/bin/lazar" 2>/dev/null | grep -q uchg \
+ls -lO "$LAZAR_HOME/bin/lazar" 2>/dev/null | rg -q uchg \
     && pass "kernel binary is uchg-locked (immutable)" \
     || fail "kernel binary is NOT immutable — chflags uchg should be set"
 
@@ -71,7 +71,7 @@ done
 
 ## 2. Sandbox boundary tests
 
-The sandbox profile should deny writes to `bin/` and `src/` while allowing writes to `skills/`, `memory/`, `workspace/`, `logs/`, `/tmp`. Validate by trying.
+The sandbox profile should deny writes to `bin/`, `src/`, and trusted `logs/` while allowing writes to `skills/`, `memory/`, `workspace/`, and `/tmp`. Validate by trying.
 
 ```bash
 echo "── 2. sandbox boundary tests ───────────────────────"
@@ -85,6 +85,11 @@ echo probe > "$LAZAR_HOME/bin/.health-probe" 2>/dev/null \
 echo probe > "$LAZAR_HOME/src/.health-probe" 2>/dev/null \
     && { rm -f "$LAZAR_HOME/src/.health-probe"; fail "could write to src/ — sandbox broken"; } \
     || pass "write to src/ correctly denied"
+
+# DENY: logs/
+echo probe > "$LAZAR_LOGS/.health-probe" 2>/dev/null \
+    && { rm -f "$LAZAR_LOGS/.health-probe"; fail "could write to logs/ — trusted logs boundary broken"; } \
+    || pass "write to logs/ correctly denied"
 
 # ALLOW: workspace/
 echo probe > "$HC/.write-probe" \
@@ -106,7 +111,7 @@ echo "── 3. memory persistence ───────────────
 PROBE="$LAZAR_MEMORY/.health-probe-$(date +%s).md"
 MAGIC="lazar-health-check-$(date +%s)-$$"
 echo "# $MAGIC" > "$PROBE"
-grep -q "$MAGIC" "$PROBE" && pass "memory write+read" || fail "memory readback failed"
+rg -q "$MAGIC" "$PROBE" && pass "memory write+read" || fail "memory readback failed"
 rm -f "$PROBE"
 ```
 
@@ -139,7 +144,7 @@ fi
 echo "── 5. recursion (lazar -p inside a tool call) ──────"
 
 OUT=$(lazar -p "run this exact command and tell me the result: lazar -p 'echo HEALTH_RECURSION_OK_$$'" --verbose 2>&1 || true)
-echo "$OUT" | grep -q "HEALTH_RECURSION_OK_$$" \
+echo "$OUT" | rg -q "HEALTH_RECURSION_OK_$$" \
     && pass "recursion works (depth>0 invocation succeeded)" \
     || fail "recursion did not produce expected output"
 ```
@@ -151,11 +156,11 @@ We can't easily make the model emit an empty tool_use, but we can verify the ker
 ```bash
 echo "── 6. kernel safeguards present ────────────────────"
 
-strings "$LAZAR_HOME/bin/lazar" 2>/dev/null | grep -q "empty or missing 'command' field" \
+strings "$LAZAR_HOME/bin/lazar" 2>/dev/null | rg -q "empty or missing 'command' field" \
     && pass "empty-command safeguard compiled in" \
     || fail "empty-command safeguard not found in binary (rebuild needed?)"
 
-strings "$LAZAR_HOME/bin/lazar" 2>/dev/null | grep -q "auto-rotated stream.jsonl" \
+strings "$LAZAR_HOME/bin/lazar" 2>/dev/null | rg -q "auto-rotated stream.jsonl" \
     && pass "auto-rotation code path compiled in" \
     || fail "auto-rotation not found in binary"
 ```
@@ -169,7 +174,7 @@ if command -v npx >/dev/null 2>&1; then
     mkdir -p "$HC/ts" && cd "$HC/ts"
     mkdir -p .npm && echo "cache=$(pwd)/.npm" > .npmrc
     echo 'console.log("HC_TS_OK")' > test.ts
-    if npx -y --quiet tsx test.ts 2>/dev/null | grep -q "HC_TS_OK"; then
+    if npx -y --quiet tsx test.ts 2>/dev/null | rg -q "HC_TS_OK"; then
         pass "tsx run works (TypeScript toolchain healthy)"
     else
         fail "tsx run failed — check Node + npx + npm cache"
@@ -188,7 +193,7 @@ echo "── 8. e2e: python venv ───────────────�
 if command -v python3 >/dev/null 2>&1; then
     mkdir -p "$HC/py" && cd "$HC/py"
     python3 -m venv .venv 2>/dev/null
-    if [ -x .venv/bin/python ] && .venv/bin/python -c "print('HC_PY_OK')" 2>/dev/null | grep -q "HC_PY_OK"; then
+    if [ -x .venv/bin/python ] && .venv/bin/python -c "print('HC_PY_OK')" 2>/dev/null | rg -q "HC_PY_OK"; then
         pass "python3 venv works"
     else
         fail "python3 venv failed"
@@ -204,7 +209,7 @@ fi
 ```bash
 echo "── 9. skill index reachable ────────────────────────"
 
-cat "$LAZAR_SKILLS/INDEX.md" | grep -q "_meta/health-check" \
+cat "$LAZAR_SKILLS/INDEX.md" | rg -q "_meta/health-check" \
     && pass "health-check is registered in INDEX.md" \
     || fail "health-check missing from INDEX — agent won't find this skill"
 ```

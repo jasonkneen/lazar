@@ -23,6 +23,7 @@ use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
 
 mod hooks;
 mod session;
+mod stall;
 mod verifier;
 use hooks::HookEvent;
 
@@ -54,7 +55,6 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 200_000;
 const DEFAULT_MAX_AGENT_TURNS: u32 = 50;
-const DEFAULT_MAX_TEXT_ONLY_TURNS: u32 = 20;
 const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
 const TOOL_READ_CHUNK_BYTES: usize = 8192;
 
@@ -266,7 +266,7 @@ struct Args {
 
     /// Heartbeat: fire all hooks under hooks/tick.d/ and exit. No model call.
     /// Wire this to launchd / cron for scheduled work (memory consolidation,
-    /// log compression, etc).
+    /// summary enrichment, etc).
     #[arg(long, conflicts_with_all = ["prompt", "reset_all"])]
     tick: bool,
 
@@ -467,8 +467,6 @@ fn run_bash(cmd: &str) -> String {
             .arg(format!("MEMORY_PATH={lazar}/memory"))
             .arg("-D")
             .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-            .arg("-D")
-            .arg(format!("LOGS_PATH={lazar}/logs"))
             .arg("-D")
             .arg(format!(
                 "USER_HOME={}",
@@ -759,9 +757,10 @@ fn write_new_no_follow(path: &Path, label: &str, contents: &str) -> std::io::Res
 /// The current log is moved to a unique stream.jsonl.<unix-nanos>.<pid>.bak
 /// archive and a minimal summary is written into memory/log-summaries/ so the
 /// agent has a navigable index of past archives. Skills like _meta/log-rotation
-/// can layer richer summaries on top, but this floor is non-negotiable —
-/// without it the log grows unbounded and any context-loading attempt
-/// blows the API limit.
+/// can layer richer summaries on top. After rotation hooks run, the kernel prunes
+/// old *harvested* archives according to LAZAR_LOG_ARCHIVE_KEEP (default 5,
+/// 0 disables). Unharvested archives are never deleted — harvest first
+/// (memory/.harvested), then prune keeps disk bounded.
 /// Result of a successful log rotation. Returned to the caller so it can
 /// fire the `log-rotation` hook AFTER releasing the stream lock — firing
 /// inside the lock would deadlock because hooks themselves write hook_start
@@ -835,8 +834,10 @@ fn maybe_rotate_log(logs: &Path, path: &Path) -> Option<RotationInfo> {
              rotated_at_unix_ms: {}\n\
              \n\
              _Auto-rotated by the lazar kernel when stream.jsonl exceeded \
-             LAZAR_LOG_MAX_BYTES. For richer per-archive summaries (top user prompts, \
-             top tool commands), run the `_meta/log-rotation` skill against this archive. \
+             LAZAR_LOG_MAX_BYTES. The kernel may prune old full archives according \
+             to LAZAR_LOG_ARCHIVE_KEEP; this summary is the durable navigation \
+             record. For richer per-archive summaries (top user prompts, top tool \
+             commands), run the `_meta/log-rotation` skill against this archive. \
              For LLM-extracted learnings, run `_meta/distill`._\n",
             archive.display(),
             now_millis()
@@ -853,6 +854,95 @@ fn maybe_rotate_log(logs: &Path, path: &Path) -> Option<RotationInfo> {
         size_bytes: size,
         summary: summary_path,
     })
+}
+
+fn log_archive_timestamp(path: &Path) -> Option<u128> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_prefix("stream.jsonl.")?
+        .strip_suffix(".bak.gz")
+        .or_else(|| name.strip_prefix("stream.jsonl.")?.strip_suffix(".bak"))?;
+    stem.split('.').next()?.parse().ok()
+}
+
+/// Load archive basenames recorded by `_meta/log-harvest` in
+/// `memory/.harvested`. Only harvested archives are eligible for prune —
+/// unharvested history is never deleted solely because keep was exceeded.
+fn harvested_archive_names(home: &Path) -> std::collections::HashSet<String> {
+    let path = home.join("memory").join(".harvested");
+    match fs::read_to_string(path) {
+        Ok(s) => s
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(String::from)
+            .collect(),
+        Err(_) => std::collections::HashSet::new(),
+    }
+}
+
+fn archives_to_prune(
+    logs: &Path,
+    keep: usize,
+    harvested: &std::collections::HashSet<String>,
+) -> Vec<PathBuf> {
+    if keep == 0 {
+        return Vec::new();
+    }
+
+    let mut archives: Vec<(u128, String, PathBuf)> = match fs::read_dir(logs) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_file() {
+                    return None;
+                }
+                let ts = log_archive_timestamp(&path)?;
+                let name = path.file_name()?.to_str()?.to_string();
+                // Never prune unharvested archives — durable journal first.
+                if !harvested.contains(&name) {
+                    return None;
+                }
+                Some((ts, name, path))
+            })
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+
+    archives.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    archives
+        .into_iter()
+        .skip(keep)
+        .map(|(_, _, path)| path)
+        .collect()
+}
+
+fn log_archive_keep_limit() -> usize {
+    match env::var("LAZAR_LOG_ARCHIVE_KEEP") {
+        Ok(raw) => match raw.parse() {
+            Ok(keep) => keep,
+            Err(_) => {
+                eprintln!(
+                    "[lazar] WARN: invalid LAZAR_LOG_ARCHIVE_KEEP={raw:?}; using default 5"
+                );
+                5
+            }
+        },
+        Err(_) => 5,
+    }
+}
+
+fn prune_log_archives(logs: &Path) {
+    let harvested = harvested_archive_names(&lazar_home());
+    for archive in archives_to_prune(logs, log_archive_keep_limit(), &harvested) {
+        if let Err(e) = fs::remove_file(&archive) {
+            eprintln!(
+                "[lazar] WARN: failed to prune old log archive {}: {e}",
+                archive.display()
+            );
+        }
+    }
 }
 
 /// Append a single JSON event to the canonical stream at logs/stream.jsonl.
@@ -929,6 +1019,7 @@ pub(crate) fn append_stream(mut event: Value) {
                 "summary": info.summary,
             }),
         );
+        prune_log_archives(&logs);
     }
 }
 
@@ -1295,29 +1386,15 @@ fn run_agent(
          \"fine\") against the actual prior turn instead of inferring from \
          recent tool output.\n\
          \n\
-         RECURSION FOR REFERENTIAL PROMPTS (use this when the operator forgot --session)\n\
+         REFERENTIAL PROMPTS (when the operator forgot --session)\n\
          If you receive a short, ambiguous, or referential prompt (\"yes\", \
          \"do that\", \"ok\", \"fine\", \"continue\") AND you have no prior \
-         messages in this invocation (no --session/--resume was passed), \
-         DO NOT infer the referent from recent tool output. That fill-in \
-         pattern is the documented #1 source of \"executes the wrong thing \
-         confidently\" errors. Instead:\n\
-         \n\
-         1. PREFER asking the operator a one-line clarifying question and \
-            ending your turn. Confident-but-wrong is worse than confirming.\n\
-         \n\
-         2. OR, if you genuinely think you can disambiguate by reading the \
-            most recent session, recurse on yourself with --resume:\n\
-                execute `lazar --resume -p \"<the same referential prompt>\" \
-                --output-format text`\n\
-            The nested call inherits the most recent session log and has \
-            real conversation history. Use its answer as your own. This \
-            costs an API call but converts a hallucination into a real \
-            answer.\n\
-         \n\
-         Note: nested `lazar -p` calls require LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1; \
-         if recursion fails with a missing-key error, fall back to (1) — ask \
-         the operator. Do NOT silently guess.\n\
+         messages in this invocation, DO NOT infer the referent from recent \
+         tool output. That fill-in pattern is the documented #1 source of \
+         \"executes the wrong thing confidently\" errors. Ask the operator a \
+         one-line clarifying question and end your turn. Confident-but-wrong \
+         is worse than confirming. (Raw self-recursion via `lazar -p` is \
+         disabled — a pre-tool hook vetoes it.)\n\
          \n\
          BUT every prompt, response, tool call, and tool result you (and \
          past-you) ever produced is appended as JSONL to:\n\
@@ -1355,23 +1432,26 @@ fn run_agent(
          Then read the relevant SKILL.md before acting. Skills carry the \
          hard-won detail you need.\n\
          \n\
-         RECURSION\n\
-         Tool subprocesses do not inherit ANTHROPIC_API_KEY by default. \
-         If the operator set LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1, \
-         nested calls can use: execute `LAZAR_DEPTH={next_depth} lazar -p \"...\"`. \
-         Otherwise treat nested `lazar -p` API calls as unavailable and ask \
-         the user to re-run with that opt-in if recursion is essential.\n\
+         DELEGATION (sub-agents)\n\
+         To delegate work to a sub-agent, use the subagent core skill: \
+         `bash skills/_meta/subagent/spawn.sh <task-id> <prompt-file>`. \
+         It lints the prompt, bounds retries, kills wedged children, and \
+         gates success by re-checking your declared claims. Raw `lazar -p` \
+         calls are vetoed by a pre-tool hook — read _meta/subagent/SKILL.md. \
          Recursion depth is capped at {max_depth}; current depth is {depth}.\n\
          \n\
          BOUNDARIES\n\
          By default, writes are limited by sandbox-exec to skills/, \
-         memory/, workspace/, logs/, /tmp, and specific session/auth \
-         subdirs under ~/.codex and ~/.claude (e.g. sessions/, todos/, \
-         auth.json). Do not try to modify bin/, src/, ~/.codex/config.toml, \
-         ~/.codex/AGENTS.md, ~/.claude/settings.json, ~/.claude/hooks/, \
-         ~/.claude/CLAUDE.md, ssh keys, or anything else outside these \
-         allowed zones. You will see 'Operation not permitted' if you try; \
-         learn from the failure and route around it via a skill.\n\
+         memory/, workspace/, /tmp, and specific session/auth subdirs \
+         under ~/.codex and ~/.claude (e.g. sessions/, todos/, auth.json). \
+         Logs are trusted kernel-owned state: you may read bounded slices \
+         of logs/stream.jsonl and rotated archives, but do not write, \
+         compress, prune, or repair logs/. Write derived summaries to \
+         memory/ instead. Do not try to modify bin/, src/, logs/, \
+         ~/.codex/config.toml, ~/.codex/AGENTS.md, ~/.claude/settings.json, \
+         ~/.claude/hooks/, ~/.claude/CLAUDE.md, ssh keys, or anything else \
+         outside these allowed zones. You will see 'Operation not permitted' \
+         if you try; learn from the failure and route around it via a skill.\n\
          \n\
          EXCEPTION: if the operator passed --no-sandbox or set \
          LAZAR_NO_SANDBOX=1, the sandbox is OFF for this invocation. \
@@ -1430,7 +1510,6 @@ fn run_agent(
          passes — proof of work overrides suspicion.",
         home_disp = home.display(),
         skills_disp = skills.display(),
-        next_depth = depth + 1,
         max_depth = MAX_DEPTH,
         depth = depth,
         sandbox_status_line = if no_sandbox_active() {
@@ -1527,20 +1606,31 @@ fn run_agent(
     // happily runs `bash -c ""` forever.
     let mut consecutive_empty_turns: u32 = 0;
     const MAX_CONSECUTIVE_EMPTY_TURNS: u32 = 3;
-    // end_turn with no tool_use — model talked instead of acting. Keep looping
-    // in-process instead of exiting and forcing the TUI to inject fake prompts.
-    let mut consecutive_text_only_turns: u32 = 0;
-    let max_text_only_turns = env::var("LAZAR_MAX_TEXT_ONLY_TURNS")
+    // OWNER DOCTRINE (Jason, 2026-07-07): the agent loop lives HERE, in the
+    // kernel — never in a client. Stall recovery is bounded and conservative
+    // (see stall.rs): default TWO nudges per invocation (MiniMax stalls in
+    // streaks), only for unfinished announcements, never for questions to
+    // the operator. The old unbounded 20-shot "Continue" spam is not
+    // allowed back.
+    let max_stall_nudges: u32 = env::var("LAZAR_STALL_NUDGES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|turns: &u32| *turns > 0)
-        .unwrap_or(DEFAULT_MAX_TEXT_ONLY_TURNS);
-    let auto_continue = !env_flag_enabled("LAZAR_NO_AUTO_CONTINUE");
+        .unwrap_or(2);
+    let mut stall_nudges_used: u32 = 0;
     let max_agent_turns = env::var("LAZAR_MAX_TURNS")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|turns: &u32| *turns > 0)
         .unwrap_or(DEFAULT_MAX_AGENT_TURNS);
+    // Model output cap. The old hardcoded 8192 (~30KB) truncated large single
+    // writes mid-string → unparseable tool_use → "empty tool call" abort.
+    // Configurable now, with a higher default so big files don't require
+    // chunking as aggressively. Env-tunable per model's real output ceiling.
+    let max_tokens: u32 = env::var("LAZAR_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|t: &u32| *t > 0)
+        .unwrap_or(16384);
     let max_tool_calls = env::var("LAZAR_MAX_TOOL_CALLS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -1561,7 +1651,7 @@ fn run_agent(
 
         let body = json!({
             "model": model,
-            "max_tokens": 8192,
+            "max_tokens": max_tokens,
             "system": system,
             "tools": [tool],
             "messages": messages,
@@ -1679,6 +1769,38 @@ fn run_agent(
         let stop_reason = stop_reason_str.as_str();
 
         if stop_reason == "end_turn" {
+            let final_text = verifier::extract_text(&content);
+            let tool_uses_this_turn = verifier::count_tool_uses(&content);
+
+            // Kernel-owned stall recovery (bounded — see stall.rs doctrine).
+            // Runs BEFORE invoke_end is logged so consumers never see a turn
+            // end and then resurrect, which is what the old hack did.
+            if tool_uses_this_turn == 0
+                && stall_nudges_used < max_stall_nudges
+                && stall::looks_stalled(&final_text)
+            {
+                stall_nudges_used += 1;
+                messages.push(json!({"role": "user", "content": stall::NUDGE_PROMPT}));
+                append_stream(json!({
+                    "kind": "auto_nudge",
+                    "content": stall::NUDGE_PROMPT,
+                    "nudge": stall_nudges_used,
+                    "max": max_stall_nudges,
+                }));
+                if format == OutputFormat::StreamJson {
+                    emit_event(json!({
+                        "type": "auto_nudge",
+                        "content": stall::NUDGE_PROMPT,
+                    }));
+                }
+                if verbose {
+                    eprintln!(
+                        "[lazar] end_turn with unfinished intent; nudging ({stall_nudges_used}/{max_stall_nudges})"
+                    );
+                }
+                continue;
+            }
+
             // text was already streamed live in parse_sse_stream (Text mode)
             append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason}));
             let duration_ms = started.elapsed().as_millis();
@@ -1694,9 +1816,6 @@ fn run_agent(
             // is added to the operator's view, not injected into the
             // model's context.
             // ────────────────────────────────────────────────────────
-            let final_text = verifier::extract_text(&content);
-            let tool_uses_this_turn = verifier::count_tool_uses(&content);
-
             // Layer 1 — VERIFY-block engine (kernel runs the actual checks).
             // The agent declares testable claims; the kernel runs them.
             // This is the ironclad layer: model can't lie about file
@@ -1784,21 +1903,6 @@ fn run_agent(
                     "duration_ms": duration_ms,
                 }));
             } else if format == OutputFormat::Json {
-                let final_text: String = content
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|b| {
-                                if b["type"] == "text" {
-                                    b["text"].as_str().map(String::from)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
                 let result = json!({
                     "type": "result",
                     "stop_reason": stop_reason,
@@ -1808,29 +1912,6 @@ fn run_agent(
                     "duration_ms": duration_ms,
                 });
                 println!("{result}");
-            }
-
-            if auto_continue
-                && tool_uses_this_turn == 0
-                && consecutive_text_only_turns < max_text_only_turns
-            {
-                consecutive_text_only_turns += 1;
-                let nudge = "Continue. Use the bash tool to execute the next step. Do not end your turn with text only.";
-                messages.push(json!({"role": "user", "content": nudge}));
-                append_stream(json!({"kind": "user", "content": nudge}));
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({
-                        "type": "user_message",
-                        "content": nudge,
-                        "auto_continue": true,
-                    }));
-                }
-                if verbose {
-                    eprintln!(
-                        "[lazar] end_turn without tools; auto-continuing ({consecutive_text_only_turns}/{max_text_only_turns})"
-                    );
-                }
-                continue;
             }
 
             if verbose {
@@ -1980,7 +2061,6 @@ fn run_agent(
             }
         } else if had_any_valid_call {
             consecutive_empty_turns = 0;
-            consecutive_text_only_turns = 0;
         }
 
         if results.is_empty() {
@@ -2026,7 +2106,7 @@ fn run_agent(
 
 /// Heartbeat path: fire all hooks under hooks/tick.d/ and exit.
 /// No model call, no agent loop. Wire this to launchd/cron for scheduled
-/// background work like memory consolidation, log compression, etc.
+/// background work like memory consolidation, summary enrichment, etc.
 fn run_tick(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     let started = std::time::Instant::now();
     append_stream(json!({"kind": "tick_start"}));
@@ -2179,6 +2259,10 @@ mod tests {
             SANDBOX_PROFILE.contains("/.claude/todos"),
             "sandbox profile must allow writes to ~/.claude/todos"
         );
+        assert!(
+            !SANDBOX_PROFILE.contains(r#"(subpath (param "LOGS_PATH"))"#),
+            "sandbox profile must not allow sandboxed tools to write trusted lazar logs"
+        );
 
         // The broad whole-directory grants must NOT be present.
         // These exact SBPL patterns would grant write access to the entire
@@ -2300,6 +2384,115 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
         assert_ne!(first, second);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn archives_to_prune_keeps_newest_requested_count_across_bak_variants() {
+        let dir = TempTestDir::new("archive-retention-newest");
+        let logs = dir.path();
+        let old_bak = logs.join("stream.jsonl.100.1.bak");
+        let mid_gz = logs.join("stream.jsonl.200.1.bak.gz");
+        let new_bak = logs.join("stream.jsonl.300.1.bak");
+        fs::write(&old_bak, "old").unwrap();
+        fs::write(&mid_gz, "mid").unwrap();
+        fs::write(&new_bak, "new").unwrap();
+        let harvested: std::collections::HashSet<String> = [
+            "stream.jsonl.100.1.bak".into(),
+            "stream.jsonl.200.1.bak.gz".into(),
+            "stream.jsonl.300.1.bak".into(),
+        ]
+        .into_iter()
+        .collect();
+
+        let to_prune = archives_to_prune(logs, 2, &harvested);
+
+        assert_eq!(to_prune, vec![old_bak]);
+    }
+
+    #[test]
+    fn archives_to_prune_keep_zero_disables_pruning() {
+        let dir = TempTestDir::new("archive-retention-disabled");
+        let logs = dir.path();
+        fs::write(logs.join("stream.jsonl.100.1.bak"), "old").unwrap();
+        fs::write(logs.join("stream.jsonl.200.1.bak.gz"), "new").unwrap();
+        let harvested: std::collections::HashSet<String> = [
+            "stream.jsonl.100.1.bak".into(),
+            "stream.jsonl.200.1.bak.gz".into(),
+        ]
+        .into_iter()
+        .collect();
+
+        let to_prune = archives_to_prune(logs, 0, &harvested);
+
+        assert!(to_prune.is_empty());
+    }
+
+    #[test]
+    fn archives_to_prune_ignores_active_lock_and_sessions() {
+        let dir = TempTestDir::new("archive-retention-ignores-non-archives");
+        let logs = dir.path();
+        let old_bak = logs.join("stream.jsonl.100.1.bak");
+        let new_bak = logs.join("stream.jsonl.200.1.bak");
+        fs::write(&old_bak, "old").unwrap();
+        fs::write(&new_bak, "new").unwrap();
+        fs::write(logs.join("stream.jsonl"), "active").unwrap();
+        fs::write(logs.join(".stream.lock"), "lock").unwrap();
+        let sessions = logs.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("stream.jsonl.050.1.bak"), "session").unwrap();
+        let harvested: std::collections::HashSet<String> = [
+            "stream.jsonl.100.1.bak".into(),
+            "stream.jsonl.200.1.bak".into(),
+        ]
+        .into_iter()
+        .collect();
+
+        let to_prune = archives_to_prune(logs, 1, &harvested);
+
+        assert_eq!(to_prune, vec![old_bak]);
+    }
+
+    #[test]
+    fn archives_to_prune_skips_unharvested() {
+        let dir = TempTestDir::new("archive-retention-unharvested");
+        let logs = dir.path();
+        let old_bak = logs.join("stream.jsonl.100.1.bak");
+        let new_bak = logs.join("stream.jsonl.200.1.bak");
+        fs::write(&old_bak, "old").unwrap();
+        fs::write(&new_bak, "new").unwrap();
+        // Only the newest is harvested — old unharvested must not be pruned.
+        let harvested: std::collections::HashSet<String> =
+            ["stream.jsonl.200.1.bak".into()].into_iter().collect();
+
+        let to_prune = archives_to_prune(logs, 1, &harvested);
+
+        assert!(to_prune.is_empty(), "unharvested old archive must be kept");
+    }
+
+    struct TempTestDir {
+        path: PathBuf,
+    }
+
+    impl TempTestDir {
+        fn new(label: &str) -> Self {
+            let path = env::temp_dir().join(format!(
+                "lazar-test-{label}-{}-{}",
+                std::process::id(),
+                now_millis()
+            ));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 
     #[test]
