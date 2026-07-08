@@ -16,9 +16,10 @@ DATE=$(date '+%Y-%m-%d %H:%M')
 
 [ -f "$LEDGER" ] || printf '# self-patch ledger — every fix I made and why\n\nSymptom → root-cause → layer → fix → how it was verified. Newest first.\n\n' > "$LEDGER"
 
-ENTRY=$(printf '## %s  [%s]\n- symptom: %s\n- cause: %s\n- fix: %s\n- verified: %s\n\n' \
+# Note: command substitution strips trailing newlines — write separators explicitly.
+ENTRY=$(printf '## %s  [%s]\n- symptom: %s\n- cause: %s\n- fix: %s\n- verified: %s' \
   "$DATE" "$LAYER" "$SYMPTOM" "$CAUSE" "$FIX" "$VERIFY")
 
-# Prepend under the header (newest first).
-{ head -n 4 "$LEDGER"; printf '%s' "$ENTRY"; tail -n +5 "$LEDGER"; } > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
+# Prepend under the header (newest first). Blank line after each entry.
+{ head -n 4 "$LEDGER"; printf '%s\n\n' "$ENTRY"; tail -n +5 "$LEDGER"; } > "$LEDGER.tmp" && mv "$LEDGER.tmp" "$LEDGER"
 echo "recorded to $LEDGER"
