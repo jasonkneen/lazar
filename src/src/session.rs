@@ -160,11 +160,7 @@ pub fn load_messages(id: &str) -> Vec<Value> {
         match kind {
             "user" => {
                 if let Some(content) = event.get("content") {
-                    // User content is usually a plain string. Pass through.
-                    messages.push(json!({
-                        "role": "user",
-                        "content": content,
-                    }));
+                    push_message(&mut messages, "user", content.clone());
                 }
             }
             "assistant" => {
@@ -172,10 +168,7 @@ pub fn load_messages(id: &str) -> Vec<Value> {
                 // turn was tool-use-only, skip it entirely.
                 if let Some(text) = extract_text_from_assistant_content(event.get("content")) {
                     if !text.is_empty() {
-                        messages.push(json!({
-                            "role": "assistant",
-                            "content": text,
-                        }));
+                        push_message(&mut messages, "assistant", json!(text));
                     }
                 }
             }
@@ -185,6 +178,24 @@ pub fn load_messages(id: &str) -> Vec<Value> {
     }
 
     truncate_to_byte_cap(messages)
+}
+
+/// Keep provider history valid after persisted tool blocks/results have been
+/// stripped. A tool round can otherwise leave adjacent assistant messages.
+fn push_message(messages: &mut Vec<Value>, role: &str, content: Value) {
+    if let Some(last) = messages.last_mut() {
+        let same_role = last.get("role").and_then(|v| v.as_str()) == Some(role);
+        if same_role {
+            if let (Some(existing), Some(next)) = (
+                last.get("content").and_then(|v| v.as_str()),
+                content.as_str(),
+            ) {
+                last["content"] = json!(format!("{existing}\n\n{next}"));
+                return;
+            }
+        }
+    }
+    messages.push(json!({"role": role, "content": content}));
 }
 
 /// Pull the concatenated text out of an assistant content array,
@@ -372,5 +383,15 @@ mod tests {
             );
         }
         std::env::remove_var("LAZAR_SESSION_HISTORY_MAX_BYTES");
+    }
+
+    #[test]
+    fn push_message_merges_adjacent_roles_after_tool_stripping() {
+        let mut messages = vec![json!({"role":"user","content":"inspect"})];
+        push_message(&mut messages, "assistant", json!("I will inspect."));
+        push_message(&mut messages, "assistant", json!("Inspection complete."));
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["content"], "I will inspect.\n\nInspection complete.");
     }
 }

@@ -9,10 +9,11 @@ use clap::{Parser, ValueEnum};
 use include_dir::{include_dir, Dir};
 use serde_json::{json, Value};
 use std::{
+    cell::Cell,
     env, fs,
     fs::File,
     io::{BufRead, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -57,6 +58,10 @@ const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 200_000;
 const DEFAULT_MAX_AGENT_TURNS: u32 = 50;
 const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
 const TOOL_READ_CHUNK_BYTES: usize = 8192;
+
+thread_local! {
+    static IN_LOG_ROTATION_HOOK: Cell<bool> = const { Cell::new(false) };
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ToolLimits {
@@ -202,6 +207,23 @@ fn validate_reset_home(home: &Path) -> Result<(), String> {
             home.display()
         ));
     }
+    if home
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(format!(
+            "refusing to reset non-canonical LAZAR_HOME: {}",
+            home.display()
+        ));
+    }
+    if let Ok(meta) = fs::symlink_metadata(home) {
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to reset symlinked LAZAR_HOME: {}",
+                home.display()
+            ));
+        }
+    }
     if home.parent().is_none() {
         return Err(format!(
             "refusing to reset filesystem root: {}",
@@ -231,6 +253,10 @@ fn env_flag_enabled(name: &str) -> bool {
         env::var(name).ok().as_deref(),
         Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
     )
+}
+
+fn is_terminal_stop_reason(stop_reason: &str) -> bool {
+    matches!(stop_reason, "end_turn" | "stop_sequence" | "refusal")
 }
 
 #[derive(Parser)]
@@ -516,6 +542,14 @@ fn run_bash(cmd: &str) -> String {
             env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
         );
 
+    // Only the main process establishes a session id. Propagate that validated
+    // value so child helpers can enforce their documented per-session limits.
+    if let Ok(session_id) = env::var("LAZAR_SESSION_ID") {
+        if session::validate_session_id(&session_id).is_ok() {
+            command.env("LAZAR_SESSION_ID", session_id);
+        }
+    }
+
     // Propagate LAZAR_NO_SANDBOX so nested `lazar -p` calls inherit the
     // mode (otherwise the child would re-sandbox and the operator's
     // intent would be silently dropped).
@@ -576,6 +610,7 @@ fn run_bash(cmd: &str) -> String {
         Ok(child) => child,
         Err(e) => return format!("[spawn error: {e}]\n[exit 1]"),
     };
+    let child_pid = child.id();
 
     let stdout = child
         .stdout
@@ -594,7 +629,7 @@ fn run_bash(cmd: &str) -> String {
             Ok(None) => {
                 if started.elapsed() >= limits.timeout {
                     timed_out = true;
-                    kill_process_group(child.id());
+                    kill_process_group(child_pid);
                     let _ = child.kill();
                     break child.wait().ok();
                 }
@@ -606,6 +641,13 @@ fn run_bash(cmd: &str) -> String {
             }
         }
     };
+
+    // The shell can exit while a background descendant still owns stdout or
+    // stderr. Those inherited descriptors otherwise make the reader joins
+    // block forever after a seemingly successful tool call. A tool call owns
+    // its whole process group, so terminate remaining descendants before
+    // draining the pipes.
+    kill_process_group(child_pid);
 
     let stdout = stdout
         .and_then(|h| h.join().ok())
@@ -967,9 +1009,14 @@ pub(crate) fn append_stream(mut event: Value) {
             lock_file_exclusive(lock);
         }
 
-        // Safety floor: rotate before appending if oversized. Without this,
-        // the agent's own load-context calls eventually blow the API limit.
-        let info = maybe_rotate_log(&logs, &path);
+        // Safety floor: rotate before appending if oversized. A log-rotation
+        // hook emits hook_start/hook_end events through this function, so do
+        // not recursively rotate while that hook is running.
+        let info = if IN_LOG_ROTATION_HOOK.with(|active| active.get()) {
+            None
+        } else {
+            maybe_rotate_log(&logs, &path)
+        };
 
         if let Some(obj) = event.as_object_mut() {
             obj.insert("ts_ms".into(), json!(now_millis()));
@@ -988,7 +1035,7 @@ pub(crate) fn append_stream(mut event: Value) {
         // bookkeeping events — those are kernel-internal and don't need
         // to be in the session-level history.
         if let Ok(session_id) = env::var("LAZAR_SESSION_ID") {
-            if !session_id.is_empty() {
+            if !session_id.is_empty() && session::validate_session_id(&session_id).is_ok() {
                 let kind = event
                     .get("kind")
                     .and_then(|v| v.as_str())
@@ -1011,6 +1058,7 @@ pub(crate) fn append_stream(mut event: Value) {
         // events without deadlocking. The new stream.jsonl is now empty,
         // so a hook calling load-context won't see the old data — but the
         // archive path is in the payload.
+        IN_LOG_ROTATION_HOOK.with(|active| active.set(true));
         hooks::fire(
             HookEvent::LogRotation,
             json!({
@@ -1019,6 +1067,7 @@ pub(crate) fn append_stream(mut event: Value) {
                 "summary": info.summary,
             }),
         );
+        IN_LOG_ROTATION_HOOK.with(|active| active.set(false));
         prune_log_archives(&logs);
     }
 }
@@ -1710,11 +1759,13 @@ fn run_agent(
         // then return stop_reason=end_turn. The agent loop then halts
         // even though the model clearly wanted to run a command. Detect
         // that pattern and synthesize tool_use blocks so the loop keeps
-        // progressing. Disable with LAZAR_NO_BASH_FALLBACK=1.
+        // progressing. This is opt-in: a displayed shell example is not an
+        // execution request. Set LAZAR_BASH_FALLBACK=1 only for providers
+        // that demonstrably cannot emit tool_use blocks.
         let mut content = content;
         let mut stop_reason_str = stop_reason_str;
-        let bash_fallback_off = env_flag_enabled("LAZAR_NO_BASH_FALLBACK");
-        if !bash_fallback_off && stop_reason_str == "end_turn" {
+        let bash_fallback_enabled = env_flag_enabled("LAZAR_BASH_FALLBACK");
+        if bash_fallback_enabled && stop_reason_str == "end_turn" {
             let has_tool_use = content
                 .as_array()
                 .map(|a| a.iter().any(|b| b["type"] == "tool_use"))
@@ -1768,14 +1819,15 @@ fn run_agent(
 
         let stop_reason = stop_reason_str.as_str();
 
-        if stop_reason == "end_turn" {
+        if is_terminal_stop_reason(stop_reason) {
             let final_text = verifier::extract_text(&content);
             let tool_uses_this_turn = verifier::count_tool_uses(&content);
 
             // Kernel-owned stall recovery (bounded — see stall.rs doctrine).
             // Runs BEFORE invoke_end is logged so consumers never see a turn
             // end and then resurrect, which is what the old hack did.
-            if tool_uses_this_turn == 0
+            if stop_reason == "end_turn"
+                && tool_uses_this_turn == 0
                 && stall_nudges_used < max_stall_nudges
                 && stall::looks_stalled(&final_text)
             {
@@ -2064,40 +2116,13 @@ fn run_agent(
         }
 
         if results.is_empty() {
-            // text already streamed in parse_sse_stream; just log and exit
-            eprintln!("[lazar] stop_reason={stop_reason}, no tool calls; exiting");
-            append_stream(
-                json!({"kind": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}),
+            let msg = format!(
+                "API stopped with {stop_reason:?} before a terminal response and without executable bash calls"
             );
-            if depth == 0 {
-                hooks::fire(
-                    HookEvent::AgentStop,
-                    json!({
-                        "depth": depth,
-                        "stop_reason": stop_reason,
-                        "note": "no tool calls",
-                    }),
-                );
-            }
-            if format == OutputFormat::StreamJson {
-                emit_event(
-                    json!({"type": "invoke_end", "stop_reason": stop_reason, "note": "no tool calls"}),
-                );
-            } else if format == OutputFormat::Json {
-                println!(
-                    "{}",
-                    json!({
-                        "type": "result",
-                        "stop_reason": stop_reason,
-                        "model": &model,
-                        "result": "",
-                        "content": content,
-                        "note": "no tool calls",
-                    })
-                );
-            }
-            session_guard.mark_ok();
-            return Ok(());
+            emit_stream_error(format, &msg);
+            append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
+            session_guard.mark_error(&msg);
+            return Err(msg.into());
         }
 
         messages.push(json!({"role": "user", "content": results}));
@@ -2147,6 +2172,10 @@ fn run_tick(verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    // A parent shell must not silently inject a session path into an
+    // invocation that did not request --session or --resume.
+    env::remove_var("LAZAR_SESSION_ID");
 
     if args.reset_all {
         return reset_all(args.yes);
@@ -2501,5 +2530,21 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         let err = validate_reset_home(Path::new(&home)).unwrap_err();
 
         assert!(err.contains("refusing to reset HOME"));
+    }
+
+    #[test]
+    fn reset_home_validation_rejects_alias_components() {
+        let err = validate_reset_home(Path::new("/tmp/lazar-reset/..")).unwrap_err();
+        assert!(err.contains("non-canonical"));
+    }
+
+    #[test]
+    fn only_complete_stop_reasons_succeed() {
+        assert!(is_terminal_stop_reason("end_turn"));
+        assert!(is_terminal_stop_reason("stop_sequence"));
+        assert!(is_terminal_stop_reason("refusal"));
+        assert!(!is_terminal_stop_reason("max_tokens"));
+        assert!(!is_terminal_stop_reason("model_context_window_exceeded"));
+        assert!(!is_terminal_stop_reason("tool_use"));
     }
 }

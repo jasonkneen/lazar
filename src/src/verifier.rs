@@ -23,6 +23,7 @@
 
 use serde_json::{json, Value};
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -586,10 +587,9 @@ pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
         VerifyClaim::Contains(path, needle) => {
             let p = expand_path(path);
             const READ_CAP: usize = 65_536;
-            match fs::read_to_string(&p) {
+            match read_regular_file_head(&p, READ_CAP) {
                 Ok(s) => {
-                    let head = head_bytes(&s, READ_CAP);
-                    let ok = head.contains(needle.as_str());
+                    let ok = s.contains(needle.as_str());
                     ClaimResult {
                         claim: claim.clone(),
                         passed: ok,
@@ -634,6 +634,24 @@ pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
             }
         }
     }
+}
+
+/// Read no more than `cap` bytes from a regular, non-symlinked file. VERIFY
+/// claims are model-controlled, so they must not consume streams such as
+/// /dev/zero or FIFOs while the kernel checks a claim.
+fn read_regular_file_head(path: &Path, cap: usize) -> io::Result<String> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VERIFY contains requires a regular non-symlink file",
+        ));
+    }
+
+    let mut file = fs::File::open(path)?.take(cap as u64);
+    let mut bytes = Vec::with_capacity(cap);
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Run every claim, return a report.
@@ -753,6 +771,20 @@ mod tests {
         assert!(suspicions
             .iter()
             .any(|s| s.kind == SuspicionKind::PastTenseAction));
+    }
+
+    #[test]
+    fn contains_reader_limits_regular_file_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "lazar-verifier-cap-{}-{}",
+            std::process::id(),
+            crate::now_millis()
+        ));
+        fs::write(&path, "a".repeat(128)).unwrap();
+
+        let head = read_regular_file_head(&path, 64).unwrap();
+        assert_eq!(head.len(), 64);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -24,23 +24,16 @@ LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
 export LAZAR_HOME
 
 # ── 1. Secrets from Keychain (+ non-secrets from .env) ──────────────────────
-_LOAD="$LAZAR_HOME/skills/env-vars/load-all.sh"
-if [ -f "$_LOAD" ]; then
-  # shellcheck disable=SC1090
-  source "$_LOAD" 2>/dev/null || true
-else
-  # fallback: .env non-secrets only
-  if [ -f "$LAZAR_HOME/.env" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$LAZAR_HOME/.env"
-    set +a
-  fi
-  if [ -f "$LAZAR_HOME/workspace/provider-switch/provider-env.sh" ]; then
-    # shellcheck disable=SC1090
-    source "$LAZAR_HOME/workspace/provider-switch/provider-env.sh" 2>/dev/null || true
-  fi
+# This file is sourced by the operator's launcher, so it must never execute
+# runtime skills or workspace files: both are intentionally writable by the
+# sandboxed agent. The compiled/locked source copy is the trusted loader.
+_LOAD="$LAZAR_HOME/src/seed-skills/_meta/env-vars/load-all.sh"
+if [ ! -f "$_LOAD" ]; then
+  echo "[lazar-env] missing trusted Keychain loader: $_LOAD" >&2
+  return 1 2>/dev/null || exit 1
 fi
+# shellcheck disable=SC1090
+source "$_LOAD"
 
 # ── 2. Backend selection ────────────────────────────────────────────────────
 BACKEND="${LAZAR_BACKEND:-minimax}"
@@ -49,15 +42,10 @@ PROXY_PORT="${PROXY_PORT:-4000}"
 export LAZAR_USE_PROXY="${LAZAR_USE_PROXY:-0}"
 
 _start_proxy() {
-  local provider="$1" model="$2"
-  local start="$PROXY_DIR/start-proxy.sh"
-  if [ ! -x "$start" ]; then
-    echo "[lazar-env] WARN: missing $start — cannot start proxy for $provider" >&2
-    return 1
-  fi
-  # start-proxy.sh already kills stale pid and loads Keychain via provider-env
-  PROVIDER="$provider" MODEL="$model" PROXY_PORT="$PROXY_PORT" \
-    bash "$start" "$provider" "$model" >/dev/null
+  local provider="$1"
+  echo "[lazar-env] refusing to execute runtime proxy launcher for $provider" >&2
+  echo "[lazar-env] start a trusted proxy separately, then use LAZAR_BACKEND=proxy" >&2
+  return 1
 }
 
 case "$BACKEND" in
@@ -94,7 +82,7 @@ case "$BACKEND" in
     esac
     export LAZAR_MODEL="${LAZAR_MODEL:-$local_model_default}"
     if ! _start_proxy "$BACKEND" "$LAZAR_MODEL"; then
-      echo "[lazar-env] proxy start failed for backend=$BACKEND" >&2
+      return 2 2>/dev/null || exit 2
     fi
     export ANTHROPIC_BASE_URL="http://127.0.0.1:${PROXY_PORT}"
     export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-proxy-local}"

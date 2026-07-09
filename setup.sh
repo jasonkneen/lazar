@@ -72,7 +72,6 @@ chmod 555 "$TMP_BIN"
 chflags nouchg "$LAZAR_HOME/bin/lazar" 2>/dev/null || true
 mv -f "$TMP_BIN" "$LAZAR_HOME/bin/lazar"
 chflags uchg "$LAZAR_HOME/bin/lazar"
-chmod -R a-w "$LAZAR_HOME/src"
 
 # Install helper scripts so printed maintenance commands work from LAZAR_HOME.
 if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
@@ -86,9 +85,14 @@ if [[ "${LAZAR_RESET_ALL:-0}" == "1" ]]; then
 elif [[ ! -f "$LAZAR_HOME/skills/INDEX.md" ]]; then
     echo "[lazar] seeding default skills into empty skills/"
     cp -R "$LAZAR_HOME/src/seed-skills/." "$LAZAR_HOME/skills/"
+    chmod -R u+w "$LAZAR_HOME/skills"
 else
     echo "[lazar] preserving existing skills/memory/workspace/logs (no reset)"
 fi
+
+# The kernel source is immutable after the writable runtime skills have been
+# seeded. Locking first makes cp preserve read-only modes in skills/.
+chmod -R a-w "$LAZAR_HOME/src"
 
 "$LAZAR_HOME/bin/lazar" --help >/dev/null
 

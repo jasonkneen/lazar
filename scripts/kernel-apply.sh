@@ -39,6 +39,14 @@ echo "=== diff vs current kernel ==="
 diff -ru --exclude target "$LAZAR_HOME/src" "$PROPOSAL/src" || true
 echo "==="
 
+VERIFY_SCRIPT="$PROPOSAL/verify.sh"
+if [ -f "$VERIFY_SCRIPT" ]; then
+    echo "=== proposal verifier (runs sandboxed after apply) ==="
+    shasum -a 256 "$VERIFY_SCRIPT"
+    sed -n '1,260p' "$VERIFY_SCRIPT"
+    echo "==="
+fi
+
 if [ ! -t 0 ]; then
     fail "refusing to apply non-interactively; rerun from a terminal"
 fi

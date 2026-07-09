@@ -381,6 +381,7 @@ fn run_hook(
             };
         }
     };
+    let child_pid = child.id();
 
     // Start output readers before writing stdin. A hook may ignore stdin;
     // writing a large payload synchronously would otherwise block before the
@@ -408,7 +409,7 @@ fn run_hook(
             Ok(None) => {
                 if started.elapsed() >= timeout {
                     timed_out = true;
-                    crate::kill_process_group(child.id());
+                    crate::kill_process_group(child_pid);
                     let _ = child.kill();
                     break child.wait().ok();
                 }
@@ -420,6 +421,11 @@ fn run_hook(
             }
         }
     };
+
+    // A hook may background a process that inherits its captured pipes. The
+    // hook shell can then exit while the reader threads remain blocked forever.
+    // Hooks own their process group, so terminate descendants before joining.
+    crate::kill_process_group(child_pid);
 
     if let Some(handle) = stdin_handle {
         let _ = handle.join();
