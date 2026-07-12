@@ -1,6 +1,6 @@
 ## Core (operating basics — outrank all other skills)
 - env-vars — Keychain API keys (list/get/export/store/verify)
-- _meta/subagent — the only sanctioned way to delegate; spawn.sh wrapper, raw lazar -p vetoed
+- _meta/subagent — delegate via locked bin/lazar-spawn (skills spawn.sh is thin re-exec); raw lazar -p vetoed
 - _meta/log-harvest — durable work journal from logs (run before prune)
 - _meta/self-patch — notice→root-cause→fix loop; kernel changes are proposal-only
 - soul / memory / verify — see memory/PINNED.md

@@ -13,6 +13,14 @@ memory/
 workspace/
 logs/
 
+# The eval harness is versioned even though the rest of workspace/ is runtime
+# state. Existing eval scripts are tracked; keep new fixtures and runners
+# visible to Git as the suite grows.
+!workspace/
+workspace/*
+!workspace/evals/
+!workspace/evals/**
+
 # ─── editor / IDE ───────────────────────────────────────────────────
 .vscode/
 .idea/

@@ -45,7 +45,7 @@ Never claim a behavioral fix without a passing VERIFY.
   2. Delegate the mechanical edit+build to a worker (isolates it from my context) by writing a
      PRECISE spawn prompt — exact file, exact old→new text, and an `EXPECT-VERIFY:` block
      requiring a build-ok marker — then:
-     `bash skills/_meta/subagent/spawn.sh <name> <prompt-file>`.
+     `bash "$LAZAR_HOME/bin/lazar-spawn" <name> <prompt-file>`.
      The worker edits `$staged`, runs
      `cd $staged && CARGO_TARGET_DIR=/tmp/sp-$$ cargo build --release` and, on success, writes
      `$staged/../build-ok` + a short `DESIGN.md`. (Or, for a tiny edit, I do this directly.)

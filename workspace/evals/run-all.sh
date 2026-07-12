@@ -8,6 +8,7 @@
 #   bash workspace/evals/run-all.sh              # full + live (loads lazar-env)
 #   bash workspace/evals/run-all.sh --no-live    # offline only
 #   EVAL_MODELS="MiniMax-M3 MiniMax-M2.7" bash workspace/evals/run-all.sh
+#   MODEL_EVAL_MODELS="MiniMax-M3 anthropic/claude-haiku-4.5" bash workspace/evals/run-all.sh
 set -uo pipefail
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
 cd "$LAZAR_HOME"
@@ -41,11 +42,18 @@ done
 line "TUI go tests (interaction layer only)"
 ( cd workspace/tui && go test ./... 2>&1 | tail -1 ) || FAILED=1
 
+line "model event analyzer tests"
+bash workspace/evals/model-evals.sh --self-test || FAILED=1
+
 if [ "$LIVE" = "1" ]; then
   if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     echo; echo "(skipping live evals — no ANTHROPIC_API_KEY; use scripts/lazar-env.sh)"
     FAILED=1
   else
+    line "cross-provider model grounding evals"
+    EVAL_MODELS="${MODEL_EVAL_MODELS:-MiniMax-M3 anthropic/claude-haiku-4.5 openai/gpt-5.1 google/gemini-3.5-flash}" \
+      bash workspace/evals/model-evals.sh || FAILED=1
+
     # Default models: flagship M3 (product default) + cheaper regression tiers
     MODELS="${EVAL_MODELS:-MiniMax-M3 MiniMax-M2.5-highspeed MiniMax-M2.7}"
     for m in $MODELS; do
@@ -59,7 +67,11 @@ fi
 
 line "RESULT"
 if [ "$FAILED" -eq 0 ]; then
-  echo "ALL GREEN — kernel + skills + models hold"
+  if [ "$LIVE" = "1" ]; then
+    echo "ALL GREEN — kernel + skills + live model gates hold"
+  else
+    echo "ALL GREEN — offline gates hold (live model evals skipped)"
+  fi
   exit 0
 else
   echo "SOME FAILURES — see above"

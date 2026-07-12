@@ -1482,8 +1482,9 @@ fn run_agent(
          hard-won detail you need.\n\
          \n\
          DELEGATION (sub-agents)\n\
-         To delegate work to a sub-agent, use the subagent core skill: \
-         `bash skills/_meta/subagent/spawn.sh <task-id> <prompt-file>`. \
+         To delegate work to a sub-agent, use the locked spawn binary (same path for every model): \
+         `bash $LAZAR_HOME/bin/lazar-spawn <task-id> <prompt-file>` \
+         (skills/_meta/subagent/spawn.sh is only a thin re-exec to that binary). \
          It lints the prompt, bounds retries, kills wedged children, and \
          gates success by re-checking your declared claims. Raw `lazar -p` \
          calls are vetoed by a pre-tool hook — read _meta/subagent/SKILL.md. \

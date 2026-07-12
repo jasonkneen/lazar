@@ -44,12 +44,14 @@ else
   no "big write" "no file produced (likely empty-call abort): $(echo "$OUT" | tail -1)"
 fi
 
-# 4. Subagent live-fire: spawn a real child via spawn.sh, gate on the envelope.
+# 4. Subagent live-fire: spawn via locked bin/lazar-spawn (fallback: scripts/).
 PF="$T/task.txt"
+SPAWN_BIN="$LAZAR_HOME/bin/lazar-spawn"
+[ -x "$SPAWN_BIN" ] || SPAWN_BIN="$LAZAR_HOME/scripts/lazar-spawn.sh"
 printf 'Write the single word HATCHED to the file %s. Then end your turn with a VERIFY block: contains=%s:HATCHED\nSUCCESS: %s contains HATCHED\nEXPECT-VERIFY:\n  contains=%s:HATCHED\n' "$T/child.txt" "$T/child.txt" "$T/child.txt" "$T/child.txt" > "$PF"
 ENV=$(LAZAR_BIN="$BIN" LAZAR_SPAWN_TIMEOUT=90 EVAL_MODEL="$MODEL" \
   env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}" \
-  bash "$LAZAR_HOME/skills/_meta/subagent/spawn.sh" evalchild "$PF" 2>&1)
+  bash "$SPAWN_BIN" evalchild "$PF" 2>&1)
 if echo "$ENV" | rg -q '"matched":true' && [ -f "$T/child.txt" ] && rg -q HATCHED "$T/child.txt" 2>/dev/null; then
   ok "subagent LIVE-FIRE: child ran, claim matched, envelope ok"
 else
@@ -58,13 +60,17 @@ fi
 
 # 5. Spawn-discipline veto (deterministic — pipe payloads to the LIVE hook).
 HOOK="$LAZAR_HOME/hooks/pre-tool.d/10-spawn-discipline.strict.sh"
-if [ -x "$HOOK" ]; then
+if [ -x "$HOOK" ] || [ -f "$HOOK" ]; then
   V=$(printf '{"command":"LAZAR_DEPTH=1 lazar -p hi"}' | bash "$HOOK" 2>&1)
   echo "$V" | rg -q '"action":"veto"' && ok "veto blocks raw lazar -p (live hook)" || no "veto block" "$V"
-  A=$(printf '{"command":"bash skills/_meta/subagent/spawn.sh t /tmp/p"}' | bash "$HOOK" 2>&1)
-  echo "$A" | rg -q '"action":"continue"' && ok "veto allows spawn.sh wrapper" || no "veto allow" "$A"
+  A=$(printf '{"command":"bash $LAZAR_HOME/bin/lazar-spawn t /tmp/p"}' | bash "$HOOK" 2>&1)
+  echo "$A" | rg -q '"action":"continue"' && ok "veto allows locked bin/lazar-spawn" || no "veto allow" "$A"
+  A2=$(printf '{"command":"bash skills/_meta/subagent/spawn.sh t /tmp/p"}' | bash "$HOOK" 2>&1)
+  echo "$A2" | rg -q '"action":"continue"' && ok "veto allows thin skills re-exec" || no "veto thin allow" "$A2"
   B=$(printf '{"command":"echo subagent/spawn.sh; lazar -p evil"}' | bash "$HOOK" 2>&1)
   echo "$B" | rg -q '"action":"veto"' && ok "veto blocks decoy spawn.sh + raw lazar -p" || no "veto decoy bypass" "$B"
+  B2=$(printf '{"command":"echo bin/lazar-spawn; lazar -p evil"}' | bash "$HOOK" 2>&1)
+  echo "$B2" | rg -q '"action":"veto"' && ok "veto blocks decoy bin name + raw lazar -p" || no "veto bin decoy" "$B2"
 else
   sk "spawn-veto" "hook not installed"
 fi

@@ -112,7 +112,7 @@ printf 'Write the word SKILLSPAWN to %s\nSUCCESS: file has SKILLSPAWN\nEXPECT-VE
   "$T/spawned.txt" "$T/spawned.txt" > "$PF"
 ENV=$(LAZAR_BIN="$BIN" LAZAR_SPAWN_TIMEOUT=120 \
   env ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}" \
-  bash "$LAZAR_HOME/skills/_meta/subagent/spawn.sh" agenteval "$PF" 2>&1)
+  bash "${LAZAR_HOME}/bin/lazar-spawn" agenteval "$PF" 2>&1)
 if echo "$ENV" | rg -q '"matched":true' && [ -f "$T/spawned.txt" ] && rg -q SKILLSPAWN "$T/spawned.txt"; then
   ok "A7 subagent skill live-fire matched"
 else

@@ -78,6 +78,29 @@ if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
     cp -R "$SCRIPT_DIR/scripts/." "$LAZAR_HOME/scripts/"
 fi
 
+# Install locked sub-agent spawn surface (outside agent-writable skills/).
+# Source of truth: scripts/lazar-spawn.sh. Budget state lives under logs/subagent.
+SPAWN_SRC="$LAZAR_HOME/scripts/lazar-spawn.sh"
+if [[ ! -f "$SPAWN_SRC" && -f "$SCRIPT_DIR/scripts/lazar-spawn.sh" ]]; then
+    SPAWN_SRC="$SCRIPT_DIR/scripts/lazar-spawn.sh"
+    mkdir -p "$LAZAR_HOME/scripts"
+    cp "$SPAWN_SRC" "$LAZAR_HOME/scripts/lazar-spawn.sh"
+    SPAWN_SRC="$LAZAR_HOME/scripts/lazar-spawn.sh"
+fi
+if [[ -f "$SPAWN_SRC" ]]; then
+    echo "[lazar] installing locked bin/lazar-spawn"
+    TMP_SPAWN="$LAZAR_HOME/bin/.lazar-spawn.$$.tmp"
+    rm -f "$TMP_SPAWN"
+    cp "$SPAWN_SRC" "$TMP_SPAWN"
+    chmod 555 "$TMP_SPAWN"
+    chflags nouchg "$LAZAR_HOME/bin/lazar-spawn" 2>/dev/null || true
+    mv -f "$TMP_SPAWN" "$LAZAR_HOME/bin/lazar-spawn"
+    chflags uchg "$LAZAR_HOME/bin/lazar-spawn"
+    mkdir -p "$LAZAR_HOME/logs/subagent"
+else
+    echo "[lazar] WARN: scripts/lazar-spawn.sh missing — subagent spawn not installed"
+fi
+
 # Non-destructive default seeding. Full reset is explicit via LAZAR_RESET_ALL=1.
 if [[ "${LAZAR_RESET_ALL:-0}" == "1" ]]; then
     echo "[lazar] LAZAR_RESET_ALL=1: factory resetting runtime state"

@@ -11,6 +11,7 @@ This is the TUI it built for me -- yours will not be the same as this
 
 One tool: `bash(command)` — bash, sandboxed.
 One protocol: skills as filesystem entries.
+Sub-agent spawns go through locked `bin/lazar-spawn` (not agent-writable skills logic); budget state under `logs/subagent/`.
 Everything else is emergent.
 
 ## Architecture
