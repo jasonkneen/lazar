@@ -72,33 +72,11 @@ chmod 555 "$TMP_BIN"
 chflags nouchg "$LAZAR_HOME/bin/lazar" 2>/dev/null || true
 mv -f "$TMP_BIN" "$LAZAR_HOME/bin/lazar"
 chflags uchg "$LAZAR_HOME/bin/lazar"
+chmod -R a-w "$LAZAR_HOME/src"
 
 # Install helper scripts so printed maintenance commands work from LAZAR_HOME.
 if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
     cp -R "$SCRIPT_DIR/scripts/." "$LAZAR_HOME/scripts/"
-fi
-
-# Install locked sub-agent spawn surface (outside agent-writable skills/).
-# Source of truth: scripts/lazar-spawn.sh. Budget state lives under logs/subagent.
-SPAWN_SRC="$LAZAR_HOME/scripts/lazar-spawn.sh"
-if [[ ! -f "$SPAWN_SRC" && -f "$SCRIPT_DIR/scripts/lazar-spawn.sh" ]]; then
-    SPAWN_SRC="$SCRIPT_DIR/scripts/lazar-spawn.sh"
-    mkdir -p "$LAZAR_HOME/scripts"
-    cp "$SPAWN_SRC" "$LAZAR_HOME/scripts/lazar-spawn.sh"
-    SPAWN_SRC="$LAZAR_HOME/scripts/lazar-spawn.sh"
-fi
-if [[ -f "$SPAWN_SRC" ]]; then
-    echo "[lazar] installing locked bin/lazar-spawn"
-    TMP_SPAWN="$LAZAR_HOME/bin/.lazar-spawn.$$.tmp"
-    rm -f "$TMP_SPAWN"
-    cp "$SPAWN_SRC" "$TMP_SPAWN"
-    chmod 555 "$TMP_SPAWN"
-    chflags nouchg "$LAZAR_HOME/bin/lazar-spawn" 2>/dev/null || true
-    mv -f "$TMP_SPAWN" "$LAZAR_HOME/bin/lazar-spawn"
-    chflags uchg "$LAZAR_HOME/bin/lazar-spawn"
-    mkdir -p "$LAZAR_HOME/logs/subagent"
-else
-    echo "[lazar] WARN: scripts/lazar-spawn.sh missing — subagent spawn not installed"
 fi
 
 # Non-destructive default seeding. Full reset is explicit via LAZAR_RESET_ALL=1.
@@ -108,14 +86,9 @@ if [[ "${LAZAR_RESET_ALL:-0}" == "1" ]]; then
 elif [[ ! -f "$LAZAR_HOME/skills/INDEX.md" ]]; then
     echo "[lazar] seeding default skills into empty skills/"
     cp -R "$LAZAR_HOME/src/seed-skills/." "$LAZAR_HOME/skills/"
-    chmod -R u+w "$LAZAR_HOME/skills"
 else
     echo "[lazar] preserving existing skills/memory/workspace/logs (no reset)"
 fi
-
-# The kernel source is immutable after the writable runtime skills have been
-# seeded. Locking first makes cp preserve read-only modes in skills/.
-chmod -R a-w "$LAZAR_HOME/src"
 
 "$LAZAR_HOME/bin/lazar" --help >/dev/null
 
