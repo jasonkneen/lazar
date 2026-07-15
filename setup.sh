@@ -74,6 +74,12 @@ mv -f "$TMP_BIN" "$LAZAR_HOME/bin/lazar"
 chflags uchg "$LAZAR_HOME/bin/lazar"
 chmod -R a-w "$LAZAR_HOME/src"
 
+# Install the trusted sub-agent spawn wrapper alongside the kernel binary.
+if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
+    cp "$SCRIPT_DIR/bin/lazar-spawn" "$LAZAR_HOME/bin/lazar-spawn"
+fi
+chmod 555 "$LAZAR_HOME/bin/lazar-spawn"
+
 # Install helper scripts so printed maintenance commands work from LAZAR_HOME.
 if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
     cp -R "$SCRIPT_DIR/scripts/." "$LAZAR_HOME/scripts/"

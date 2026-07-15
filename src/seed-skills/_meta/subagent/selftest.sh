@@ -5,13 +5,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
 
 # Resolve trusted spawn (never rely on agent-writable skills logic).
-if [ -x "$LAZAR_HOME/bin/lazar-spawn" ]; then
-  SPAWN="$LAZAR_HOME/bin/lazar-spawn"
-elif [ -x "$LAZAR_HOME/scripts/lazar-spawn.sh" ]; then
-  SPAWN="$LAZAR_HOME/scripts/lazar-spawn.sh"
-elif [ -x "$HERE/../../../../scripts/lazar-spawn.sh" ]; then
-  SPAWN="$(cd "$HERE/../../../../scripts" && pwd)/lazar-spawn.sh"
-else
+SPAWN="$LAZAR_HOME/bin/lazar-spawn"
+if [ ! -x "$SPAWN" ]; then
   echo "[FAIL] no trusted lazar-spawn found"; exit 1
 fi
 
@@ -63,8 +58,7 @@ OUT=$(LAZAR_BIN="$TMP/bin/lazar" "$SPAWN" tmiss "$TMP/miss.txt" 2>&1)
 echo "$OUT" | rg -q '"matched":false' && ok "unmet claim -> not matched" || no "expected matched:false, got: $OUT"
 
 # --- Task 4: production state defaults to logs/ (not skills/) ---
-if rg -q 'logs/subagent' "$SPAWN" 2>/dev/null \
-  || rg -q 'logs/subagent' "$LAZAR_HOME/scripts/lazar-spawn.sh" 2>/dev/null; then
+if rg -q 'logs/subagent' "$SPAWN" 2>/dev/null; then
   ok "trusted spawn defaults state to logs/subagent"
 else
   no "trusted spawn must default budget state under logs/subagent"
