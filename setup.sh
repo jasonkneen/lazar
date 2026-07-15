@@ -56,34 +56,18 @@ if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
     fi
 fi
 
-mkdir -p "$CARGO_TARGET_DIR"
-echo "[lazar] cargo build --release (target: $CARGO_TARGET_DIR)"
-( cd "$LAZAR_HOME/src" && CARGO_TARGET_DIR="$CARGO_TARGET_DIR" cargo build --release )
+# Install helper scripts so printed maintenance commands work from LAZAR_HOME.
+if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
+    cp -R "$SCRIPT_DIR/scripts/." "$LAZAR_HOME/scripts/"
+fi
 
-BUILT="$CARGO_TARGET_DIR/release/lazar"
-[[ -x "$BUILT" ]] || fail "built binary missing at $BUILT"
-
-# Install atomically: prepare a locked temp binary, then swap it in.
-echo "[lazar] installing binary atomically"
-TMP_BIN="$LAZAR_HOME/bin/.lazar.$$.tmp"
-rm -f "$TMP_BIN"
-cp "$BUILT" "$TMP_BIN"
-chmod 555 "$TMP_BIN"
-chflags nouchg "$LAZAR_HOME/bin/lazar" 2>/dev/null || true
-mv -f "$TMP_BIN" "$LAZAR_HOME/bin/lazar"
-chflags uchg "$LAZAR_HOME/bin/lazar"
-chmod -R a-w "$LAZAR_HOME/src"
+LAZAR_HOME="$LAZAR_HOME" CARGO_TARGET_DIR="$CARGO_TARGET_DIR" bash "$LAZAR_HOME/scripts/kernel-build.sh"
 
 # Install the trusted sub-agent spawn wrapper alongside the kernel binary.
 if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
     cp "$SCRIPT_DIR/bin/lazar-spawn" "$LAZAR_HOME/bin/lazar-spawn"
 fi
 chmod 555 "$LAZAR_HOME/bin/lazar-spawn"
-
-# Install helper scripts so printed maintenance commands work from LAZAR_HOME.
-if [[ "$SCRIPT_DIR" != "$LAZAR_HOME" ]]; then
-    cp -R "$SCRIPT_DIR/scripts/." "$LAZAR_HOME/scripts/"
-fi
 
 # Non-destructive default seeding. Full reset is explicit via LAZAR_RESET_ALL=1.
 if [[ "${LAZAR_RESET_ALL:-0}" == "1" ]]; then
