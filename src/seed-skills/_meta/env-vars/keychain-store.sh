@@ -40,7 +40,7 @@ store_one() {
   val=$(printenv "$name" 2>/dev/null || true)
   if [ -z "${val:-}" ]; then
     echo "  skip  $name (not set)"
-    return 1
+    return 2
   fi
   if kc_set "$name" "$val"; then
     echo "  store $name (${#val} chars)"
@@ -55,19 +55,20 @@ echo "Storing keys → Keychain service='$LAZAR_KC_SERVICE'"
 OK=0; SKIP=0; FAIL=0
 
 if [ -n "$ONE" ]; then
-  store_one "$ONE" && OK=$((OK+1)) || { [ $? -eq 1 ] && SKIP=$((SKIP+1)) || FAIL=$((FAIL+1)); }
+  store_one "$ONE"; rc=$?
+  case "$rc" in
+    0) OK=$((OK+1)) ;;
+    2) SKIP=$((SKIP+1)) ;;
+    *) FAIL=$((FAIL+1)) ;;
+  esac
 else
   for name in "${LAZAR_KEY_NAMES[@]}"; do
-    if store_one "$name"; then
-      OK=$((OK+1))
-    else
-      # store_one returns 1 for skip, 2-ish for fail — treat missing as skip
-      if printenv "$name" >/dev/null 2>&1 && [ -n "$(printenv "$name")" ]; then
-        FAIL=$((FAIL+1))
-      else
-        SKIP=$((SKIP+1))
-      fi
-    fi
+    store_one "$name"; rc=$?
+    case "$rc" in
+      0) OK=$((OK+1)) ;;
+      2) SKIP=$((SKIP+1)) ;;
+      *) FAIL=$((FAIL+1)) ;;
+    esac
   done
 fi
 
