@@ -5,23 +5,35 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/keychain-common.sh"
-
 PASS=0; FAIL=0; SKIP=0; MISS=0
 ok(){ echo "  [PASS] $1"; PASS=$((PASS+1)); }
 no(){ echo "  [FAIL] $1 — $2"; FAIL=$((FAIL+1)); }
 sk(){ echo "  [SKIP] $1 — $2"; SKIP=$((SKIP+1)); }
 ms(){ echo "  [MISS] $1"; MISS=$((MISS+1)); }
-
 # HTTP helper: status code only. Args after URL are curl args (headers etc).
 http_code() {
   local url="$1"; shift
   curl -sS -o /tmp/lazar-kc-verify-body.$$ -w '%{http_code}' --max-time 20 "$@" "$url" 2>/dev/null \
     || echo "000"
 }
-
+# probe_provider NAME URL AUTH_STYLE EXTRA_PASS EXTRA_REJECT (AUTH_STYLE: bearer|xapikey|querykey)
+probe_provider() {
+  local name="$1" url="$2" auth="$3" extra_pass="${4:-NONE}" extra_reject="${5:-NONE}"
+  local val code
+  if ! val=$(kc_get "$name" 2>/dev/null); then ms "$name"; return; fi
+  case "$auth" in
+    bearer)   code=$(http_code "$url" -H "Authorization: Bearer $val") ;;
+    xapikey)  code=$(http_code "$url" -H "X-API-KEY: $val") ;;
+    querykey) code=$(http_code "${url}?key=${val}") ;;
+  esac
+  case "$code" in
+    200|$extra_pass) ok "$name (HTTP $code)" ;;
+    401|403|$extra_reject) no "$name" "auth rejected HTTP $code" ;;
+    *) no "$name" "HTTP $code" ;;
+  esac
+}
 echo "Verifying Keychain keys (service=$LAZAR_KC_SERVICE)"
 echo "────────────────────────────────────────"
-
 # --- MINIMAX (Anthropic-compatible) ---
 if val=$(kc_get MINIMAX_API_KEY 2>/dev/null); then
   code=$(http_code "https://api.minimax.io/anthropic/v1/messages" \
@@ -74,61 +86,11 @@ if val=$(kc_get ANTHROPIC_API_KEY 2>/dev/null); then
     *) no "ANTHROPIC_API_KEY" "HTTP $code at $BASE" ;;
   esac
 else ms ANTHROPIC_API_KEY; fi
-
-# --- OPENROUTER ---
-if val=$(kc_get OPENROUTER_API_KEY 2>/dev/null); then
-  code=$(http_code "https://openrouter.ai/api/v1/models" \
-    -H "Authorization: Bearer $val")
-  case "$code" in
-    200) ok "OPENROUTER_API_KEY (HTTP $code)" ;;
-    401|403) no "OPENROUTER_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "OPENROUTER_API_KEY" "HTTP $code" ;;
-  esac
-else ms OPENROUTER_API_KEY; fi
-
-# --- XAI ---
-if val=$(kc_get XAI_API_KEY 2>/dev/null); then
-  code=$(http_code "https://api.x.ai/v1/models" \
-    -H "Authorization: Bearer $val")
-  case "$code" in
-    200) ok "XAI_API_KEY (HTTP $code)" ;;
-    401|403) no "XAI_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "XAI_API_KEY" "HTTP $code" ;;
-  esac
-else ms XAI_API_KEY; fi
-
-# --- FIREWORKS ---
-if val=$(kc_get FIREWORKS_API_KEY 2>/dev/null); then
-  code=$(http_code "https://api.fireworks.ai/inference/v1/models" \
-    -H "Authorization: Bearer $val")
-  case "$code" in
-    200) ok "FIREWORKS_API_KEY (HTTP $code)" ;;
-    401|403) no "FIREWORKS_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "FIREWORKS_API_KEY" "HTTP $code" ;;
-  esac
-else ms FIREWORKS_API_KEY; fi
-
-# --- NVIDIA ---
-if val=$(kc_get NVIDIA_API_KEY 2>/dev/null); then
-  code=$(http_code "https://integrate.api.nvidia.com/v1/models" \
-    -H "Authorization: Bearer $val")
-  case "$code" in
-    200) ok "NVIDIA_API_KEY (HTTP $code)" ;;
-    401|403) no "NVIDIA_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "NVIDIA_API_KEY" "HTTP $code" ;;
-  esac
-else ms NVIDIA_API_KEY; fi
-
-# --- GEMINI ---
-if val=$(kc_get GEMINI_API_KEY 2>/dev/null); then
-  code=$(http_code "https://generativelanguage.googleapis.com/v1beta/models?key=${val}")
-  case "$code" in
-    200) ok "GEMINI_API_KEY (HTTP $code)" ;;
-    400|401|403) no "GEMINI_API_KEY" "auth/rejected HTTP $code" ;;
-    *) no "GEMINI_API_KEY" "HTTP $code" ;;
-  esac
-else ms GEMINI_API_KEY; fi
-
+probe_provider OPENROUTER_API_KEY "https://openrouter.ai/api/v1/models"              bearer
+probe_provider XAI_API_KEY        "https://api.x.ai/v1/models"                        bearer
+probe_provider FIREWORKS_API_KEY  "https://api.fireworks.ai/inference/v1/models"      bearer
+probe_provider NVIDIA_API_KEY     "https://integrate.api.nvidia.com/v1/models"        bearer
+probe_provider GEMINI_API_KEY     "https://generativelanguage.googleapis.com/v1beta/models" querykey NONE 400
 # --- ZEN (Claude via zenmux / similar — try Anthropic-shaped if key looks like sk-) ---
 if val=$(kc_get ZEN_API_KEY 2>/dev/null); then
   # Heuristic: try common zenmux endpoint; if unknown, format check only
@@ -148,29 +110,8 @@ if val=$(kc_get ZEN_API_KEY 2>/dev/null); then
     *) sk "ZEN_API_KEY" "unexpected HTTP $code (endpoint may differ)" ;;
   esac
 else ms ZEN_API_KEY; fi
-
-# --- E2B ---
-if val=$(kc_get E2B_API_KEY 2>/dev/null); then
-  code=$(http_code "https://api.e2b.dev/sandboxes" \
-    -H "X-API-KEY: $val")
-  case "$code" in
-    200|201) ok "E2B_API_KEY (HTTP $code)" ;;
-    401|403) no "E2B_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "E2B_API_KEY" "HTTP $code" ;;
-  esac
-else ms E2B_API_KEY; fi
-
-# --- OPENAI (optional) ---
-if val=$(kc_get OPENAI_API_KEY 2>/dev/null); then
-  code=$(http_code "https://api.openai.com/v1/models" \
-    -H "Authorization: Bearer $val")
-  case "$code" in
-    200) ok "OPENAI_API_KEY (HTTP $code)" ;;
-    401|403) no "OPENAI_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "OPENAI_API_KEY" "HTTP $code" ;;
-  esac
-else ms OPENAI_API_KEY; fi
-
+probe_provider E2B_API_KEY        "https://api.e2b.dev/sandboxes"                     xapikey 201
+probe_provider OPENAI_API_KEY     "https://api.openai.com/v1/models"                  bearer
 rm -f /tmp/lazar-kc-verify-body.$$ 2>/dev/null
 
 echo "────────────────────────────────────────"
