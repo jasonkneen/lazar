@@ -263,8 +263,11 @@ fn run_hook(
     // disabled sandboxing, hooks aren't sandboxed either.
     let unsandboxed = crate::no_sandbox_active();
 
-    let mut command =
-        crate::spawn::bash_command(crate::spawn::BashPayload::Script(script), &lazar, unsandboxed);
+    let mut command = crate::spawn::bash_command(
+        crate::spawn::BashPayload::Script(script),
+        &lazar,
+        crate::access::current(),
+    );
 
     let bash_home = crate::spawn::bash_home(&lazar, unsandboxed);
 

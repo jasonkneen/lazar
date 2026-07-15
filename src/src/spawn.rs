@@ -8,7 +8,25 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::access::AccessPolicy;
 use crate::SANDBOX_PROFILE;
+
+fn sandbox_profile(policy: &AccessPolicy) -> String {
+    let mut profile = SANDBOX_PROFILE.to_string();
+    if policy.allowed_write_dirs().is_empty() {
+        return profile;
+    }
+    profile.push_str("\n;; operator-approved runtime project roots\n(allow file-write*\n");
+    for path in policy.allowed_write_dirs() {
+        let escaped = path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"");
+        profile.push_str(&format!("  (subpath \"{escaped}\")\n"));
+    }
+    profile.push_str(")\n");
+    profile
+}
 
 /// Credentials and config passed through to the child process when the
 /// operator has explicitly opted out of the sandbox (`LAZAR_NO_SANDBOX=1`).
@@ -41,8 +59,8 @@ pub(crate) enum BashPayload<'a> {
 /// Build the bash Command, wrapped in sandbox-exec unless `unsandboxed`.
 /// Mirrors main.rs run_bash / hooks.rs run_hook construction exactly.
 /// Does NOT set cwd/stdio/env — those stay at the call site (caller-specific).
-pub(crate) fn bash_command(payload: BashPayload, lazar: &str, unsandboxed: bool) -> Command {
-    if unsandboxed {
+pub(crate) fn bash_command(payload: BashPayload, lazar: &str, policy: &AccessPolicy) -> Command {
+    if policy.unsandboxed() {
         let mut c = Command::new("/bin/bash");
         match payload {
             BashPayload::Inline(cmd) => {
@@ -67,7 +85,7 @@ pub(crate) fn bash_command(payload: BashPayload, lazar: &str, unsandboxed: bool)
                 env::var("HOME").unwrap_or_else(|_| "/".to_string())
             ))
             .arg("-p")
-            .arg(SANDBOX_PROFILE)
+            .arg(sandbox_profile(policy))
             .arg("/bin/bash");
         match payload {
             BashPayload::Inline(cmd) => {
@@ -184,7 +202,71 @@ pub(crate) fn wait_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::process::Stdio;
+
+    #[test]
+    fn sandbox_profile_grants_the_canonical_allowed_directory() {
+        let requested = std::env::temp_dir().join(format!(
+            "lazar-allowed-profile-{}", std::process::id()
+        ));
+        std::fs::create_dir_all(&requested).expect("create allowed dir");
+        let canonical = requested.canonicalize().expect("canonical allowed dir");
+        let policy = AccessPolicy::new(
+            false,
+            None,
+            &[PathBuf::from(&requested)],
+            Path::new("/lazar"),
+        ).expect("valid policy");
+        let profile = sandbox_profile(&policy);
+
+        assert!(profile.contains(&format!("(subpath \"{}\")", canonical.display())));
+        std::fs::remove_dir_all(requested).expect("remove allowed dir");
+    }
+
+    #[test]
+    fn sandbox_command_writes_inside_allowed_root_but_not_its_sibling() {
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        let root = home.join(format!(".lazar-access-test-{}", std::process::id()));
+        let allowed = root.join("allowed");
+        let denied = root.join("denied");
+        std::fs::create_dir_all(&allowed).expect("create allowed dir");
+        std::fs::create_dir_all(&denied).expect("create denied dir");
+        let policy = AccessPolicy::new(
+            false,
+            Some(&allowed),
+            std::slice::from_ref(&allowed),
+            Path::new("/Users/Shared/lazar-test-home"),
+        ).expect("valid policy");
+
+        let allowed_file = allowed.join("ok.txt");
+        let mut allowed_cmd = bash_command(
+            BashPayload::Inline("printf ok > \"$TEST_TARGET\""),
+            "/Users/Shared/lazar-test-home",
+            &policy,
+        );
+        let allowed_status = allowed_cmd
+            .env("TEST_TARGET", &allowed_file)
+            .status()
+            .expect("run allowed command");
+        assert!(allowed_status.success());
+        assert_eq!(std::fs::read_to_string(&allowed_file).expect("allowed output"), "ok");
+
+        let denied_file = denied.join("blocked.txt");
+        let mut denied_cmd = bash_command(
+            BashPayload::Inline("printf blocked > \"$TEST_TARGET\""),
+            "/Users/Shared/lazar-test-home",
+            &policy,
+        );
+        let denied_status = denied_cmd
+            .env("TEST_TARGET", &denied_file)
+            .status()
+            .expect("run denied command");
+        assert!(!denied_status.success());
+        assert!(!denied_file.exists());
+
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
 
     #[test]
     fn wait_with_timeout_kills_on_expiry() {

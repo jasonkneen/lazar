@@ -429,31 +429,31 @@ impl VerifyReport {
 pub fn parse_verify_blocks_strict(text: &str) -> ParsedVerifyBlocks {
     let mut claims = Vec::new();
     let mut invalid_lines = Vec::new();
-    let mut malformed = text.matches("[VERIFY]").count() != text.matches("[/VERIFY]").count();
-    let mut from = 0;
-    while let Some(start_idx) = text[from..].find("[VERIFY]") {
-        let abs_start = from + start_idx + "[VERIFY]".len();
-        let after = &text[abs_start..];
-        let end_idx = match after.find("[/VERIFY]") {
-            Some(i) => i,
-            None => {
-                malformed = true;
-                break;
+    let mut malformed = false;
+    let mut in_block = false;
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        match line {
+            "[VERIFY]" => {
+                if in_block { malformed = true; } else { in_block = true; }
             }
-        };
-        let block = &after[..end_idx];
-        for line in block.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
+            "[/VERIFY]" => {
+                if in_block { in_block = false; } else { malformed = true; }
             }
-            if let Some(claim) = parse_claim_line(line) {
-                claims.push(claim);
-            } else {
-                invalid_lines.push(line.chars().take(160).collect());
+            "" => {}
+            _ if in_block => {
+                if let Some(claim) = parse_claim_line(line) {
+                    claims.push(claim);
+                } else {
+                    invalid_lines.push(line.chars().take(160).collect());
+                }
             }
+            _ => {}
         }
-        from = abs_start + end_idx + "[/VERIFY]".len();
+    }
+    if in_block {
+        malformed = true;
     }
     ParsedVerifyBlocks { claims, invalid_lines, malformed }
 }
@@ -1008,6 +1008,17 @@ mod tests {
     fn strict_verify_rejects_unbalanced_markers() {
         let parsed = parse_verify_blocks_strict("[VERIFY]\nexists=/tmp/foo");
         assert!(parsed.malformed);
+    }
+
+    #[test]
+    fn strict_verify_ignores_marker_mentions_outside_the_terminal_block() {
+        let text = "The `[VERIFY]` contract proves filesystem claims.\n\n\
+                    [VERIFY]\nexists=/tmp\n[/VERIFY]";
+        let parsed = parse_verify_blocks_strict(text);
+
+        assert!(!parsed.malformed, "a prose marker mention must not unbalance the real block");
+        assert!(parsed.invalid_lines.is_empty());
+        assert_eq!(parsed.claims.len(), 1);
     }
 
     #[test]

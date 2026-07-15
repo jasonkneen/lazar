@@ -17,6 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod access;
 mod hooks;
 mod log;
 mod session;
@@ -318,6 +319,17 @@ struct Args {
     /// The kernel emits a loud banner on every invocation when active.
     #[arg(long)]
     no_sandbox: bool,
+
+    /// Set the working directory used by every model-issued bash command.
+    /// The path must already exist and is canonicalized before any hook or
+    /// tool runs.
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
+
+    /// Add an existing directory to the sandbox's write allowlist for this
+    /// invocation. Repeat the flag to approve multiple project roots.
+    #[arg(long = "add-dir", value_name = "PATH")]
+    add_dirs: Vec<PathBuf>,
 }
 
 pub(crate) fn lazar_home() -> PathBuf {
@@ -475,22 +487,9 @@ fn run_bash(cmd: &str) -> ToolExecutionResult {
         .unwrap_or(0);
     let child_depth = current_depth.saturating_add(1);
 
-    let unsandboxed = no_sandbox_active();
-
-    // When sandbox is disabled, run bash directly with operator-level cwd.
-    // Use $PWD if available (where the operator invoked lazar from) so
-    // commands like `ls` / `cat ./file` work in the project directory
-    // instead of always being chained to $LAZAR_WORKSPACE.
-    let cwd = if unsandboxed {
-        env::var("PWD")
-            .ok()
-            .filter(|p| !p.is_empty() && Path::new(p).is_dir())
-            .unwrap_or_else(|| workspace.clone())
-    } else {
-        workspace.clone()
-    };
-
-    let mut command = spawn::bash_command(spawn::BashPayload::Inline(cmd), &lazar, unsandboxed);
+    let policy = access::current();
+    let unsandboxed = policy.unsandboxed();
+    let mut command = spawn::bash_command(spawn::BashPayload::Inline(cmd), &lazar, policy);
 
     // When unsandboxed, use the operator's real HOME (so things like ~/.ssh,
     // git config, gh CLI, claude/codex auth all work without redirection).
@@ -498,7 +497,7 @@ fn run_bash(cmd: &str) -> ToolExecutionResult {
     let bash_home = spawn::bash_home(&lazar, unsandboxed);
 
     command
-        .current_dir(&cwd)
+        .current_dir(policy.tool_cwd())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1022,6 +1021,8 @@ fn run_agent(
     };
     system.push_str("\n\n");
     system.push_str(&runtime_identity_context(&model, &api_url));
+    system.push_str("\n\n");
+    system.push_str(&access::current().prompt_context());
 
     let tool = json!({
         "name": "bash",
@@ -1688,6 +1689,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return reset_all(args.yes);
     }
 
+    let unsandboxed = args.no_sandbox || env_flag_enabled("LAZAR_NO_SANDBOX");
+    let access_policy = access::AccessPolicy::new(
+        unsandboxed,
+        args.cwd.as_deref(),
+        &args.add_dirs,
+        &lazar_home(),
+    )?;
+    access::init(access_policy)?;
+
     // Make sure hooks/ exists for any path that fires hooks. First-run
     // installs that predate this kernel won't have the directory yet.
     ensure_hooks_seeded();
@@ -1697,7 +1707,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // agent itself cannot flip this on — env at spawn time is inherited
     // from this main process, and the agent is a tool subprocess that
     // can't mutate the parent's env.
-    if args.no_sandbox || env_flag_enabled("LAZAR_NO_SANDBOX") {
+    if unsandboxed {
         env::set_var("LAZAR_NO_SANDBOX", "1");
         eprintln!();
         eprintln!("════════════════════════════════════════════════════════════════");
@@ -1713,6 +1723,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "source": if args.no_sandbox { "cli_flag" } else { "env_var" },
         }));
     }
+    append_stream(json!({
+        "kind": "access_policy",
+        "cwd": access::current().tool_cwd(),
+        "allowed_write_dirs": access::current().allowed_write_dirs(),
+        "unsandboxed": access::current().unsandboxed(),
+    }));
 
     if args.tick {
         return run_tick(args.verbose);
@@ -1761,6 +1777,28 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::path::Path;
+
+    #[test]
+    fn cli_accepts_explicit_cwd_and_repeatable_add_dirs() {
+        let args = Args::try_parse_from([
+            "lazar",
+            "--cwd",
+            "/tmp",
+            "--add-dir",
+            "/tmp/one",
+            "--add-dir",
+            "/tmp/two",
+            "-p",
+            "test",
+        ])
+        .expect("scoped access flags should parse");
+
+        assert_eq!(args.cwd.as_deref(), Some(Path::new("/tmp")));
+        assert_eq!(
+            args.add_dirs,
+            [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
+        );
+    }
 
     /// Regression guard: the sandbox profile must grant writes to the specific
     /// session/auth subdirectories of ~/.codex and ~/.claude, but must NOT

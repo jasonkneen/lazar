@@ -204,12 +204,25 @@ That creates a timestamped `src.backup.*` first. Runtime state is still preserve
 - `LAZAR_LOG_MAX_BYTES` — size at which `logs/stream.jsonl` auto-rotates; default 10485760.
 - `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY` — opt-in (`1`, `true`, `yes`, `on`) to expose the API key to tool subprocesses so nested `lazar -p` calls can make API requests. Off by default for secret isolation.
 
+Project access can be scoped per invocation:
+
+```bash
+lazar --cwd ~/Documents/GitHub/my-project \
+  --add-dir ~/Documents/GitHub/my-project \
+  -p "inspect this project"
+```
+
+- `--cwd <path>` sets the working directory for model-issued bash commands.
+- Repeat `--add-dir <path>` to grant sandboxed writes to additional existing
+  project roots. Paths are canonicalized before any hook or tool runs.
+- `--no-sandbox` remains the explicit full-access escape hatch.
+
 ## Sandbox boundaries
 
 Every bash command runs through `sandbox-exec` with this policy:
 
 - **Reads:** open. The agent can read its own kernel and source.
-- **Writes:** only `skills/`, `memory/`, `workspace/`, `/tmp`, and selected session/auth subdirectories. `logs/` is trusted kernel-owned state: tools/skills may read it, not mutate it.
+- **Writes:** only `skills/`, `memory/`, `workspace/`, `/tmp`, selected session/auth subdirectories, and any operator-approved `--add-dir` roots. `logs/` is trusted kernel-owned state: tools/skills may read it, not mutate it.
 - **Network:** open (for API calls and skills like web-search).
 - **Process spawn:** open (for CLI tools and optional `lazar -p` recursion; nested API recursion requires `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1`).
 
