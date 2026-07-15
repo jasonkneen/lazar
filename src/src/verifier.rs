@@ -497,6 +497,32 @@ fn parse_claim_line(line: &str) -> Option<VerifyClaim> {
     }
 }
 
+/// Shared implementation for the Size / SizeAtLeast / SizeAtMost claims:
+/// stat the file, then let the caller supply the comparator and note text.
+fn check_size_claim(
+    claim: &VerifyClaim,
+    path: &Path,
+    ok: impl Fn(u64) -> bool,
+    describe: impl Fn(u64) -> String,
+) -> ClaimResult {
+    let p = expand_path(path);
+    match fs::metadata(&p) {
+        Ok(m) => {
+            let len = m.len();
+            ClaimResult {
+                claim: claim.clone(),
+                passed: ok(len),
+                note: describe(len),
+            }
+        }
+        Err(e) => ClaimResult {
+            claim: claim.clone(),
+            passed: false,
+            note: format!("stat failed: {e}"),
+        },
+    }
+}
+
 /// Run a single claim against the actual filesystem. Returns
 /// pass/fail and a one-line note. Read-only — no side effects.
 pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
@@ -527,63 +553,15 @@ pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
                 },
             }
         }
-        VerifyClaim::Size(path, n) => {
-            let p = expand_path(path);
-            match fs::metadata(&p) {
-                Ok(m) => {
-                    let len = m.len();
-                    let ok = len == *n;
-                    ClaimResult {
-                        claim: claim.clone(),
-                        passed: ok,
-                        note: format!("actual size {} bytes (expected {})", len, n),
-                    }
-                }
-                Err(e) => ClaimResult {
-                    claim: claim.clone(),
-                    passed: false,
-                    note: format!("stat failed: {e}"),
-                },
-            }
-        }
-        VerifyClaim::SizeAtLeast(path, n) => {
-            let p = expand_path(path);
-            match fs::metadata(&p) {
-                Ok(m) => {
-                    let len = m.len();
-                    let ok = len >= *n;
-                    ClaimResult {
-                        claim: claim.clone(),
-                        passed: ok,
-                        note: format!("actual size {} bytes (need >= {})", len, n),
-                    }
-                }
-                Err(e) => ClaimResult {
-                    claim: claim.clone(),
-                    passed: false,
-                    note: format!("stat failed: {e}"),
-                },
-            }
-        }
-        VerifyClaim::SizeAtMost(path, n) => {
-            let p = expand_path(path);
-            match fs::metadata(&p) {
-                Ok(m) => {
-                    let len = m.len();
-                    let ok = len <= *n;
-                    ClaimResult {
-                        claim: claim.clone(),
-                        passed: ok,
-                        note: format!("actual size {} bytes (need <= {})", len, n),
-                    }
-                }
-                Err(e) => ClaimResult {
-                    claim: claim.clone(),
-                    passed: false,
-                    note: format!("stat failed: {e}"),
-                },
-            }
-        }
+        VerifyClaim::Size(path, n) => check_size_claim(claim, path, |len| len == *n, |len| {
+            format!("actual size {} bytes (expected {})", len, n)
+        }),
+        VerifyClaim::SizeAtLeast(path, n) => check_size_claim(claim, path, |len| len >= *n, |len| {
+            format!("actual size {} bytes (need >= {})", len, n)
+        }),
+        VerifyClaim::SizeAtMost(path, n) => check_size_claim(claim, path, |len| len <= *n, |len| {
+            format!("actual size {} bytes (need <= {})", len, n)
+        }),
         VerifyClaim::Contains(path, needle) => {
             let p = expand_path(path);
             const READ_CAP: usize = 65_536;
@@ -693,7 +671,7 @@ fn short(s: &str, max: usize) -> String {
 /// Truncate to at most `cap` bytes without splitting a UTF-8 sequence.
 /// Slicing at a raw byte index panics when the index lands inside a
 /// multibyte char (e.g. '─' from TUI banners at the 64KB read cap).
-fn head_bytes(s: &str, cap: usize) -> &str {
+pub(crate) fn head_bytes(s: &str, cap: usize) -> &str {
     if s.len() <= cap {
         return s;
     }

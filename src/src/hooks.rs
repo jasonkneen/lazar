@@ -18,13 +18,14 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
-use crate::{append_stream, lazar_home, now_millis, SANDBOX_PROFILE};
+use crate::log::append_stream;
+use crate::{lazar_home, now_millis};
 
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 5;
 const HOOK_STDOUT_CAP_BYTES: usize = 16_384;
@@ -262,100 +263,22 @@ fn run_hook(
     // disabled sandboxing, hooks aren't sandboxed either.
     let unsandboxed = crate::no_sandbox_active();
 
-    let mut command = if unsandboxed {
-        let mut c = Command::new("/bin/bash");
-        c.arg(script);
-        c
-    } else {
-        let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-D")
-            .arg(format!("SKILLS_PATH={lazar}/skills"))
-            .arg("-D")
-            .arg(format!("MEMORY_PATH={lazar}/memory"))
-            .arg("-D")
-            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-            .arg("-D")
-            .arg(format!(
-                "USER_HOME={}",
-                env::var("HOME").unwrap_or_else(|_| "/".to_string())
-            ))
-            .arg("-p")
-            .arg(SANDBOX_PROFILE)
-            .arg("/bin/bash")
-            .arg(script);
-        c
-    };
+    let mut command =
+        crate::spawn::bash_command(crate::spawn::BashPayload::Script(script), &lazar, unsandboxed);
 
-    let bash_home = if unsandboxed {
-        env::var("HOME").unwrap_or_else(|_| lazar.clone())
-    } else {
-        lazar.clone()
-    };
+    let bash_home = crate::spawn::bash_home(&lazar, unsandboxed);
 
     command
         .current_dir(&workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("HOME", &bash_home)
-        .env("LAZAR_HOME", &lazar)
-        .env("LAZAR_SKILLS", format!("{lazar}/skills"))
-        .env("LAZAR_MEMORY", format!("{lazar}/memory"))
-        .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
-        .env("LAZAR_LOGS", format!("{lazar}/logs"))
+        .stderr(Stdio::piped());
+    crate::spawn::apply_base_env(&mut command, &lazar, &bash_home, unsandboxed);
+    command
         .env("LAZAR_HOOK_EVENT", event.as_str())
-        .env("LAZAR_HOOK_PAYLOAD_LEN", payload_str.len().to_string())
-        .env(
-            "TERM",
-            env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        )
-        .env(
-            "LANG",
-            env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
-        );
+        .env("LAZAR_HOOK_PAYLOAD_LEN", payload_str.len().to_string());
 
-    if unsandboxed {
-        command.env("LAZAR_NO_SANDBOX", "1");
-
-        // See main.rs for rationale: when operator opts out of sandbox,
-        // hook scripts also need real shell env to interact with the system.
-        const PASSTHROUGH_VARS: &[&str] = &[
-            "SSH_AUTH_SOCK", "SSH_AGENT_PID",
-            "GPG_TTY", "GNUPGHOME",
-            "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN",
-            "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
-            "GOOGLE_API_KEY", "MISTRAL_API_KEY", "TOGETHER_API_KEY",
-            "PERPLEXITY_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
-            "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
-            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-            "EDITOR", "VISUAL", "PAGER",
-            "LC_ALL", "LC_CTYPE",
-            "COLORTERM", "CLICOLOR", "FORCE_COLOR", "NO_COLOR",
-            "USER", "LOGNAME",
-            "TMPDIR",
-        ];
-        for var in PASSTHROUGH_VARS {
-            if let Ok(val) = env::var(var) {
-                command.env(var, val);
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::spawn::isolate_process_group(&mut command);
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -402,25 +325,13 @@ fn run_hook(
         })
     });
 
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    timed_out = true;
-                    crate::kill_process_group(child_pid);
-                    let _ = child.kill();
-                    break child.wait().ok();
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                break None;
-            }
-        }
-    };
+    let (status, timed_out) = crate::spawn::wait_with_timeout(
+        &mut child,
+        child_pid,
+        timeout,
+        Duration::from_millis(20),
+    )
+    .unwrap_or_default();
 
     // A hook may background a process that inherits its captured pipes. The
     // hook shell can then exit while the reader threads remain blocked forever.
@@ -486,6 +397,20 @@ fn run_hook(
     }
 }
 
+/// Reject invalid hook output: warn the operator, then fail open
+/// (Continue) or closed (Veto) depending on strict mode. `lenient_note`
+/// describes the fail-open consequence ("ignoring", "treating as Continue").
+fn reject(event: HookEvent, script_name: &str, msg: String, lenient_note: &str) -> HookAction {
+    eprintln!(
+        "[lazar] WARN: hook {} ({}) {}; {}",
+        script_name,
+        event.as_str(),
+        msg,
+        if strict_pre_tool_hook(event, script_name) { "failing closed" } else { lenient_note }
+    );
+    hook_failure_action(event, script_name, msg)
+}
+
 fn parse_action(stdout_bytes: &[u8], event: HookEvent, script_name: &str) -> HookAction {
     // Empty stdout = continue (the common case).
     let trimmed_start = stdout_bytes
@@ -499,56 +424,26 @@ fn parse_action(stdout_bytes: &[u8], event: HookEvent, script_name: &str) -> Hoo
     let s = match std::str::from_utf8(stdout_bytes) {
         Ok(s) => s.trim(),
         Err(_) => {
-            let msg = "emitted non-UTF8 stdout".to_string();
-            eprintln!(
-                "[lazar] WARN: hook {} ({}) {}; {}",
-                script_name,
-                event.as_str(),
-                msg,
-                if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "treating as Continue" }
-            );
-            return hook_failure_action(event, script_name, msg);
+            return reject(event, script_name, "emitted non-UTF8 stdout".to_string(), "treating as Continue");
         }
     };
 
     let value: Value = match serde_json::from_str(s) {
         Ok(v) => v,
         Err(e) => {
-            let msg = format!("emitted invalid JSON ({e})");
-            eprintln!(
-                "[lazar] WARN: hook {} ({}) {}; {}",
-                script_name,
-                event.as_str(),
-                msg,
-                if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "treating as Continue" }
-            );
-            return hook_failure_action(event, script_name, msg);
+            return reject(event, script_name, format!("emitted invalid JSON ({e})"), "treating as Continue");
         }
     };
 
     let Some(action) = value.get("action").and_then(|v| v.as_str()) else {
-        let msg = "emitted JSON without string action".to_string();
-        eprintln!(
-            "[lazar] WARN: hook {} ({}) {}; {}",
-            script_name,
-            event.as_str(),
-            msg,
-            if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "treating as Continue" }
-        );
-        return hook_failure_action(event, script_name, msg);
+        return reject(event, script_name, "emitted JSON without string action".to_string(), "treating as Continue");
     };
     match action {
         "continue" => HookAction::Continue,
         "veto" => {
             if !matches!(event, HookEvent::PreTool) {
                 let msg = format!("returned 'veto' on event {}; veto is pre-tool only", event.as_str());
-                eprintln!(
-                    "[lazar] WARN: hook {} {}; {}",
-                    script_name,
-                    msg,
-                    if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "ignoring" }
-                );
-                return hook_failure_action(event, script_name, msg);
+                return reject(event, script_name, msg, "ignoring");
             }
             let reason = value
                 .get("reason")
@@ -561,37 +456,18 @@ fn parse_action(stdout_bytes: &[u8], event: HookEvent, script_name: &str) -> Hoo
             if let Some(cmd) = value.get("command").and_then(|v| v.as_str()) {
                 if !matches!(event, HookEvent::PreTool) {
                     let msg = format!("returned 'transform.command' on event {}; pre-tool only", event.as_str());
-                    eprintln!(
-                        "[lazar] WARN: hook {} {}; {}",
-                        script_name,
-                        msg,
-                        if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "ignoring" }
-                    );
-                    return hook_failure_action(event, script_name, msg);
+                    return reject(event, script_name, msg, "ignoring");
                 }
                 return HookAction::TransformCommand(cmd.to_string());
             }
             if let Some(out) = value.get("output").and_then(|v| v.as_str()) {
                 if !matches!(event, HookEvent::PostTool) {
                     let msg = format!("returned 'transform.output' on event {}; post-tool only", event.as_str());
-                    eprintln!(
-                        "[lazar] WARN: hook {} {}; {}",
-                        script_name,
-                        msg,
-                        if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "ignoring" }
-                    );
-                    return hook_failure_action(event, script_name, msg);
+                    return reject(event, script_name, msg, "ignoring");
                 }
                 return HookAction::TransformOutput(out.to_string());
             }
-            let msg = "returned 'transform' without command/output".to_string();
-            eprintln!(
-                "[lazar] WARN: hook {} {}; {}",
-                script_name,
-                msg,
-                if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "treating as Continue" }
-            );
-            hook_failure_action(event, script_name, msg)
+            reject(event, script_name, "returned 'transform' without command/output".to_string(), "treating as Continue")
         }
         "inject" => {
             if !matches!(event, HookEvent::SessionStart | HookEvent::UserPrompt) {
@@ -599,36 +475,14 @@ fn parse_action(stdout_bytes: &[u8], event: HookEvent, script_name: &str) -> Hoo
                     "returned 'inject' on event {}; only session-start/user-prompt",
                     event.as_str()
                 );
-                eprintln!(
-                    "[lazar] WARN: hook {} {}; {}",
-                    script_name,
-                    msg,
-                    if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "ignoring" }
-                );
-                return hook_failure_action(event, script_name, msg);
+                return reject(event, script_name, msg, "ignoring");
             }
             let Some(ctx) = value.get("context").and_then(|v| v.as_str()) else {
-                let msg = "returned 'inject' without string context".to_string();
-                eprintln!(
-                    "[lazar] WARN: hook {} {}; {}",
-                    script_name,
-                    msg,
-                    if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "using empty context" }
-                );
-                return hook_failure_action(event, script_name, msg);
+                return reject(event, script_name, "returned 'inject' without string context".to_string(), "using empty context");
             };
             HookAction::InjectContext(ctx.to_string())
         }
-        other => {
-            let msg = format!("returned unknown action '{other}'");
-            eprintln!(
-                "[lazar] WARN: hook {} {}; {}",
-                script_name,
-                msg,
-                if strict_pre_tool_hook(event, script_name) { "failing closed" } else { "treating as Continue" }
-            );
-            hook_failure_action(event, script_name, msg)
-        }
+        other => reject(event, script_name, format!("returned unknown action '{other}'"), "treating as Continue"),
     }
 }
 

@@ -9,24 +9,22 @@ use clap::{Parser, ValueEnum};
 use include_dir::{include_dir, Dir};
 use serde_json::{json, Value};
 use std::{
-    cell::Cell,
     env, fs,
-    fs::File,
     io::{BufRead, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
-
 mod hooks;
+mod log;
 mod session;
+mod spawn;
 mod stall;
 mod verifier;
 use hooks::HookEvent;
+use log::append_stream;
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum OutputFormat {
@@ -49,6 +47,7 @@ enum InputFormat {
 static SEED_SKILLS: Dir = include_dir!("$CARGO_MANIFEST_DIR/seed-skills");
 static SEED_HOOKS: Dir = include_dir!("$CARGO_MANIFEST_DIR/seed-hooks");
 pub(crate) static SANDBOX_PROFILE: &str = include_str!("../sandbox.sb");
+static SYSTEM_PROMPT_TEMPLATE: &str = include_str!("../system-prompt.txt");
 
 const MAX_DEPTH: u32 = 5;
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
@@ -58,10 +57,6 @@ const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = 200_000;
 const DEFAULT_MAX_AGENT_TURNS: u32 = 50;
 const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
 const TOOL_READ_CHUNK_BYTES: usize = 8192;
-
-thread_local! {
-    static IN_LOG_ROTATION_HOOK: Cell<bool> = const { Cell::new(false) };
-}
 
 #[derive(Clone, Copy, Debug)]
 struct ToolLimits {
@@ -106,25 +101,6 @@ pub(crate) fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
-}
-
-fn now_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-fn safe_prefix(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 /// Extract bash/sh commands from ```bash / ```sh / ```shell fences in
@@ -182,7 +158,7 @@ fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
         return output.to_string();
     }
 
-    let prefix = safe_prefix(output, max_bytes);
+    let prefix = verifier::head_bytes(output, max_bytes);
     let omitted = output.len().saturating_sub(prefix.len());
     format!("{prefix}\n[truncated: {omitted} bytes omitted]")
 }
@@ -192,7 +168,7 @@ fn tool_input_preview(input: &str, max_bytes: usize) -> String {
         return input.to_string();
     }
 
-    let prefix = safe_prefix(input, max_bytes);
+    let prefix = verifier::head_bytes(input, max_bytes);
     let omitted = input.len().saturating_sub(prefix.len());
     format!("{prefix}…[+{omitted}b]")
 }
@@ -481,66 +457,22 @@ fn run_bash(cmd: &str) -> String {
         workspace.clone()
     };
 
-    let mut command = if unsandboxed {
-        let mut c = Command::new("/bin/bash");
-        c.arg("-c").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-D")
-            .arg(format!("SKILLS_PATH={lazar}/skills"))
-            .arg("-D")
-            .arg(format!("MEMORY_PATH={lazar}/memory"))
-            .arg("-D")
-            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-            .arg("-D")
-            .arg(format!(
-                "USER_HOME={}",
-                env::var("HOME").unwrap_or_else(|_| "/".to_string())
-            ))
-            .arg("-p")
-            .arg(SANDBOX_PROFILE)
-            .arg("/bin/bash")
-            .arg("-c")
-            .arg(cmd);
-        c
-    };
+    let mut command = spawn::bash_command(spawn::BashPayload::Inline(cmd), &lazar, unsandboxed);
 
     // When unsandboxed, use the operator's real HOME (so things like ~/.ssh,
     // git config, gh CLI, claude/codex auth all work without redirection).
     // When sandboxed, HOME is pinned to LAZAR_HOME (existing behavior).
-    let bash_home = if unsandboxed {
-        env::var("HOME").unwrap_or_else(|_| lazar.clone())
-    } else {
-        lazar.clone()
-    };
+    let bash_home = spawn::bash_home(&lazar, unsandboxed);
 
     command
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("HOME", &bash_home)
-        .env("LAZAR_HOME", &lazar)
-        .env("LAZAR_SKILLS", format!("{lazar}/skills"))
-        .env("LAZAR_MEMORY", format!("{lazar}/memory"))
-        .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
-        .env("LAZAR_LOGS", format!("{lazar}/logs"))
+        .stderr(Stdio::piped());
+    spawn::apply_base_env(&mut command, &lazar, &bash_home, unsandboxed);
+    command
         .env("LAZAR_TOOL_ENV", "1")
-        .env("LAZAR_DEPTH", child_depth.to_string())
-        .env(
-            "TERM",
-            env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        )
-        .env(
-            "LANG",
-            env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
-        );
+        .env("LAZAR_DEPTH", child_depth.to_string());
 
     // Only the main process establishes a session id. Propagate that validated
     // value so child helpers can enforce their documented per-session limits.
@@ -552,35 +484,8 @@ fn run_bash(cmd: &str) -> String {
 
     // Propagate LAZAR_NO_SANDBOX so nested `lazar -p` calls inherit the
     // mode (otherwise the child would re-sandbox and the operator's
-    // intent would be silently dropped).
-    if unsandboxed {
-        command.env("LAZAR_NO_SANDBOX", "1");
-
-        // When unsandboxed, operator explicitly opted out of isolation.
-        // Pass through credentials and config that real shells/CLIs need:
-        // SSH agent, GPG, GitHub/GitLab tokens, common LLM API keys,
-        // editor/pager preferences, locale, color settings.
-        const PASSTHROUGH_VARS: &[&str] = &[
-            "SSH_AUTH_SOCK", "SSH_AGENT_PID",
-            "GPG_TTY", "GNUPGHOME",
-            "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN",
-            "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
-            "GOOGLE_API_KEY", "MISTRAL_API_KEY", "TOGETHER_API_KEY",
-            "PERPLEXITY_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
-            "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
-            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-            "EDITOR", "VISUAL", "PAGER",
-            "LC_ALL", "LC_CTYPE",
-            "COLORTERM", "CLICOLOR", "FORCE_COLOR", "NO_COLOR",
-            "USER", "LOGNAME",
-            "TMPDIR",
-        ];
-        for var in PASSTHROUGH_VARS {
-            if let Ok(val) = env::var(var) {
-                command.env(var, val);
-            }
-        }
-    }
+    // intent would be silently dropped). Handled by apply_base_env above
+    // (sets LAZAR_NO_SANDBOX + PASSTHROUGH_VARS when unsandboxed).
 
     if let Ok(model) = env::var("LAZAR_MODEL") {
         command.env("LAZAR_MODEL", model);
@@ -596,15 +501,7 @@ fn run_bash(cmd: &str) -> String {
         }
     }
 
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    spawn::isolate_process_group(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -621,25 +518,14 @@ fn run_bash(cmd: &str) -> String {
         .take()
         .map(|err| read_capped(err, limits.output_max_bytes));
 
-    let started = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if started.elapsed() >= limits.timeout {
-                    timed_out = true;
-                    kill_process_group(child_pid);
-                    let _ = child.kill();
-                    break child.wait().ok();
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return format!("[wait error: {e}]\n[exit 1]");
-            }
-        }
+    let (status, timed_out) = match spawn::wait_with_timeout(
+        &mut child,
+        child_pid,
+        limits.timeout,
+        Duration::from_millis(50),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => return format!("[wait error: {e}]\n[exit 1]"),
     };
 
     // The shell can exit while a background descendant still owns stdout or
@@ -697,379 +583,12 @@ fn run_bash(cmd: &str) -> String {
 /// This is the "structured streaming" output for programmatic consumers like
 /// the TUI. Distinct from the canonical log at logs/stream.jsonl.
 fn emit_event(mut event: Value) {
-    use std::io::Write;
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts_ms = now_millis();
     if let Some(obj) = event.as_object_mut() {
         obj.insert("ts_ms".into(), json!(ts_ms));
     }
     println!("{event}");
     let _ = std::io::stdout().flush();
-}
-
-fn unique_log_archive_path(logs: &Path) -> PathBuf {
-    let pid = std::process::id();
-    for attempt in 0..1000u32 {
-        let suffix = if attempt == 0 {
-            String::new()
-        } else {
-            format!(".{attempt}")
-        };
-        let candidate = logs.join(format!("stream.jsonl.{}.{pid}{suffix}.bak", now_nanos()));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-
-    logs.join(format!("stream.jsonl.{}.{pid}.fallback.bak", now_nanos()))
-}
-
-#[cfg(unix)]
-fn lock_file_exclusive(file: &File) {
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
-    }
-}
-
-#[cfg(not(unix))]
-fn lock_file_exclusive(_file: &File) {}
-
-fn ensure_dir_not_symlink(path: &Path, label: &str) -> std::io::Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("refusing to use symlinked {label}"),
-            ));
-        }
-    }
-    fs::create_dir_all(path)?;
-    let meta = fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("refusing to use symlinked {label}"),
-        ));
-    }
-    Ok(())
-}
-
-fn open_append_no_follow(path: &Path, label: &str) -> std::io::Result<File> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("refusing to append to symlinked {label}"),
-            ));
-        }
-    }
-
-    let mut opts = fs::OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    opts.open(path)
-}
-
-fn write_new_no_follow(path: &Path, label: &str, contents: &str) -> std::io::Result<()> {
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("refusing to write symlinked {label}"),
-            ));
-        }
-    }
-
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        opts.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = opts.open(path)?;
-    file.write_all(contents.as_bytes())
-}
-
-/// Auto-rotate the stream log when it exceeds LAZAR_LOG_MAX_BYTES (default 10MB).
-/// The current log is moved to a unique stream.jsonl.<unix-nanos>.<pid>.bak
-/// archive and a minimal summary is written into memory/log-summaries/ so the
-/// agent has a navigable index of past archives. Skills like _meta/log-rotation
-/// can layer richer summaries on top. After rotation hooks run, the kernel prunes
-/// old *harvested* archives according to LAZAR_LOG_ARCHIVE_KEEP (default 5,
-/// 0 disables). Unharvested archives are never deleted — harvest first
-/// (memory/.harvested), then prune keeps disk bounded.
-/// Result of a successful log rotation. Returned to the caller so it can
-/// fire the `log-rotation` hook AFTER releasing the stream lock — firing
-/// inside the lock would deadlock because hooks themselves write hook_start
-/// / hook_end events through append_stream.
-struct RotationInfo {
-    archive: PathBuf,
-    size_bytes: u64,
-    summary: Option<PathBuf>,
-}
-
-fn maybe_rotate_log(logs: &Path, path: &Path) -> Option<RotationInfo> {
-    let max_bytes: u64 = env::var("LAZAR_LOG_MAX_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10_485_760); // 10 MB
-
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(_) => return None, // file doesn't exist yet — nothing to rotate
-    };
-    if meta.file_type().is_symlink() {
-        eprintln!("[lazar] WARN: refusing to rotate symlinked stream.jsonl");
-        return None;
-    }
-
-    let size = meta.len();
-    if size < max_bytes {
-        return None;
-    }
-
-    let archive = unique_log_archive_path(logs);
-    if fs::rename(path, &archive).is_err() {
-        eprintln!("[lazar] WARN: log rotation rename failed; log will keep growing");
-        return None;
-    }
-    eprintln!(
-        "[lazar] auto-rotated stream.jsonl → {} ({size} bytes)",
-        archive
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("archive")
-    );
-
-    // Write a minimal summary into memory/log-summaries/ so the agent has
-    // an index of past archives without re-reading them. _meta/log-rotation
-    // and _meta/distill can layer richer per-archive summaries on top.
-    let memory_root = logs
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("memory");
-    let memory = memory_root.join("log-summaries");
-    let mut summary_path: Option<PathBuf> = None;
-    if let Err(e) = ensure_dir_not_symlink(&memory_root, "memory directory") {
-        eprintln!("[lazar] WARN: not writing rotation summary: {e}");
-    } else if let Err(e) = ensure_dir_not_symlink(&memory, "log-summaries directory") {
-        eprintln!("[lazar] WARN: not writing rotation summary: {e}");
-    } else {
-        let summary_name = archive
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("stream.jsonl.unknown.bak")
-            .trim_start_matches("stream.jsonl.")
-            .trim_end_matches(".bak")
-            .to_string();
-        let sum_path = memory.join(format!("{summary_name}.md"));
-        let header = format!(
-            "# log-summary {summary_name}\n\
-             \n\
-             archive: {}\n\
-             size_bytes: {size}\n\
-             rotated_at_unix_ms: {}\n\
-             \n\
-             _Auto-rotated by the lazar kernel when stream.jsonl exceeded \
-             LAZAR_LOG_MAX_BYTES. The kernel may prune old full archives according \
-             to LAZAR_LOG_ARCHIVE_KEEP; this summary is the durable navigation \
-             record. For richer per-archive summaries (top user prompts, top tool \
-             commands), run the `_meta/log-rotation` skill against this archive. \
-             For LLM-extracted learnings, run `_meta/distill`._\n",
-            archive.display(),
-            now_millis()
-        );
-        if let Err(e) = write_new_no_follow(&sum_path, "rotation summary", &header) {
-            eprintln!("[lazar] WARN: failed to write rotation summary: {e}");
-        } else {
-            summary_path = Some(sum_path);
-        }
-    }
-
-    Some(RotationInfo {
-        archive,
-        size_bytes: size,
-        summary: summary_path,
-    })
-}
-
-fn log_archive_timestamp(path: &Path) -> Option<u128> {
-    let name = path.file_name()?.to_str()?;
-    let stem = name
-        .strip_prefix("stream.jsonl.")?
-        .strip_suffix(".bak.gz")
-        .or_else(|| name.strip_prefix("stream.jsonl.")?.strip_suffix(".bak"))?;
-    stem.split('.').next()?.parse().ok()
-}
-
-/// Load archive basenames recorded by `_meta/log-harvest` in
-/// `memory/.harvested`. Only harvested archives are eligible for prune —
-/// unharvested history is never deleted solely because keep was exceeded.
-fn harvested_archive_names(home: &Path) -> std::collections::HashSet<String> {
-    let path = home.join("memory").join(".harvested");
-    match fs::read_to_string(path) {
-        Ok(s) => s
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect(),
-        Err(_) => std::collections::HashSet::new(),
-    }
-}
-
-fn archives_to_prune(
-    logs: &Path,
-    keep: usize,
-    harvested: &std::collections::HashSet<String>,
-) -> Vec<PathBuf> {
-    if keep == 0 {
-        return Vec::new();
-    }
-
-    let mut archives: Vec<(u128, String, PathBuf)> = match fs::read_dir(logs) {
-        Ok(entries) => entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                if !path.is_file() {
-                    return None;
-                }
-                let ts = log_archive_timestamp(&path)?;
-                let name = path.file_name()?.to_str()?.to_string();
-                // Never prune unharvested archives — durable journal first.
-                if !harvested.contains(&name) {
-                    return None;
-                }
-                Some((ts, name, path))
-            })
-            .collect(),
-        Err(_) => return Vec::new(),
-    };
-
-    archives.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    archives
-        .into_iter()
-        .skip(keep)
-        .map(|(_, _, path)| path)
-        .collect()
-}
-
-fn log_archive_keep_limit() -> usize {
-    match env::var("LAZAR_LOG_ARCHIVE_KEEP") {
-        Ok(raw) => match raw.parse() {
-            Ok(keep) => keep,
-            Err(_) => {
-                eprintln!(
-                    "[lazar] WARN: invalid LAZAR_LOG_ARCHIVE_KEEP={raw:?}; using default 5"
-                );
-                5
-            }
-        },
-        Err(_) => 5,
-    }
-}
-
-fn prune_log_archives(logs: &Path) {
-    let harvested = harvested_archive_names(&lazar_home());
-    for archive in archives_to_prune(logs, log_archive_keep_limit(), &harvested) {
-        if let Err(e) = fs::remove_file(&archive) {
-            eprintln!(
-                "[lazar] WARN: failed to prune old log archive {}: {e}",
-                archive.display()
-            );
-        }
-    }
-}
-
-/// Append a single JSON event to the canonical stream at logs/stream.jsonl.
-/// The kernel records; the agent decides what (if anything) to read back.
-/// This is the "infinite memory log" — a single append-only stream of every
-/// prompt, response, tool call, and result across all invocations.
-///
-/// Auto-rotates when the log exceeds LAZAR_LOG_MAX_BYTES.
-pub(crate) fn append_stream(mut event: Value) {
-    let logs = lazar_home().join("logs");
-    let _ = fs::create_dir_all(&logs);
-    let path = logs.join("stream.jsonl");
-    let lock_path = logs.join(".stream.lock");
-
-    // Capture rotation info from inside the lock so we can fire the
-    // log-rotation hook AFTER the lock is released — firing it inside
-    // would deadlock because hooks emit hook_start/hook_end events back
-    // through this same function.
-    let rotation_info = {
-        let lock = open_append_no_follow(&lock_path, "stream lock").ok();
-        if let Some(lock) = lock.as_ref() {
-            lock_file_exclusive(lock);
-        }
-
-        // Safety floor: rotate before appending if oversized. A log-rotation
-        // hook emits hook_start/hook_end events through this function, so do
-        // not recursively rotate while that hook is running.
-        let info = if IN_LOG_ROTATION_HOOK.with(|active| active.get()) {
-            None
-        } else {
-            maybe_rotate_log(&logs, &path)
-        };
-
-        if let Some(obj) = event.as_object_mut() {
-            obj.insert("ts_ms".into(), json!(now_millis()));
-        }
-
-        match open_append_no_follow(&path, "stream log") {
-            Ok(mut f) => {
-                let _ = writeln!(f, "{}", event);
-            }
-            Err(e) => eprintln!("[lazar] WARN: failed to append stream log: {e}"),
-        }
-
-        // If a session id is set for this invocation, mirror the event
-        // into the session log so multi-turn continuity works on the
-        // next invocation. Skipped for hook_start/hook_end and rotation
-        // bookkeeping events — those are kernel-internal and don't need
-        // to be in the session-level history.
-        if let Ok(session_id) = env::var("LAZAR_SESSION_ID") {
-            if !session_id.is_empty() && session::validate_session_id(&session_id).is_ok() {
-                let kind = event
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let mirror = matches!(
-                    kind,
-                    "user" | "assistant" | "tool_result" | "invoke_start" | "invoke_end"
-                );
-                if mirror {
-                    session::append_session(&session_id, event.clone());
-                }
-            }
-        }
-        info
-        // lock dropped here
-    };
-
-    if let Some(info) = rotation_info {
-        // Hook fires post-lock so it can write its own hook_start/hook_end
-        // events without deadlocking. The new stream.jsonl is now empty,
-        // so a hook calling load-context won't see the old data — but the
-        // archive path is in the payload.
-        IN_LOG_ROTATION_HOOK.with(|active| active.set(true));
-        hooks::fire(
-            HookEvent::LogRotation,
-            json!({
-                "archive": info.archive,
-                "size_bytes": info.size_bytes,
-                "summary": info.summary,
-            }),
-        );
-        IN_LOG_ROTATION_HOOK.with(|active| active.set(false));
-        prune_log_archives(&logs);
-    }
 }
 
 /// Parse an SSE stream from the Anthropic Messages API.
@@ -1097,6 +616,7 @@ fn parse_sse_reader<R: BufRead>(
 
     let mut blocks: HashMap<u64, Value> = HashMap::new();
     let mut tool_input_buffers: HashMap<u64, String> = HashMap::new();
+    let mut text_buffers: HashMap<u64, String> = HashMap::new();
     let mut stop_reason = String::new();
     let mut printed_any_text = false;
     let mut saw_message_stop = false;
@@ -1144,10 +664,7 @@ fn parse_sse_reader<R: BufRead>(
                                 // Suppress live output; final result emitted at end_turn.
                             }
                         }
-                        if let Some(block) = blocks.get_mut(&idx) {
-                            let current = block["text"].as_str().unwrap_or("").to_string();
-                            block["text"] = json!(current + text);
-                        }
+                        text_buffers.entry(idx).or_default().push_str(text);
                     }
                     "input_json_delta" => {
                         let partial = delta["partial_json"].as_str().unwrap_or("");
@@ -1191,11 +708,16 @@ fn parse_sse_reader<R: BufRead>(
                                 "input": block["input"],
                             }));
                         }
-                    } else if block["type"] == "text" && format == OutputFormat::StreamJson {
-                        emit_event(json!({
-                            "type": "text_done",
-                            "index": idx,
-                        }));
+                    } else if block["type"] == "text" {
+                        if let Some(buf) = text_buffers.remove(&idx) {
+                            block["text"] = json!(buf);
+                        }
+                        if format == OutputFormat::StreamJson {
+                            emit_event(json!({
+                                "type": "text_done",
+                                "index": idx,
+                            }));
+                        }
                     }
                 }
             }
@@ -1251,6 +773,15 @@ fn parse_sse_reader<R: BufRead>(
 
     if format == OutputFormat::Text && printed_any_text {
         println!();
+    }
+
+    // Early-EOF recovery: fold text that never saw content_block_stop.
+    for (idx, buf) in text_buffers.drain() {
+        if let Some(block) = blocks.get_mut(&idx) {
+            if block["type"] == "text" {
+                block["text"] = json!(buf);
+            }
+        }
     }
 
     let mut indices: Vec<u64> = blocks.keys().copied().collect();
@@ -1312,6 +843,40 @@ impl Drop for SessionEndGuard {
             }
         }
         hooks::fire(HookEvent::SessionEnd, payload);
+    }
+}
+
+/// Uniform abort: mirror the error to stream-json consumers, record
+/// invoke_end in the canonical log, mark the session guard, and build the
+/// Err. Every early-exit in the agent loop MUST go through this.
+fn abort_invoke(
+    format: OutputFormat,
+    session_guard: &SessionEndGuard,
+    stop_reason: &str,
+    msg: String,
+) -> Box<dyn std::error::Error> {
+    emit_stream_error(format, &msg);
+    append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason, "note": &msg}));
+    session_guard.mark_error(&msg);
+    msg.into()
+}
+
+/// Record an event in the canonical log (key "kind") and, in stream-json
+/// mode, emit the same payload to stdout (key "type"). Only use this when
+/// the logged and emitted payloads are identical apart from kind/type —
+/// see the auto_nudge site in run_agent for a case where they are not.
+fn log_and_emit(format: OutputFormat, name: &str, payload: Value) {
+    let mut logged = payload.clone();
+    if let Some(obj) = logged.as_object_mut() {
+        obj.insert("kind".into(), json!(name));
+    }
+    append_stream(logged);
+    if format == OutputFormat::StreamJson {
+        let mut emitted = payload;
+        if let Some(obj) = emitted.as_object_mut() {
+            obj.insert("type".into(), json!(name));
+        }
+        emit_event(emitted);
     }
 }
 
@@ -1400,174 +965,19 @@ fn run_agent(
     let home = lazar_home();
     let skills = home.join("skills");
 
-    let system = format!(
-        "You are lazar, a self-evolving agent.\n\
-         \n\
-         You have ONE tool: bash(command). It runs a bash command \
-         through sandbox-exec and returns stdout+stderr+exit code.\n\
-         \n\
-         ARCHITECTURE\n\
-         Your home is {home_disp}. Inside it:\n\
-         - bin/   and src/   are READ-ONLY (the immutable kernel). You may \
-         `cat` them to study yourself; writes are blocked by the OS.\n\
-         - skills/  your \"being\" — capabilities you can read and grow.\n\
-         - hooks/   user-controlled lifecycle scripts. The kernel fires them \
-         at session-start, user-prompt, pre-tool, post-tool, session-end, \
-         log-rotation, agent-stop, and tick. Drop scripts into hooks/<event>.d/. \
-         You may read these but do not modify hooks the user installed without \
-         being asked. See hooks/README.md for the protocol.\n\
-         - memory/  durable notes (managed via the memory skill).\n\
-         - workspace/  scratchpad and your cwd (write freely).\n\
-         - logs/stream.jsonl  the canonical event stream (see CONTEXT).\n\
-         \n\
-         You evolve by writing skills, never by modifying your runner. If \
-         you need a capability you lack, write a new SKILL.md under \
-         {skills_disp}/<name>/ and append a one-line entry to {skills_disp}/INDEX.md.\n\
-         \n\
-         CONTEXT (this is important)\n\
-         By default, each `lazar -p` invocation starts with NO prior messages \
-         — your conversational context is just this prompt and the system prompt.\n\
-         \n\
-         EXCEPTION: if the operator passed --session <id> or --resume, prior \
-         turns from a session log have been prepended to your message array. \
-         You CAN see what was said before in this conversation. Use that \
-         continuity to resolve referential prompts (\"yes\", \"do that\", \
-         \"fine\") against the actual prior turn instead of inferring from \
-         recent tool output.\n\
-         \n\
-         REFERENTIAL PROMPTS (when the operator forgot --session)\n\
-         If you receive a short, ambiguous, or referential prompt (\"yes\", \
-         \"do that\", \"ok\", \"fine\", \"continue\") AND you have no prior \
-         messages in this invocation, DO NOT infer the referent from recent \
-         tool output. That fill-in pattern is the documented #1 source of \
-         \"executes the wrong thing confidently\" errors. Ask the operator a \
-         one-line clarifying question and end your turn. Confident-but-wrong \
-         is worse than confirming. (Raw self-recursion via `lazar -p` is \
-         disabled — a pre-tool hook vetoes it.)\n\
-         \n\
-         BUT every prompt, response, tool call, and tool result you (and \
-         past-you) ever produced is appended as JSONL to:\n\
-             {home_disp}/logs/stream.jsonl\n\
-         \n\
-         This is your \"infinite memory\" log. The kernel records but does \
-         NOT auto-load — reading and hygiene are skill territory.\n\
-         \n\
-         CRITICAL HYGIENE\n\
-         - BEFORE reading the log for the first time in a session, read \
-         _meta/load-context/SKILL.md and use its bounded recipes. NEVER \
-         `cat` the log — it can be MB+ and will exceed your context window \
-         (the API will reject the request).\n\
-         - The log auto-rotates at LAZAR_LOG_MAX_BYTES (default ~10MB). \
-         Run _meta/log-rotation only when you want richer archive summaries. \
-         A cheap size check at session start is good hygiene: \
-         `wc -c {home_disp}/logs/stream.jsonl`\n\
-         \n\
-         If a prompt is referential (\"yes\", \"do that\", \"continue\", \"as I \
-         said\"), use load-context. The default recipe is:\n\
-             tail -n 200 {home_disp}/logs/stream.jsonl | tail -c 50000\n\
-         The log format is one JSON object per line with fields like \
-         {{kind, ts_ms, content, command, ...}}; jq is your friend.\n\
-         \n\
-         SELF-DISCOVERY\n\
-         You can read anywhere in the filesystem, including your own \
-         kernel source at {home_disp}/src/ and the binary at {home_disp}/bin/. \
-         Study yourself when useful. If you perceive a kernel-level \
-         limitation, you cannot change the kernel — but you can almost \
-         always work around it by writing a skill. Reach for that move \
-         before assuming something is impossible.\n\
-         \n\
-         FIRST MOVE\n\
-         For any non-trivial task, start with: cat {skills_disp}/INDEX.md\n\
-         Then read the relevant SKILL.md before acting. Skills carry the \
-         hard-won detail you need.\n\
-         \n\
-         DELEGATION (sub-agents)\n\
-         To delegate work to a sub-agent, use the locked spawn binary (same path for every model): \
-         `bash $LAZAR_HOME/bin/lazar-spawn <task-id> <prompt-file>` \
-         (skills/_meta/subagent/spawn.sh is only a thin re-exec to that binary). \
-         It lints the prompt, bounds retries, kills wedged children, and \
-         gates success by re-checking your declared claims. Raw `lazar -p` \
-         calls are vetoed by a pre-tool hook — read _meta/subagent/SKILL.md. \
-         Recursion depth is capped at {max_depth}; current depth is {depth}.\n\
-         \n\
-         BOUNDARIES\n\
-         By default, writes are limited by sandbox-exec to skills/, \
-         memory/, workspace/, /tmp, and specific session/auth subdirs \
-         under ~/.codex and ~/.claude (e.g. sessions/, todos/, auth.json). \
-         Logs are trusted kernel-owned state: you may read bounded slices \
-         of logs/stream.jsonl and rotated archives, but do not write, \
-         compress, prune, or repair logs/. Write derived summaries to \
-         memory/ instead. Do not try to modify bin/, src/, logs/, \
-         ~/.codex/config.toml, ~/.codex/AGENTS.md, ~/.claude/settings.json, \
-         ~/.claude/hooks/, ~/.claude/CLAUDE.md, ssh keys, or anything else \
-         outside these allowed zones. You will see 'Operation not permitted' \
-         if you try; learn from the failure and route around it via a skill.\n\
-         \n\
-         EXCEPTION: if the operator passed --no-sandbox or set \
-         LAZAR_NO_SANDBOX=1, the sandbox is OFF for this invocation. \
-         You have full operator filesystem access. Use this responsibly: \
-         you can now write outside ~/lazar (e.g. project files in the \
-         operator's cwd), call CLIs that need ~/.ssh / git config / \
-         keychain, etc. Do NOT use this latitude to do anything the \
-         operator didn't ask for. The kernel printed a loud banner; \
-         the operator knows. Treat it as 'normal user shell access' \
-         and behave as a trusted developer, not a contractor with \
-         delegated authority. {sandbox_status_line}\n\
-         \n\
-         VERIFY CONTRACT (this is enforced by the kernel)\n\
-         When you claim that a tool produced an outcome (a file was \
-         created, rotated, deleted; a file has size N; a file contains \
-         text X), you MUST end your turn with a `[VERIFY]...[/VERIFY]` \
-         block declaring those claims as testable assertions. The kernel \
-         parses the block and runs actual filesystem checks (stat, exists, \
-         contains). If your claims fail the kernel's check, the operator \
-         sees an ❌ VERIFY FAILED banner — meaning you said one thing \
-         and the filesystem says another.\n\
-         \n\
-         Supported claim formats (one per line inside [VERIFY]...[/VERIFY]):\n\
-             exists=<path>             — file/dir exists\n\
-             not_exists=<path>         — file/dir absent\n\
-             size=<path>:<bytes>       — exact size in bytes\n\
-             size_at_least=<path>:<n>  — size >= n bytes\n\
-             size_at_most=<path>:<n>   — size <= n bytes\n\
-             contains=<path>:<substr>  — file contains substring\n\
-             mtime_within=<path>:<sec> — modified within last <sec> seconds\n\
-         \n\
-         Example — you ran `echo foo > /tmp/x` and want to claim it worked:\n\
-             [VERIFY]\n\
-             exists=/tmp/x\n\
-             contains=/tmp/x:foo\n\
-             size_at_least=/tmp/x:3\n\
-             [/VERIFY]\n\
-         \n\
-         If your turn does NOT make outcome claims (you're explaining, \
-         planning, asking, reading) you do NOT need a [VERIFY] block. \
-         The contract only fires when you assert state. If you don't know \
-         the state, don't assert it — say so and run a tool to check.\n\
-         \n\
-         Why this exists: an earlier session fabricated 'I rotated the \
-         log, here's the table of new sizes' without running any tools. \
-         The operator caught it manually with `ls -la`. The kernel now \
-         runs that `ls -la` itself based on your declared claims. There \
-         is no way to lie about file state — the kernel checks. Use \
-         [VERIFY] blocks to PROVE work, and you'll never get false \
-         fabrication warnings.\n\
-         \n\
-         The kernel also runs a pattern detector (past-tense action verbs, \
-         markdown state tables, 'Total time' reports) and warns when those \
-         patterns appear without enough tool execution OR a passing VERIFY \
-         block. The pattern warning is suppressed when a VERIFY block \
-         passes — proof of work overrides suspicion.",
-        home_disp = home.display(),
-        skills_disp = skills.display(),
-        max_depth = MAX_DEPTH,
-        depth = depth,
-        sandbox_status_line = if no_sandbox_active() {
-            "Current mode: SANDBOX OFF (--no-sandbox is active)."
-        } else {
-            "Current mode: sandboxed (default)."
-        },
-    );
+    let system = SYSTEM_PROMPT_TEMPLATE
+        .replace("{max_depth}", &MAX_DEPTH.to_string())
+        .replace("{depth}", &depth.to_string())
+        .replace("{home_disp}", &home.display().to_string())
+        .replace("{skills_disp}", &skills.display().to_string())
+        .replace(
+            "{sandbox_status_line}",
+            if no_sandbox_active() {
+                "Current mode: SANDBOX OFF (--no-sandbox is active)."
+            } else {
+                "Current mode: sandboxed (default)."
+            },
+        );
 
     // Append hook-injected runtime context to the system prompt. Hooks that
     // return {"action":"inject","context":"..."} on session-start or
@@ -1693,10 +1103,7 @@ fn run_agent(
         agent_turns = agent_turns.saturating_add(1);
         if agent_turns > max_agent_turns {
             let msg = format!("aborted after reaching LAZAR_MAX_TURNS={max_agent_turns}");
-            emit_stream_error(format, &msg);
-            append_stream(json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}));
-            session_guard.mark_error(&msg);
-            return Err(msg.into());
+            return Err(abort_invoke(format, &session_guard, "aborted", msg));
         }
 
         let body = json!({
@@ -1719,10 +1126,7 @@ fn run_agent(
             Ok(resp) => resp,
             Err(e) => {
                 let msg = format!("API request failed: {e}");
-                emit_stream_error(format, &msg);
-                append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-                session_guard.mark_error(&msg);
-                return Err(msg.into());
+                return Err(abort_invoke(format, &session_guard, "error", msg));
             }
         };
 
@@ -1733,23 +1137,17 @@ fn run_agent(
             // Mirror the in-stream "error" event so stream-json consumers
             // (e.g. the TUI) see a structured message instead of just stderr
             // + non-zero exit.
-            emit_stream_error(format, &msg);
             if verbose {
                 eprintln!("[lazar] {msg}");
             }
-            append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-            session_guard.mark_error(&msg);
-            return Err(msg.into());
+            return Err(abort_invoke(format, &session_guard, "error", msg));
         }
 
         let (content, stop_reason_str) = match parse_sse_stream(resp, format) {
             Ok(parsed) => parsed,
             Err(e) => {
                 let msg = e.to_string();
-                emit_stream_error(format, &msg);
-                append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-                session_guard.mark_error(&msg);
-                return Err(msg.into());
+                return Err(abort_invoke(format, &session_guard, "error", msg));
             }
         };
         // ─── Bash-fence fallback ─────────────────────────────────────────
@@ -1834,6 +1232,9 @@ fn run_agent(
             {
                 stall_nudges_used += 1;
                 messages.push(json!({"role": "user", "content": stall::NUDGE_PROMPT}));
+                // NOT log_and_emit: the logged event intentionally carries
+                // extra nudge/max fields the emitted stream-json event
+                // lacks. Do not "clean up" this asymmetry.
                 append_stream(json!({
                     "kind": "auto_nudge",
                     "content": stall::NUDGE_PROMPT,
@@ -1884,16 +1285,11 @@ fn run_agent(
                 if !banner.is_empty() {
                     eprintln!("{banner}");
                 }
-                append_stream(json!({
-                    "kind": "verify_report",
-                    "report": verifier::report_to_event(&verify_report),
-                }));
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({
-                        "type": "verify_report",
-                        "report": verifier::report_to_event(&verify_report),
-                    }));
-                }
+                log_and_emit(
+                    format,
+                    "verify_report",
+                    json!({"report": verifier::report_to_event(&verify_report)}),
+                );
             }
 
             // Layer 2 — pattern detector (catches fabrication tells).
@@ -1914,22 +1310,16 @@ fn run_agent(
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
-                append_stream(json!({
-                    "kind": "fabrication_check",
-                    "flagged": true,
-                    "tool_uses_in_turn": tool_uses_this_turn,
-                    "suspicion_count": suspicions.len(),
-                    "suspicion_kinds": kinds,
-                }));
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({
-                        "type": "fabrication_check",
+                log_and_emit(
+                    format,
+                    "fabrication_check",
+                    json!({
                         "flagged": true,
                         "tool_uses_in_turn": tool_uses_this_turn,
                         "suspicion_count": suspicions.len(),
                         "suspicion_kinds": kinds,
-                    }));
-                }
+                    }),
+                );
             }
             // ────────────────────────────────────────────────────────
 
@@ -1987,12 +1377,7 @@ fn run_agent(
                 if tool_calls > max_tool_calls {
                     let msg =
                         format!("aborted after reaching LAZAR_MAX_TOOL_CALLS={max_tool_calls}");
-                    emit_stream_error(format, &msg);
-                    append_stream(
-                        json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}),
-                    );
-                    session_guard.mark_error(&msg);
-                    return Err(msg.into());
+                    return Err(abort_invoke(format, &session_guard, "aborted", msg));
                 }
 
                 let cmd_raw = b["input"]["command"].as_str().unwrap_or("");
@@ -2103,14 +1488,7 @@ fn run_agent(
                     "aborted after {consecutive_empty_turns} consecutive turns with only empty tool calls"
                 );
                 eprintln!("[lazar] {msg}");
-                append_stream(
-                    json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}),
-                );
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({"type": "error", "message": &msg}));
-                }
-                session_guard.mark_error(&msg);
-                return Err(msg.into());
+                return Err(abort_invoke(format, &session_guard, "aborted", msg));
             }
         } else if had_any_valid_call {
             consecutive_empty_turns = 0;
@@ -2120,10 +1498,7 @@ fn run_agent(
             let msg = format!(
                 "API stopped with {stop_reason:?} before a terminal response and without executable bash calls"
             );
-            emit_stream_error(format, &msg);
-            append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-            session_guard.mark_error(&msg);
-            return Err(msg.into());
+            return Err(abort_invoke(format, &session_guard, "error", msg));
         }
 
         messages.push(json!({"role": "user", "content": results}));
@@ -2312,6 +1687,34 @@ mod tests {
         );
     }
 
+    /// Regression guard: the system prompt template (system-prompt.txt,
+    /// compiled in via include_str!) must render with all placeholder
+    /// tokens substituted and must faithfully preserve the original prompt
+    /// wording — including the single-brace `{kind, ts_ms, ...}` example,
+    /// which was previously produced by format!'s `{{ }}` escaping.
+    #[test]
+    fn system_prompt_template_renders_fully() {
+        let rendered = SYSTEM_PROMPT_TEMPLATE
+            .replace("{max_depth}", "5")
+            .replace("{depth}", "0")
+            .replace("{home_disp}", "/Users/test/lazar")
+            .replace("{skills_disp}", "/Users/test/lazar/skills")
+            .replace("{sandbox_status_line}", "Current mode: sandboxed (default).");
+
+        // No placeholder tokens should survive substitution.
+        assert!(!rendered.contains("{home_disp}"));
+        assert!(!rendered.contains("{skills_disp}"));
+        assert!(!rendered.contains("{max_depth}"));
+        assert!(!rendered.contains("{depth}"));
+        assert!(!rendered.contains("{sandbox_status_line}"));
+
+        // Sentinel phrases proving faithful transcription.
+        assert!(rendered.contains("You are lazar"));
+        assert!(rendered.contains("VERIFY CONTRACT"));
+        assert!(rendered.contains("{kind, ts_ms, content, command, ...}"));
+        assert!(rendered.contains("proof of work overrides suspicion."));
+    }
+
     #[test]
     fn env_flag_accepts_only_explicit_truthy_values() {
         let name = format!("LAZAR_TEST_FLAG_{}_{}", std::process::id(), now_millis());
@@ -2325,32 +1728,6 @@ mod tests {
         env::set_var(&name, "0");
         assert!(!env_flag_enabled(&name));
         env::remove_var(&name);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn append_and_write_helpers_reject_symlinks() {
-        use std::os::unix::fs::symlink;
-
-        let dir = env::temp_dir().join(format!(
-            "lazar-symlink-test-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target");
-        let append_link = dir.join("append-link");
-        let write_link = dir.join("write-link");
-        fs::write(&target, "existing").unwrap();
-        symlink(&target, &append_link).unwrap();
-        symlink(&target, &write_link).unwrap();
-
-        let append_err = open_append_no_follow(&append_link, "test append").unwrap_err();
-        let write_err = write_new_no_follow(&write_link, "test write", "new").unwrap_err();
-
-        assert!(append_err.to_string().contains("symlinked"));
-        assert!(write_err.to_string().contains("symlinked"));
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2389,6 +1766,42 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
     }
 
     #[test]
+    fn sse_parser_accumulates_multiple_text_deltas() {
+        let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"c"}}
+data: {"type":"content_block_stop","index":0}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+data: {"type":"message_stop"}
+"#;
+
+        let (content, stop_reason) =
+            parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "abc");
+    }
+
+    #[test]
+    fn sse_parser_keeps_partial_text_without_block_stop() {
+        let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"c"}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+"#;
+
+        let (content, stop_reason) =
+            parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "abc");
+    }
+
+    #[test]
     fn sse_parser_rejects_eof_without_stop_reason() {
         let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
@@ -2397,132 +1810,6 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
         assert!(err.to_string().contains("ended before message_stop"));
         assert!(err.to_string().contains("no stop_reason"));
-    }
-
-    #[test]
-    fn unique_archive_path_does_not_reuse_existing_archive() {
-        let dir = env::temp_dir().join(format!(
-            "lazar-test-{}-{}",
-            std::process::id(),
-            now_millis()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-
-        let first = unique_log_archive_path(&dir);
-        fs::write(&first, "existing").unwrap();
-        let second = unique_log_archive_path(&dir);
-
-        assert_ne!(first, second);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn archives_to_prune_keeps_newest_requested_count_across_bak_variants() {
-        let dir = TempTestDir::new("archive-retention-newest");
-        let logs = dir.path();
-        let old_bak = logs.join("stream.jsonl.100.1.bak");
-        let mid_gz = logs.join("stream.jsonl.200.1.bak.gz");
-        let new_bak = logs.join("stream.jsonl.300.1.bak");
-        fs::write(&old_bak, "old").unwrap();
-        fs::write(&mid_gz, "mid").unwrap();
-        fs::write(&new_bak, "new").unwrap();
-        let harvested: std::collections::HashSet<String> = [
-            "stream.jsonl.100.1.bak".into(),
-            "stream.jsonl.200.1.bak.gz".into(),
-            "stream.jsonl.300.1.bak".into(),
-        ]
-        .into_iter()
-        .collect();
-
-        let to_prune = archives_to_prune(logs, 2, &harvested);
-
-        assert_eq!(to_prune, vec![old_bak]);
-    }
-
-    #[test]
-    fn archives_to_prune_keep_zero_disables_pruning() {
-        let dir = TempTestDir::new("archive-retention-disabled");
-        let logs = dir.path();
-        fs::write(logs.join("stream.jsonl.100.1.bak"), "old").unwrap();
-        fs::write(logs.join("stream.jsonl.200.1.bak.gz"), "new").unwrap();
-        let harvested: std::collections::HashSet<String> = [
-            "stream.jsonl.100.1.bak".into(),
-            "stream.jsonl.200.1.bak.gz".into(),
-        ]
-        .into_iter()
-        .collect();
-
-        let to_prune = archives_to_prune(logs, 0, &harvested);
-
-        assert!(to_prune.is_empty());
-    }
-
-    #[test]
-    fn archives_to_prune_ignores_active_lock_and_sessions() {
-        let dir = TempTestDir::new("archive-retention-ignores-non-archives");
-        let logs = dir.path();
-        let old_bak = logs.join("stream.jsonl.100.1.bak");
-        let new_bak = logs.join("stream.jsonl.200.1.bak");
-        fs::write(&old_bak, "old").unwrap();
-        fs::write(&new_bak, "new").unwrap();
-        fs::write(logs.join("stream.jsonl"), "active").unwrap();
-        fs::write(logs.join(".stream.lock"), "lock").unwrap();
-        let sessions = logs.join("sessions");
-        fs::create_dir_all(&sessions).unwrap();
-        fs::write(sessions.join("stream.jsonl.050.1.bak"), "session").unwrap();
-        let harvested: std::collections::HashSet<String> = [
-            "stream.jsonl.100.1.bak".into(),
-            "stream.jsonl.200.1.bak".into(),
-        ]
-        .into_iter()
-        .collect();
-
-        let to_prune = archives_to_prune(logs, 1, &harvested);
-
-        assert_eq!(to_prune, vec![old_bak]);
-    }
-
-    #[test]
-    fn archives_to_prune_skips_unharvested() {
-        let dir = TempTestDir::new("archive-retention-unharvested");
-        let logs = dir.path();
-        let old_bak = logs.join("stream.jsonl.100.1.bak");
-        let new_bak = logs.join("stream.jsonl.200.1.bak");
-        fs::write(&old_bak, "old").unwrap();
-        fs::write(&new_bak, "new").unwrap();
-        // Only the newest is harvested — old unharvested must not be pruned.
-        let harvested: std::collections::HashSet<String> =
-            ["stream.jsonl.200.1.bak".into()].into_iter().collect();
-
-        let to_prune = archives_to_prune(logs, 1, &harvested);
-
-        assert!(to_prune.is_empty(), "unharvested old archive must be kept");
-    }
-
-    struct TempTestDir {
-        path: PathBuf,
-    }
-
-    impl TempTestDir {
-        fn new(label: &str) -> Self {
-            let path = env::temp_dir().join(format!(
-                "lazar-test-{label}-{}-{}",
-                std::process::id(),
-                now_millis()
-            ));
-            fs::create_dir_all(&path).unwrap();
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for TempTestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 
     #[test]
