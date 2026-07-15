@@ -165,7 +165,7 @@ That separation — kernel records, agent decides — is the architectural bet. 
 
 ## Reset
 
-`lazar --reset-all` wipes `skills/`, `memory/`, `workspace/`, `logs/` and re-seeds the skills directory from copies embedded in the binary at compile time. It asks for confirmation unless you pass `--yes`. The kernel doesn't change. After reset, the agent is at the exact state of a fresh install.
+`lazar --reset-all` wipes `skills/`, `hooks/`, `memory/`, `workspace/`, `logs/`, and saved TUI access approvals, then re-seeds the embedded skills and hooks. It asks for confirmation unless you pass `--yes`. The kernel doesn't change. After reset, the agent is at the exact state of a fresh install.
 
 `setup.sh` does not reset runtime state by default. If you deliberately want setup to perform a factory reset after rebuilding, run it as `LAZAR_RESET_ALL=1 bash setup.sh`.
 
@@ -214,7 +214,8 @@ lazar --cwd ~/Documents/GitHub/my-project \
 
 - `--cwd <path>` sets the working directory for model-issued bash commands.
 - Repeat `--add-dir <path>` to grant sandboxed writes to additional existing
-  project roots. Paths are canonicalized before any hook or tool runs.
+  project roots. Paths are canonicalized before any hook or tool runs, inherited
+  by nested Lazar calls, and rejected if they would overlap protected Lazar state.
 - `--no-sandbox` remains the explicit full-access escape hatch.
 
 ## Sandbox boundaries

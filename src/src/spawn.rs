@@ -111,10 +111,15 @@ pub(crate) fn bash_home(lazar: &str, unsandboxed: bool) -> String {
 }
 
 /// env_clear + the base env both callers share (PATH, HOME, LAZAR_HOME,
-/// LAZAR_SKILLS/MEMORY/WORKSPACE/LOGS, TERM, LANG), plus LAZAR_NO_SANDBOX
-/// and PASSTHROUGH_VARS when unsandboxed. Caller-specific vars stay at
-/// the call site.
-pub(crate) fn apply_base_env(command: &mut Command, lazar: &str, bash_home: &str, unsandboxed: bool) {
+/// LAZAR_SKILLS/MEMORY/WORKSPACE/LOGS, TERM, LANG), inherited scoped access,
+/// plus LAZAR_NO_SANDBOX and PASSTHROUGH_VARS when unsandboxed.
+pub(crate) fn apply_base_env(
+    command: &mut Command,
+    lazar: &str,
+    bash_home: &str,
+    policy: &AccessPolicy,
+) {
+    let unsandboxed = policy.unsandboxed();
     command
         .env_clear()
         .env(
@@ -127,6 +132,12 @@ pub(crate) fn apply_base_env(command: &mut Command, lazar: &str, bash_home: &str
         .env("LAZAR_MEMORY", format!("{lazar}/memory"))
         .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
         .env("LAZAR_LOGS", format!("{lazar}/logs"))
+        .env(crate::access::INHERITED_CWD_ENV, policy.tool_cwd())
+        .env(
+            crate::access::INHERITED_DIRS_ENV,
+            serde_json::to_string(policy.allowed_write_dirs())
+                .unwrap_or_else(|_| "[]".to_string()),
+        )
         .env(
             "TERM",
             env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),

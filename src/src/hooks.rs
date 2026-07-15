@@ -276,7 +276,12 @@ fn run_hook(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::spawn::apply_base_env(&mut command, &lazar, &bash_home, unsandboxed);
+    crate::spawn::apply_base_env(
+        &mut command,
+        &lazar,
+        &bash_home,
+        crate::access::current(),
+    );
     command
         .env("LAZAR_HOOK_EVENT", event.as_str())
         .env("LAZAR_HOOK_PAYLOAD_LEN", payload_str.len().to_string());

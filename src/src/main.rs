@@ -260,7 +260,8 @@ struct Args {
     #[arg(short, long, conflicts_with = "reset_all")]
     prompt: Option<String>,
 
-    /// Wipe skills/, memory/, workspace/, logs/ and re-seed from the kernel.
+    /// Wipe skills/, hooks/, memory/, workspace/, logs/, and saved access
+    /// approvals, then re-seed from the kernel.
     #[arg(long)]
     reset_all: bool,
 
@@ -349,7 +350,7 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
 
     if !skip_confirm {
         eprint!(
-            "Wipe skills/, hooks/, memory/, workspace/, logs/ in {} and reseed?\n[y/N] ",
+            "Wipe skills/, hooks/, memory/, workspace/, logs/, and saved access approvals in {} and reseed?\n[y/N] ",
             home.display()
         );
         let mut buf = String::new();
@@ -367,6 +368,7 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
         }
         fs::create_dir_all(&p)?;
     }
+    remove_access_policy(&home)?;
 
     SEED_SKILLS.extract(home.join("skills"))?;
     SEED_HOOKS.extract(home.join("hooks"))?;
@@ -376,6 +378,14 @@ fn reset_all(skip_confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
         SEED_HOOKS.files().count()
     );
     Ok(())
+}
+
+fn remove_access_policy(home: &Path) -> std::io::Result<()> {
+    match fs::remove_file(home.join("access-policy.json")) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// First-run safety: if `~/lazar/hooks/` doesn't exist (e.g. user upgraded
@@ -501,7 +511,7 @@ fn run_bash(cmd: &str) -> ToolExecutionResult {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    spawn::apply_base_env(&mut command, &lazar, &bash_home, unsandboxed);
+    spawn::apply_base_env(&mut command, &lazar, &bash_home, policy);
     command
         .env("LAZAR_TOOL_ENV", "1")
         .env("LAZAR_DEPTH", child_depth.to_string());
@@ -1690,10 +1700,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let unsandboxed = args.no_sandbox || env_flag_enabled("LAZAR_NO_SANDBOX");
+    let (inherited_cwd, inherited_dirs) = access::inherited();
+    let requested_cwd = args.cwd.as_deref().or(inherited_cwd.as_deref());
+    let requested_dirs = if args.add_dirs.is_empty() {
+        inherited_dirs.as_slice()
+    } else {
+        args.add_dirs.as_slice()
+    };
     let access_policy = access::AccessPolicy::new(
         unsandboxed,
-        args.cwd.as_deref(),
-        &args.add_dirs,
+        requested_cwd,
+        requested_dirs,
         &lazar_home(),
     )?;
     access::init(access_policy)?;
@@ -1798,6 +1815,24 @@ mod tests {
             args.add_dirs,
             [PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
         );
+    }
+
+    #[test]
+    fn reset_removes_saved_access_approvals() {
+        let home = std::env::temp_dir().join(format!(
+            "lazar-reset-access-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create test home");
+        let policy = home.join("access-policy.json");
+        fs::write(&policy, r#"{"alwaysEverywhere":true}"#).expect("write policy");
+
+        remove_access_policy(&home).expect("remove policy");
+
+        assert!(!policy.exists());
+        remove_access_policy(&home).expect("missing policy is harmless");
+        fs::remove_dir_all(home).expect("remove test home");
     }
 
     /// Regression guard: the sandbox profile must grant writes to the specific
