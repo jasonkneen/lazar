@@ -23,7 +23,14 @@ T="$(mktemp -d)"; trap 'chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"' EXIT
 if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
   echo "ANTHROPIC_API_KEY not set — source your launcher env first. Aborting."; exit 2
 fi
-run(){ timeout "${EVAL_TIMEOUT:-120}" "$BIN" -p "$1" --output-format text --model "$MODEL" 2>&1; }
+TIMEOUT_CMD="$(command -v timeout || command -v gtimeout || true)"
+run(){
+  if [ -n "$TIMEOUT_CMD" ]; then
+    "$TIMEOUT_CMD" "${EVAL_TIMEOUT:-120}" "$BIN" -p "$1" --output-format text --model "$MODEL" 2>&1
+  else
+    "$BIN" -p "$1" --output-format text --model "$MODEL" 2>&1
+  fi
+}
 
 echo "== kernel behavioral evals (model: $MODEL) =="
 

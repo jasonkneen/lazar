@@ -51,17 +51,12 @@ export LAZAR_HOME
 export LAZAR_PROPOSAL_NAME="$NAME"
 export LAZAR_PROPOSAL_DIR="$PROPOSAL"
 
-# Cross-platform timeout: prefer gtimeout (brew coreutils), then timeout, else run plain
-TIMEOUT_CMD=""
-if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="gtimeout $VERIFY_TIMEOUT"
-elif command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="timeout $VERIFY_TIMEOUT"
-fi
+# Cross-platform timeout: prefer timeout, then gtimeout (brew coreutils), else run plain
+TIMEOUT_CMD="$(command -v timeout || command -v gtimeout || true)"
 
 set +e
 if [ -n "$TIMEOUT_CMD" ]; then
-    $TIMEOUT_CMD bash "$VERIFY_SCRIPT"
+    "$TIMEOUT_CMD" "$VERIFY_TIMEOUT" bash "$VERIFY_SCRIPT"
 else
     bash "$VERIFY_SCRIPT"
 fi

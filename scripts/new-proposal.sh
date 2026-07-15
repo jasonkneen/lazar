@@ -6,7 +6,7 @@ NAME="${1:-}"
 [ -z "$NAME" ] && { echo "usage: $0 <name>"; exit 2; }
 
 case "$NAME" in
-    *[!A-Za-z0-9._-]*|*/*|*..*|.*)
+    ""|.*|*/*|*..*|-*|*[!A-Za-z0-9._-]*)
         echo "invalid proposal name: '$NAME'" >&2
         echo "use a safe slug: letters, numbers, dot, underscore, dash; no '/', '..', or leading dot" >&2
         exit 2
