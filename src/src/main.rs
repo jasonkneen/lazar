@@ -24,6 +24,7 @@ use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
 
 mod hooks;
 mod session;
+mod spawn;
 mod stall;
 mod verifier;
 use hooks::HookEvent;
