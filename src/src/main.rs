@@ -14,13 +14,13 @@ use std::{
     fs::File,
     io::{BufRead, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
-use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd, process::CommandExt};
+use std::os::unix::{fs::OpenOptionsExt, io::AsRawFd};
 
 mod hooks;
 mod session;
@@ -482,66 +482,22 @@ fn run_bash(cmd: &str) -> String {
         workspace.clone()
     };
 
-    let mut command = if unsandboxed {
-        let mut c = Command::new("/bin/bash");
-        c.arg("-c").arg(cmd);
-        c
-    } else {
-        let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-D")
-            .arg(format!("SKILLS_PATH={lazar}/skills"))
-            .arg("-D")
-            .arg(format!("MEMORY_PATH={lazar}/memory"))
-            .arg("-D")
-            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-            .arg("-D")
-            .arg(format!(
-                "USER_HOME={}",
-                env::var("HOME").unwrap_or_else(|_| "/".to_string())
-            ))
-            .arg("-p")
-            .arg(SANDBOX_PROFILE)
-            .arg("/bin/bash")
-            .arg("-c")
-            .arg(cmd);
-        c
-    };
+    let mut command = spawn::bash_command(spawn::BashPayload::Inline(cmd), &lazar, unsandboxed);
 
     // When unsandboxed, use the operator's real HOME (so things like ~/.ssh,
     // git config, gh CLI, claude/codex auth all work without redirection).
     // When sandboxed, HOME is pinned to LAZAR_HOME (existing behavior).
-    let bash_home = if unsandboxed {
-        env::var("HOME").unwrap_or_else(|_| lazar.clone())
-    } else {
-        lazar.clone()
-    };
+    let bash_home = spawn::bash_home(&lazar, unsandboxed);
 
     command
         .current_dir(&cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("HOME", &bash_home)
-        .env("LAZAR_HOME", &lazar)
-        .env("LAZAR_SKILLS", format!("{lazar}/skills"))
-        .env("LAZAR_MEMORY", format!("{lazar}/memory"))
-        .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
-        .env("LAZAR_LOGS", format!("{lazar}/logs"))
+        .stderr(Stdio::piped());
+    spawn::apply_base_env(&mut command, &lazar, &bash_home, unsandboxed);
+    command
         .env("LAZAR_TOOL_ENV", "1")
-        .env("LAZAR_DEPTH", child_depth.to_string())
-        .env(
-            "TERM",
-            env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        )
-        .env(
-            "LANG",
-            env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
-        );
+        .env("LAZAR_DEPTH", child_depth.to_string());
 
     // Only the main process establishes a session id. Propagate that validated
     // value so child helpers can enforce their documented per-session limits.
@@ -553,35 +509,8 @@ fn run_bash(cmd: &str) -> String {
 
     // Propagate LAZAR_NO_SANDBOX so nested `lazar -p` calls inherit the
     // mode (otherwise the child would re-sandbox and the operator's
-    // intent would be silently dropped).
-    if unsandboxed {
-        command.env("LAZAR_NO_SANDBOX", "1");
-
-        // When unsandboxed, operator explicitly opted out of isolation.
-        // Pass through credentials and config that real shells/CLIs need:
-        // SSH agent, GPG, GitHub/GitLab tokens, common LLM API keys,
-        // editor/pager preferences, locale, color settings.
-        const PASSTHROUGH_VARS: &[&str] = &[
-            "SSH_AUTH_SOCK", "SSH_AGENT_PID",
-            "GPG_TTY", "GNUPGHOME",
-            "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN",
-            "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
-            "GOOGLE_API_KEY", "MISTRAL_API_KEY", "TOGETHER_API_KEY",
-            "PERPLEXITY_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
-            "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
-            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-            "EDITOR", "VISUAL", "PAGER",
-            "LC_ALL", "LC_CTYPE",
-            "COLORTERM", "CLICOLOR", "FORCE_COLOR", "NO_COLOR",
-            "USER", "LOGNAME",
-            "TMPDIR",
-        ];
-        for var in PASSTHROUGH_VARS {
-            if let Ok(val) = env::var(var) {
-                command.env(var, val);
-            }
-        }
-    }
+    // intent would be silently dropped). Handled by apply_base_env above
+    // (sets LAZAR_NO_SANDBOX + PASSTHROUGH_VARS when unsandboxed).
 
     if let Ok(model) = env::var("LAZAR_MODEL") {
         command.env("LAZAR_MODEL", model);
@@ -597,15 +526,7 @@ fn run_bash(cmd: &str) -> String {
         }
     }
 
-    #[cfg(unix)]
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    spawn::isolate_process_group(&mut command);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -622,25 +543,14 @@ fn run_bash(cmd: &str) -> String {
         .take()
         .map(|err| read_capped(err, limits.output_max_bytes));
 
-    let started = Instant::now();
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {
-                if started.elapsed() >= limits.timeout {
-                    timed_out = true;
-                    kill_process_group(child_pid);
-                    let _ = child.kill();
-                    break child.wait().ok();
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return format!("[wait error: {e}]\n[exit 1]");
-            }
-        }
+    let (status, timed_out) = match spawn::wait_with_timeout(
+        &mut child,
+        child_pid,
+        limits.timeout,
+        Duration::from_millis(50),
+    ) {
+        Ok(pair) => pair,
+        Err(e) => return format!("[wait error: {e}]\n[exit 1]"),
     };
 
     // The shell can exit while a background descendant still owns stdout or
