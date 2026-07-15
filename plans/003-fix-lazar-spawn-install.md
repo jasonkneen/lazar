@@ -6,7 +6,7 @@
 > report — do not improvise. When done, update the status row for this plan
 > in `plans/README.md`.
 >
-> **Drift check (run first)**: `git diff --stat 2f10eb7..HEAD -- setup.sh bin/lazar-spawn src/seed-skills/_meta/subagent/spawn.sh`
+> **Drift check (run first)**: `git diff --stat 2f10eb7..HEAD -- setup.sh bin/lazar-spawn src/seed-skills/_meta/subagent/spawn.sh src/seed-skills/_meta/subagent/selftest.sh`
 > On any drift, compare the "Current state" excerpts before proceeding; on a
 > mismatch, STOP.
 
@@ -67,6 +67,20 @@ for candidate in \
 do
 ```
 
+- `src/seed-skills/_meta/subagent/selftest.sh:8-16` — carries TWO dead
+  fallback branches for the same ghost path (`$LAZAR_HOME/scripts/lazar-spawn.sh`
+  and the relative `$HERE/../../../../scripts/lazar-spawn.sh`), and line 66-67
+  greps the ghost path when checking the `logs/subagent` default:
+
+```bash
+if [ -x "$LAZAR_HOME/bin/lazar-spawn" ]; then
+  SPAWN="$LAZAR_HOME/bin/lazar-spawn"
+elif [ -x "$LAZAR_HOME/scripts/lazar-spawn.sh" ]; then
+  SPAWN="$LAZAR_HOME/scripts/lazar-spawn.sh"
+elif [ -x "$HERE/../../../../scripts/lazar-spawn.sh" ]; then
+  SPAWN="$(cd "$HERE/../../../../scripts" && pwd)/lazar-spawn.sh"
+```
+
 - `setup.sh:78-80` — copies `scripts/` into `$LAZAR_HOME/scripts/` when
   installing from a separate checkout:
 
@@ -94,6 +108,8 @@ fi
 - `bin/lazar-spawn` — header comment only (lines 2-6). NO logic changes.
 - `src/seed-skills/_meta/subagent/spawn.sh` — remove the dead fallback
   candidate and fix the comment.
+- `src/seed-skills/_meta/subagent/selftest.sh` — remove the two dead
+  fallback branches (lines 10-13) and the ghost-path grep leg (line 67).
 
 **Out of scope**:
 - `bin/lazar` handling in setup.sh (the compiled kernel install is correct).
@@ -152,6 +168,24 @@ Keep the existing error JSON emission for the missing case.
 **Verify**: `bash -n src/seed-skills/_meta/subagent/spawn.sh` → exit 0;
 `grep -n "lazar-spawn.sh" src/seed-skills/_meta/subagent/spawn.sh` → no matches.
 
+### Step 3b: Remove the ghost-path branches in selftest.sh
+
+In `src/seed-skills/_meta/subagent/selftest.sh`, collapse the SPAWN
+resolution (lines 8-16) to the single real path:
+
+```bash
+SPAWN="$LAZAR_HOME/bin/lazar-spawn"
+if [ ! -x "$SPAWN" ]; then
+  echo "[FAIL] no trusted lazar-spawn found"; exit 1
+fi
+```
+
+And in Task 4 (lines 66-71), drop the second `rg` leg that greps
+`$LAZAR_HOME/scripts/lazar-spawn.sh` — keep only the check against `$SPAWN`.
+
+**Verify**: `bash -n src/seed-skills/_meta/subagent/selftest.sh` → exit 0;
+`grep -c "lazar-spawn.sh" src/seed-skills/_meta/subagent/selftest.sh` → 0.
+
 ### Step 4: Run the subagent selftest
 
 `bash src/seed-skills/_meta/subagent/selftest.sh`
@@ -175,9 +209,9 @@ reasons, report it, don't fix runtime state.
 
 - [ ] `grep -c "lazar-spawn" setup.sh` → ≥ 2 (install block present)
 - [ ] `grep -n "chflags uchg" bin/lazar-spawn` → empty
-- [ ] `grep -n "scripts/lazar-spawn.sh" -r src/seed-skills/` → empty
+- [ ] `grep -rn "lazar-spawn.sh" src/seed-skills/` → empty
 - [ ] `bash src/seed-skills/_meta/subagent/selftest.sh` → exit 0
-- [ ] Only the three in-scope files modified (`git status`)
+- [ ] Only the four in-scope files modified (`git status`)
 - [ ] `plans/README.md` status row updated
 
 ## STOP conditions
