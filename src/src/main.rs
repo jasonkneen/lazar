@@ -862,6 +862,40 @@ impl Drop for SessionEndGuard {
     }
 }
 
+/// Uniform abort: mirror the error to stream-json consumers, record
+/// invoke_end in the canonical log, mark the session guard, and build the
+/// Err. Every early-exit in the agent loop MUST go through this.
+fn abort_invoke(
+    format: OutputFormat,
+    session_guard: &SessionEndGuard,
+    stop_reason: &str,
+    msg: String,
+) -> Box<dyn std::error::Error> {
+    emit_stream_error(format, &msg);
+    append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason, "note": &msg}));
+    session_guard.mark_error(&msg);
+    msg.into()
+}
+
+/// Record an event in the canonical log (key "kind") and, in stream-json
+/// mode, emit the same payload to stdout (key "type"). Only use this when
+/// the logged and emitted payloads are identical apart from kind/type —
+/// see the auto_nudge site in run_agent for a case where they are not.
+fn log_and_emit(format: OutputFormat, name: &str, payload: Value) {
+    let mut logged = payload.clone();
+    if let Some(obj) = logged.as_object_mut() {
+        obj.insert("kind".into(), json!(name));
+    }
+    append_stream(logged);
+    if format == OutputFormat::StreamJson {
+        let mut emitted = payload;
+        if let Some(obj) = emitted.as_object_mut() {
+            obj.insert("type".into(), json!(name));
+        }
+        emit_event(emitted);
+    }
+}
+
 fn run_agent(
     prompt: &str,
     format: OutputFormat,
@@ -1085,10 +1119,7 @@ fn run_agent(
         agent_turns = agent_turns.saturating_add(1);
         if agent_turns > max_agent_turns {
             let msg = format!("aborted after reaching LAZAR_MAX_TURNS={max_agent_turns}");
-            emit_stream_error(format, &msg);
-            append_stream(json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}));
-            session_guard.mark_error(&msg);
-            return Err(msg.into());
+            return Err(abort_invoke(format, &session_guard, "aborted", msg));
         }
 
         let body = json!({
@@ -1111,10 +1142,7 @@ fn run_agent(
             Ok(resp) => resp,
             Err(e) => {
                 let msg = format!("API request failed: {e}");
-                emit_stream_error(format, &msg);
-                append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-                session_guard.mark_error(&msg);
-                return Err(msg.into());
+                return Err(abort_invoke(format, &session_guard, "error", msg));
             }
         };
 
@@ -1125,23 +1153,17 @@ fn run_agent(
             // Mirror the in-stream "error" event so stream-json consumers
             // (e.g. the TUI) see a structured message instead of just stderr
             // + non-zero exit.
-            emit_stream_error(format, &msg);
             if verbose {
                 eprintln!("[lazar] {msg}");
             }
-            append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-            session_guard.mark_error(&msg);
-            return Err(msg.into());
+            return Err(abort_invoke(format, &session_guard, "error", msg));
         }
 
         let (content, stop_reason_str) = match parse_sse_stream(resp, format) {
             Ok(parsed) => parsed,
             Err(e) => {
                 let msg = e.to_string();
-                emit_stream_error(format, &msg);
-                append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-                session_guard.mark_error(&msg);
-                return Err(msg.into());
+                return Err(abort_invoke(format, &session_guard, "error", msg));
             }
         };
         // ─── Bash-fence fallback ─────────────────────────────────────────
@@ -1226,6 +1248,9 @@ fn run_agent(
             {
                 stall_nudges_used += 1;
                 messages.push(json!({"role": "user", "content": stall::NUDGE_PROMPT}));
+                // NOT log_and_emit: the logged event intentionally carries
+                // extra nudge/max fields the emitted stream-json event
+                // lacks. Do not "clean up" this asymmetry.
                 append_stream(json!({
                     "kind": "auto_nudge",
                     "content": stall::NUDGE_PROMPT,
@@ -1276,16 +1301,11 @@ fn run_agent(
                 if !banner.is_empty() {
                     eprintln!("{banner}");
                 }
-                append_stream(json!({
-                    "kind": "verify_report",
-                    "report": verifier::report_to_event(&verify_report),
-                }));
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({
-                        "type": "verify_report",
-                        "report": verifier::report_to_event(&verify_report),
-                    }));
-                }
+                log_and_emit(
+                    format,
+                    "verify_report",
+                    json!({"report": verifier::report_to_event(&verify_report)}),
+                );
             }
 
             // Layer 2 — pattern detector (catches fabrication tells).
@@ -1306,22 +1326,16 @@ fn run_agent(
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
-                append_stream(json!({
-                    "kind": "fabrication_check",
-                    "flagged": true,
-                    "tool_uses_in_turn": tool_uses_this_turn,
-                    "suspicion_count": suspicions.len(),
-                    "suspicion_kinds": kinds,
-                }));
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({
-                        "type": "fabrication_check",
+                log_and_emit(
+                    format,
+                    "fabrication_check",
+                    json!({
                         "flagged": true,
                         "tool_uses_in_turn": tool_uses_this_turn,
                         "suspicion_count": suspicions.len(),
                         "suspicion_kinds": kinds,
-                    }));
-                }
+                    }),
+                );
             }
             // ────────────────────────────────────────────────────────
 
@@ -1379,12 +1393,7 @@ fn run_agent(
                 if tool_calls > max_tool_calls {
                     let msg =
                         format!("aborted after reaching LAZAR_MAX_TOOL_CALLS={max_tool_calls}");
-                    emit_stream_error(format, &msg);
-                    append_stream(
-                        json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}),
-                    );
-                    session_guard.mark_error(&msg);
-                    return Err(msg.into());
+                    return Err(abort_invoke(format, &session_guard, "aborted", msg));
                 }
 
                 let cmd_raw = b["input"]["command"].as_str().unwrap_or("");
@@ -1495,14 +1504,7 @@ fn run_agent(
                     "aborted after {consecutive_empty_turns} consecutive turns with only empty tool calls"
                 );
                 eprintln!("[lazar] {msg}");
-                append_stream(
-                    json!({"kind": "invoke_end", "stop_reason": "aborted", "note": &msg}),
-                );
-                if format == OutputFormat::StreamJson {
-                    emit_event(json!({"type": "error", "message": &msg}));
-                }
-                session_guard.mark_error(&msg);
-                return Err(msg.into());
+                return Err(abort_invoke(format, &session_guard, "aborted", msg));
             }
         } else if had_any_valid_call {
             consecutive_empty_turns = 0;
@@ -1512,10 +1514,7 @@ fn run_agent(
             let msg = format!(
                 "API stopped with {stop_reason:?} before a terminal response and without executable bash calls"
             );
-            emit_stream_error(format, &msg);
-            append_stream(json!({"kind": "invoke_end", "stop_reason": "error", "note": &msg}));
-            session_guard.mark_error(&msg);
-            return Err(msg.into());
+            return Err(abort_invoke(format, &session_guard, "error", msg));
         }
 
         messages.push(json!({"role": "user", "content": results}));
