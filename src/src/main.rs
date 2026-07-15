@@ -103,18 +103,6 @@ pub(crate) fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-fn safe_prefix(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 /// Extract bash/sh commands from ```bash / ```sh / ```shell fences in
 /// a text block. Used by the bash-fence fallback when a model emits
 /// shell commands as markdown instead of proper tool_use blocks. Real
@@ -170,7 +158,7 @@ fn truncate_tool_output(output: &str, max_bytes: usize) -> String {
         return output.to_string();
     }
 
-    let prefix = safe_prefix(output, max_bytes);
+    let prefix = verifier::head_bytes(output, max_bytes);
     let omitted = output.len().saturating_sub(prefix.len());
     format!("{prefix}\n[truncated: {omitted} bytes omitted]")
 }
@@ -180,7 +168,7 @@ fn tool_input_preview(input: &str, max_bytes: usize) -> String {
         return input.to_string();
     }
 
-    let prefix = safe_prefix(input, max_bytes);
+    let prefix = verifier::head_bytes(input, max_bytes);
     let omitted = input.len().saturating_sub(prefix.len());
     format!("{prefix}…[+{omitted}b]")
 }
@@ -595,11 +583,7 @@ fn run_bash(cmd: &str) -> String {
 /// This is the "structured streaming" output for programmatic consumers like
 /// the TUI. Distinct from the canonical log at logs/stream.jsonl.
 fn emit_event(mut event: Value) {
-    use std::io::Write;
-    let ts_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts_ms = now_millis();
     if let Some(obj) = event.as_object_mut() {
         obj.insert("ts_ms".into(), json!(ts_ms));
     }

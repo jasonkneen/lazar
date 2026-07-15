@@ -232,26 +232,7 @@ fn push_message(messages: &mut Vec<Value>, role: &str, content: Value) {
 /// dropping tool_use and any other non-text blocks. Returns None if
 /// content is missing; returns Some("") if the turn was tool-only.
 fn extract_text_from_assistant_content(content: Option<&Value>) -> Option<String> {
-    let content = content?;
-    // Assistant content can be either a plain string (rare, defensive)
-    // or an array of content blocks (the normal Anthropic shape).
-    if let Some(s) = content.as_str() {
-        return Some(s.to_string());
-    }
-    let arr = content.as_array()?;
-    let mut out = String::new();
-    for block in arr {
-        if block.get("type").and_then(|v| v.as_str()) == Some("text") {
-            if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(t);
-            }
-        }
-        // tool_use, tool_result, image, etc — silently dropped.
-    }
-    Some(out)
+    content.map(crate::verifier::extract_text)
 }
 
 /// Resolve the session-history byte cap, honoring
