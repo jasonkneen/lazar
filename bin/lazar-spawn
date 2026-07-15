@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # lazar-spawn — the ONLY trusted sub-agent spawn surface.
 #
-# Installed to $LAZAR_HOME/bin/lazar-spawn (chmod 555 + chflags uchg).
+# Installed to $LAZAR_HOME/bin/lazar-spawn by setup.sh (chmod 555; bin/ is not agent-writable under the sandbox).
 # Lives outside agent-writable skills/; budget state lives under logs/
 # (sandbox cannot write logs/). Model-agnostic — no provider-specific logic.
 #
