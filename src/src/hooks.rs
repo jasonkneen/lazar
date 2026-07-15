@@ -18,13 +18,13 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
 
-use crate::{append_stream, lazar_home, now_millis, SANDBOX_PROFILE};
+use crate::{append_stream, lazar_home, now_millis};
 
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 5;
 const HOOK_STDOUT_CAP_BYTES: usize = 16_384;
@@ -262,100 +262,22 @@ fn run_hook(
     // disabled sandboxing, hooks aren't sandboxed either.
     let unsandboxed = crate::no_sandbox_active();
 
-    let mut command = if unsandboxed {
-        let mut c = Command::new("/bin/bash");
-        c.arg(script);
-        c
-    } else {
-        let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-D")
-            .arg(format!("SKILLS_PATH={lazar}/skills"))
-            .arg("-D")
-            .arg(format!("MEMORY_PATH={lazar}/memory"))
-            .arg("-D")
-            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
-            .arg("-D")
-            .arg(format!(
-                "USER_HOME={}",
-                env::var("HOME").unwrap_or_else(|_| "/".to_string())
-            ))
-            .arg("-p")
-            .arg(SANDBOX_PROFILE)
-            .arg("/bin/bash")
-            .arg(script);
-        c
-    };
+    let mut command =
+        crate::spawn::bash_command(crate::spawn::BashPayload::Script(script), &lazar, unsandboxed);
 
-    let bash_home = if unsandboxed {
-        env::var("HOME").unwrap_or_else(|_| lazar.clone())
-    } else {
-        lazar.clone()
-    };
+    let bash_home = crate::spawn::bash_home(&lazar, unsandboxed);
 
     command
         .current_dir(&workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_clear()
-        .env(
-            "PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        )
-        .env("HOME", &bash_home)
-        .env("LAZAR_HOME", &lazar)
-        .env("LAZAR_SKILLS", format!("{lazar}/skills"))
-        .env("LAZAR_MEMORY", format!("{lazar}/memory"))
-        .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
-        .env("LAZAR_LOGS", format!("{lazar}/logs"))
+        .stderr(Stdio::piped());
+    crate::spawn::apply_base_env(&mut command, &lazar, &bash_home, unsandboxed);
+    command
         .env("LAZAR_HOOK_EVENT", event.as_str())
-        .env("LAZAR_HOOK_PAYLOAD_LEN", payload_str.len().to_string())
-        .env(
-            "TERM",
-            env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-        )
-        .env(
-            "LANG",
-            env::var("LANG").unwrap_or_else(|_| "en_US.UTF-8".into()),
-        );
+        .env("LAZAR_HOOK_PAYLOAD_LEN", payload_str.len().to_string());
 
-    if unsandboxed {
-        command.env("LAZAR_NO_SANDBOX", "1");
-
-        // See main.rs for rationale: when operator opts out of sandbox,
-        // hook scripts also need real shell env to interact with the system.
-        const PASSTHROUGH_VARS: &[&str] = &[
-            "SSH_AUTH_SOCK", "SSH_AGENT_PID",
-            "GPG_TTY", "GNUPGHOME",
-            "GH_TOKEN", "GITHUB_TOKEN", "GITLAB_TOKEN",
-            "OPENAI_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY",
-            "GOOGLE_API_KEY", "MISTRAL_API_KEY", "TOGETHER_API_KEY",
-            "PERPLEXITY_API_KEY", "DEEPSEEK_API_KEY", "XAI_API_KEY",
-            "AWS_PROFILE", "AWS_REGION", "AWS_DEFAULT_REGION",
-            "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
-            "EDITOR", "VISUAL", "PAGER",
-            "LC_ALL", "LC_CTYPE",
-            "COLORTERM", "CLICOLOR", "FORCE_COLOR", "NO_COLOR",
-            "USER", "LOGNAME",
-            "TMPDIR",
-        ];
-        for var in PASSTHROUGH_VARS {
-            if let Ok(val) = env::var(var) {
-                command.env(var, val);
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    crate::spawn::isolate_process_group(&mut command);
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -402,25 +324,13 @@ fn run_hook(
         })
     });
 
-    let mut timed_out = false;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) => {
-                if started.elapsed() >= timeout {
-                    timed_out = true;
-                    crate::kill_process_group(child_pid);
-                    let _ = child.kill();
-                    break child.wait().ok();
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                break None;
-            }
-        }
-    };
+    let (status, timed_out) = crate::spawn::wait_with_timeout(
+        &mut child,
+        child_pid,
+        timeout,
+        Duration::from_millis(20),
+    )
+    .unwrap_or_default();
 
     // A hook may background a process that inherits its captured pipes. The
     // hook shell can then exit while the reader threads remain blocked forever.
