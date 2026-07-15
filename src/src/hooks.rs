@@ -24,7 +24,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{append_stream, lazar_home, now_millis};
+use crate::log::append_stream;
+use crate::{lazar_home, now_millis};
 
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 5;
 const HOOK_STDOUT_CAP_BYTES: usize = 16_384;
