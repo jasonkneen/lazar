@@ -1097,6 +1097,7 @@ fn parse_sse_reader<R: BufRead>(
 
     let mut blocks: HashMap<u64, Value> = HashMap::new();
     let mut tool_input_buffers: HashMap<u64, String> = HashMap::new();
+    let mut text_buffers: HashMap<u64, String> = HashMap::new();
     let mut stop_reason = String::new();
     let mut printed_any_text = false;
     let mut saw_message_stop = false;
@@ -1144,10 +1145,7 @@ fn parse_sse_reader<R: BufRead>(
                                 // Suppress live output; final result emitted at end_turn.
                             }
                         }
-                        if let Some(block) = blocks.get_mut(&idx) {
-                            let current = block["text"].as_str().unwrap_or("").to_string();
-                            block["text"] = json!(current + text);
-                        }
+                        text_buffers.entry(idx).or_default().push_str(text);
                     }
                     "input_json_delta" => {
                         let partial = delta["partial_json"].as_str().unwrap_or("");
@@ -1191,11 +1189,16 @@ fn parse_sse_reader<R: BufRead>(
                                 "input": block["input"],
                             }));
                         }
-                    } else if block["type"] == "text" && format == OutputFormat::StreamJson {
-                        emit_event(json!({
-                            "type": "text_done",
-                            "index": idx,
-                        }));
+                    } else if block["type"] == "text" {
+                        if let Some(buf) = text_buffers.remove(&idx) {
+                            block["text"] = json!(buf);
+                        }
+                        if format == OutputFormat::StreamJson {
+                            emit_event(json!({
+                                "type": "text_done",
+                                "index": idx,
+                            }));
+                        }
                     }
                 }
             }
@@ -1251,6 +1254,15 @@ fn parse_sse_reader<R: BufRead>(
 
     if format == OutputFormat::Text && printed_any_text {
         println!();
+    }
+
+    // Early-EOF recovery: fold text that never saw content_block_stop.
+    for (idx, buf) in text_buffers.drain() {
+        if let Some(block) = blocks.get_mut(&idx) {
+            if block["type"] == "text" {
+                block["text"] = json!(buf);
+            }
+        }
     }
 
     let mut indices: Vec<u64> = blocks.keys().copied().collect();
@@ -2386,6 +2398,42 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
         assert_eq!(stop_reason, "end_turn");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "partial");
+    }
+
+    #[test]
+    fn sse_parser_accumulates_multiple_text_deltas() {
+        let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"c"}}
+data: {"type":"content_block_stop","index":0}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+data: {"type":"message_stop"}
+"#;
+
+        let (content, stop_reason) =
+            parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "abc");
+    }
+
+    #[test]
+    fn sse_parser_keeps_partial_text_without_block_stop() {
+        let data = br#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"b"}}
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"c"}}
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
+"#;
+
+        let (content, stop_reason) =
+            parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
+
+        assert_eq!(stop_reason, "end_turn");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "abc");
     }
 
     #[test]
