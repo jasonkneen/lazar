@@ -44,6 +44,8 @@ pub enum SuspicionKind {
     CheckmarkClaim,
     /// "Within the last N minutes/seconds" recency claim.
     Recency,
+    /// Explicit implementation/completion + test claim.
+    CompletionClaim,
 }
 
 impl SuspicionKind {
@@ -54,6 +56,7 @@ impl SuspicionKind {
             SuspicionKind::TotalTime => "total_time",
             SuspicionKind::CheckmarkClaim => "checkmark_claim",
             SuspicionKind::Recency => "recency",
+            SuspicionKind::CompletionClaim => "completion_claim",
         }
     }
 }
@@ -80,24 +83,14 @@ pub fn extract_text(content: &Value) -> String {
     out
 }
 
-/// Count tool_use blocks in an assistant content array. Used to detect
-/// "claims of work without any tool ran" — the strongest fabrication
-/// signal.
-pub fn count_tool_uses(content: &Value) -> usize {
-    if let Some(arr) = content.as_array() {
-        arr.iter()
-            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
-            .count()
-    } else {
-        0
-    }
-}
-
 /// Scan text for fabrication tells. Returns suspicions ordered by
 /// position in the text. Empty if nothing matched.
 pub fn scan(text: &str) -> Vec<Suspicion> {
     let mut suspicions = Vec::new();
-    let lower = text.to_lowercase();
+    let lines: Vec<(&str, String)> = text
+        .lines()
+        .map(|line| (line, line.to_lowercase()))
+        .collect();
 
     // 1. Past-tense action verbs that claim completion
     //    Pattern: "just X" / "now X" / "already X" where X is an action verb
@@ -109,42 +102,27 @@ pub fn scan(text: &str) -> Vec<Suspicion> {
     ];
     let triggers = ["just ", "now ", "already ", "i've ", "i have ", "i ran "];
     for trigger in &triggers {
-        let mut from = 0;
-        while let Some(idx) = lower[from..].find(trigger) {
-            let abs = from + idx;
-            let after = &lower[abs + trigger.len()..];
-            for verb in &action_verbs {
-                if after.starts_with(verb) {
-                    let end = (abs + trigger.len() + verb.len() + 40).min(text.len());
-                    let mut start = abs;
-                    while !text.is_char_boundary(start) && start > 0 {
-                        start -= 1;
-                    }
-                    let mut e = end;
-                    while !text.is_char_boundary(e) && e < text.len() {
-                        e += 1;
-                    }
+        for (line, lower) in &lines {
+            let mut from = 0;
+            while let Some(idx) = lower[from..].find(trigger) {
+                let abs = from + idx;
+                let after = &lower[abs + trigger.len()..];
+                if action_verbs.iter().any(|verb| after.starts_with(verb)) {
                     suspicions.push(Suspicion {
                         kind: SuspicionKind::PastTenseAction,
-                        matched_text: text[start..e].trim().to_string(),
+                        matched_text: line.trim().to_string(),
                     });
-                    break;
                 }
+                from = abs + trigger.len();
             }
-            from = abs + trigger.len();
         }
     }
 
     // 2. "Total time: ~N seconds" / "Total time: N min"
-    if let Some(idx) = lower.find("total time:") {
-        let end = (idx + 60).min(text.len());
-        let mut e = end;
-        while !text.is_char_boundary(e) && e < text.len() {
-            e += 1;
-        }
+    if let Some((line, _)) = lines.iter().find(|(_, lower)| lower.contains("total time:")) {
         suspicions.push(Suspicion {
             kind: SuspicionKind::TotalTime,
-            matched_text: text[idx..e].trim().to_string(),
+            matched_text: line.trim().to_string(),
         });
     }
 
@@ -163,15 +141,10 @@ pub fn scan(text: &str) -> Vec<Suspicion> {
     ];
     for phrase in &checkmark_phrases {
         let lower_phrase = phrase.to_lowercase();
-        if let Some(idx) = lower.find(&lower_phrase) {
-            let end = (idx + 80).min(text.len());
-            let mut e = end;
-            while !text.is_char_boundary(e) && e < text.len() {
-                e += 1;
-            }
+        if let Some((line, _)) = lines.iter().find(|(_, lower)| lower.contains(&lower_phrase)) {
             suspicions.push(Suspicion {
                 kind: SuspicionKind::CheckmarkClaim,
-                matched_text: text[idx..e].trim().to_string(),
+                matched_text: line.trim().to_string(),
             });
         }
     }
@@ -191,26 +164,11 @@ pub fn scan(text: &str) -> Vec<Suspicion> {
         "removed |",
         "fresh content |",
     ];
-    let lower_table = lower.as_str();
     for sig in &table_signals {
-        if let Some(idx) = lower_table.find(sig) {
-            // Walk back to find the start of the table line
-            let line_start = lower_table[..idx].rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let line_end = lower_table[idx..]
-                .find('\n')
-                .map(|i| idx + i)
-                .unwrap_or(text.len());
-            let mut s = line_start;
-            while !text.is_char_boundary(s) && s > 0 {
-                s -= 1;
-            }
-            let mut e = line_end;
-            while !text.is_char_boundary(e) && e < text.len() {
-                e += 1;
-            }
+        if let Some((line, _)) = lines.iter().find(|(_, lower)| lower.contains(sig)) {
             suspicions.push(Suspicion {
                 kind: SuspicionKind::StateTable,
-                matched_text: text[s..e].trim().to_string(),
+                matched_text: line.trim().to_string(),
             });
             break; // one table cell finding is enough
         }
@@ -219,20 +177,37 @@ pub fn scan(text: &str) -> Vec<Suspicion> {
     // 5. "Within the last N minutes/seconds" / "in the last N minutes"
     let recency_phrases = ["within the last ", "in the last "];
     for phrase in &recency_phrases {
-        if let Some(idx) = lower.find(phrase) {
-            let after = &lower[idx + phrase.len()..];
-            // Quick check: starts with a digit?
-            if after.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
-                let end = (idx + phrase.len() + 40).min(text.len());
-                let mut e = end;
-                while !text.is_char_boundary(e) && e < text.len() {
-                    e += 1;
+        for (line, lower) in &lines {
+            if let Some(idx) = lower.find(phrase) {
+                let after = &lower[idx + phrase.len()..];
+                if after.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    suspicions.push(Suspicion {
+                        kind: SuspicionKind::Recency,
+                        matched_text: line.trim().to_string(),
+                    });
                 }
-                suspicions.push(Suspicion {
-                    kind: SuspicionKind::Recency,
-                    matched_text: text[idx..e].trim().to_string(),
-                });
             }
+        }
+    }
+
+    // 6. Explicit claims that implementation and testing are complete. These
+    // require a passing VERIFY block even if they avoid the older May 5-style
+    // checkmarks/tables/past-tense wording.
+    let completion_phrases = [
+        "implemented and tested",
+        "are implemented",
+        "is implemented",
+        "everything is complete",
+        "all work is complete",
+        "fully implemented",
+    ];
+    for phrase in completion_phrases {
+        if let Some((line, _)) = lines.iter().find(|(_, lower)| lower.contains(phrase)) {
+            suspicions.push(Suspicion {
+                kind: SuspicionKind::CompletionClaim,
+                matched_text: line.trim().to_string(),
+            });
+            break;
         }
     }
 
@@ -289,6 +264,13 @@ pub fn should_flag(suspicions: &[Suspicion], tool_uses_in_turn: usize) -> bool {
     if has_strong_signal && tool_uses_in_turn == 0 {
         return true;
     }
+    if suspicions
+        .iter()
+        .any(|s| s.kind == SuspicionKind::CompletionClaim)
+        && tool_uses_in_turn == 0
+    {
+        return true;
+    }
     // Multiple past-tense actions with zero or one tool — suspicious
     let past_tense_count = suspicions
         .iter()
@@ -305,6 +287,74 @@ pub fn should_flag(suspicions: &[Suspicion], tool_uses_in_turn: usize) -> bool {
         return true;
     }
     false
+}
+
+/// Explain why a terminal response cannot be accepted as grounded.
+pub fn grounding_failure_reason(
+    report: &VerifyReport,
+    fabrication_flagged: bool,
+    verify_contract_broken: bool,
+) -> Option<String> {
+    if report.any_failed() {
+        return Some(format!(
+            "kernel verification failed: {} of {} declared claims did not match filesystem state",
+            report.failed_count(),
+            report.claims.len()
+        ));
+    }
+    if verify_contract_broken {
+        return Some(
+            "completion claims require a valid, passing [VERIFY] block; the block was missing or malformed"
+                .into(),
+        );
+    }
+    if fabrication_flagged {
+        return Some("kernel fabrication detector flagged unsupported completion claims".into());
+    }
+    None
+}
+
+/// Build the provider-neutral correction prompt injected after an ungrounded
+/// terminal response.
+pub fn format_grounding_retry_prompt(
+    report: &VerifyReport,
+    suspicions: &[Suspicion],
+    tool_uses_in_invocation: usize,
+    retry: u32,
+    max_retries: u32,
+) -> String {
+    let mut out = String::new();
+    out.push_str("KERNEL GROUNDING CORRECTION\n");
+    out.push_str(&format!("Retry {retry} of {max_retries}. "));
+    if report.any_failed() {
+        out.push_str(&format!(
+            "The kernel checked your [VERIFY] block and {} of {} claims failed.\n",
+            report.failed_count(),
+            report.claims.len()
+        ));
+        for result in report.claims.iter().filter(|result| !result.passed).take(8) {
+            out.push_str(&format!("- {:?}: {}\n", result.claim, short(&result.note, 160)));
+        }
+        if report.failed_count() > 8 {
+            out.push_str(&format!("- and {} more failed claims\n", report.failed_count() - 8));
+        }
+    } else {
+        out.push_str("The kernel flagged unsupported completion language in your response.\n");
+    }
+    if !suspicions.is_empty() {
+        let kinds = suspicions
+            .iter()
+            .map(|s| s.kind.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        out.push_str(&format!("Fabrication signals: {}.\n", kinds.into_iter().collect::<Vec<_>>().join(", ")));
+    }
+    out.push_str(&format!(
+        "Valid bash calls observed in this invocation: {tool_uses_in_invocation}.\n"
+    ));
+    out.push_str(
+        "Use bash now to inspect the real state and correct the work. Do not repeat a completion claim unless the evidence supports it. End with a new [VERIFY] block that matches the actual filesystem. If the task cannot be completed, state that plainly without claiming success.",
+    );
+    out
 }
 
 // ════════════════════════════════════════════════════════════════════
@@ -351,6 +401,13 @@ pub struct VerifyReport {
     pub claims: Vec<ClaimResult>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ParsedVerifyBlocks {
+    pub claims: Vec<VerifyClaim>,
+    pub invalid_lines: Vec<String>,
+    pub malformed: bool,
+}
+
 impl VerifyReport {
     pub fn all_passed(&self) -> bool {
         !self.claims.is_empty() && self.claims.iter().all(|r| r.passed)
@@ -366,17 +423,23 @@ impl VerifyReport {
     }
 }
 
-/// Extract all `[VERIFY]...[/VERIFY]` blocks from text and parse the
-/// claims inside. Returns one Vec of claims (concatenated across blocks).
-pub fn parse_verify_blocks(text: &str) -> Vec<VerifyClaim> {
+/// Strict VERIFY parser used by the kernel acceptance gate. Unknown or
+/// malformed non-empty lines and unbalanced markers remain visible as contract
+/// failures instead of being silently discarded beside a passing claim.
+pub fn parse_verify_blocks_strict(text: &str) -> ParsedVerifyBlocks {
     let mut claims = Vec::new();
+    let mut invalid_lines = Vec::new();
+    let mut malformed = text.matches("[VERIFY]").count() != text.matches("[/VERIFY]").count();
     let mut from = 0;
     while let Some(start_idx) = text[from..].find("[VERIFY]") {
         let abs_start = from + start_idx + "[VERIFY]".len();
         let after = &text[abs_start..];
         let end_idx = match after.find("[/VERIFY]") {
             Some(i) => i,
-            None => break,
+            None => {
+                malformed = true;
+                break;
+            }
         };
         let block = &after[..end_idx];
         for line in block.lines() {
@@ -386,11 +449,13 @@ pub fn parse_verify_blocks(text: &str) -> Vec<VerifyClaim> {
             }
             if let Some(claim) = parse_claim_line(line) {
                 claims.push(claim);
+            } else {
+                invalid_lines.push(line.chars().take(160).collect());
             }
         }
         from = abs_start + end_idx + "[/VERIFY]".len();
     }
-    claims
+    ParsedVerifyBlocks { claims, invalid_lines, malformed }
 }
 
 /// Normalize a string before path comparison:
@@ -805,22 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn count_tool_uses_finds_blocks() {
-        let content = json!([
-            {"type": "text", "text": "hello"},
-            {"type": "tool_use", "name": "execute", "input": {}},
-            {"type": "tool_use", "name": "execute", "input": {}},
-        ]);
-        assert_eq!(count_tool_uses(&content), 2);
-    }
-
-    #[test]
-    fn count_tool_uses_zero_for_text_only() {
-        let content = json!([{"type": "text", "text": "hi"}]);
-        assert_eq!(count_tool_uses(&content), 0);
-    }
-
-    #[test]
     fn should_flag_state_table_with_no_tools() {
         let suspicions = vec![Suspicion {
             kind: SuspicionKind::StateTable,
@@ -846,6 +895,51 @@ mod tests {
             matched_text: "Total time: ~30 seconds".into(),
         }];
         assert!(should_flag(&suspicions, 0));
+    }
+
+    #[test]
+    fn failed_verify_requires_grounding_correction() {
+        let claims = (0..16)
+            .map(|i| ClaimResult {
+                claim: VerifyClaim::Exists(PathBuf::from(format!("/tmp/fabricated-{i}"))),
+                passed: false,
+                note: "not found".into(),
+            })
+            .collect();
+        let report = VerifyReport { claims };
+
+        assert_eq!(
+            grounding_failure_reason(&report, false, false).as_deref(),
+            Some("kernel verification failed: 16 of 16 declared claims did not match filesystem state")
+        );
+        let prompt = format_grounding_retry_prompt(&report, &[], 0, 1, 1);
+        assert!(prompt.contains("16 of 16 claims failed"));
+        assert!(prompt.contains("/tmp/fabricated-0"));
+        assert!(prompt.contains("and 8 more failed claims"));
+        assert!(prompt.contains("Do not repeat a completion claim"));
+        assert!(prompt.contains("Valid bash calls observed in this invocation: 0"));
+    }
+
+    #[test]
+    fn explicit_implemented_and_tested_claim_requires_proof() {
+        let text = "All 16 desktop notification files are implemented and tested.";
+        let suspicions = scan(text);
+
+        assert!(suspicions
+            .iter()
+            .any(|s| s.kind == SuspicionKind::CompletionClaim));
+        assert!(should_flag(&suspicions, 0));
+        assert_eq!(
+            grounding_failure_reason(&VerifyReport::default(), true, true).as_deref(),
+            Some("completion claims require a valid, passing [VERIFY] block; the block was missing or malformed")
+        );
+    }
+
+    #[test]
+    fn completion_scan_is_safe_after_unicode_case_expansion() {
+        let text = "İİİ All files are implemented and tested.";
+        let suspicions = scan(text);
+        assert!(suspicions.iter().any(|s| s.kind == SuspicionKind::CompletionClaim));
     }
 
     #[test]
@@ -875,7 +969,7 @@ mod tests {
     #[test]
     fn parse_verify_block_basic() {
         let text = "Some text\n[VERIFY]\nexists=/tmp/foo\nsize=/tmp/bar:0\n[/VERIFY]\nMore text.";
-        let claims = parse_verify_blocks(text);
+        let claims = parse_verify_blocks_strict(text).claims;
         assert_eq!(claims.len(), 2);
         assert!(matches!(claims[0], VerifyClaim::Exists(_)));
         match &claims[1] {
@@ -890,22 +984,30 @@ mod tests {
     #[test]
     fn parse_verify_block_with_bullets() {
         let text = "[VERIFY]\n- exists=/tmp/x\n* not_exists=/tmp/y\n[/VERIFY]";
-        let claims = parse_verify_blocks(text);
+        let claims = parse_verify_blocks_strict(text).claims;
         assert_eq!(claims.len(), 2);
     }
 
     #[test]
     fn parse_verify_handles_multiple_blocks() {
         let text = "[VERIFY]\nexists=/a\n[/VERIFY]\nMiddle\n[VERIFY]\nexists=/b\n[/VERIFY]";
-        let claims = parse_verify_blocks(text);
+        let claims = parse_verify_blocks_strict(text).claims;
         assert_eq!(claims.len(), 2);
     }
 
     #[test]
-    fn parse_verify_ignores_unknown_keys() {
+    fn strict_verify_rejects_unknown_lines_beside_valid_claims() {
         let text = "[VERIFY]\nexists=/tmp/foo\nbogus=anything\n[/VERIFY]";
-        let claims = parse_verify_blocks(text);
-        assert_eq!(claims.len(), 1);
+        let parsed = parse_verify_blocks_strict(text);
+        assert_eq!(parsed.claims.len(), 1);
+        assert_eq!(parsed.invalid_lines, vec!["bogus=anything"]);
+        assert!(!parsed.malformed);
+    }
+
+    #[test]
+    fn strict_verify_rejects_unbalanced_markers() {
+        let parsed = parse_verify_blocks_strict("[VERIFY]\nexists=/tmp/foo");
+        assert!(parsed.malformed);
     }
 
     #[test]

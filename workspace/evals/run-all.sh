@@ -24,15 +24,24 @@ done
 line "TUI go tests"
 ( cd workspace/tui && go test ./... 2>&1 | tail -1 ) || FAILED=1
 
+line "model event analyzer tests"
+bash workspace/evals/model-evals.sh --self-test || FAILED=1
+
 if [ "$LIVE" = "1" ]; then
-  if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo; echo "(skipping behavioral evals — ANTHROPIC_API_KEY not set; run with --no-live to silence)"
-  else
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     # Loop the behavioral evals across cheap models — behavior must hold on each.
     for m in ${EVAL_MODELS:-MiniMax-M2.5-highspeed MiniMax-M2.7}; do
       line "behavioral evals @ $m"
       EVAL_MODEL="$m" bash workspace/evals/kernel-evals.sh 2>&1 | rg '^\[|evals:' || FAILED=1
     done
+  else
+    echo; echo "(skipping legacy behavioral evals — ANTHROPIC_API_KEY not set)"
+  fi
+  if [ -n "${ANTHROPIC_API_KEY:-}${MINIMAX_API_KEY:-}${OPENROUTER_API_KEY:-}" ]; then
+    line "event-level model grounding evals"
+    bash workspace/evals/model-evals.sh || FAILED=1
+  else
+    echo; echo "(skipping live grounding evals — no supported provider key is set)"
   fi
 fi
 

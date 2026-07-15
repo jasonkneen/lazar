@@ -115,20 +115,20 @@ pub fn find_newest_session() -> Option<String> {
 /// Anthropic Messages API format. Returns an empty Vec if the log
 /// doesn't exist (first turn).
 ///
-/// IMPORTANT: tool_use blocks and tool_result events are STRIPPED from the
-/// loaded history. Tool ids are provider-specific (Anthropic, MiniMax,
-/// OpenRouter, etc all use different formats), and lazar's cascading
-/// provider failover means a session log can mix providers. Sending a
+/// IMPORTANT: provider-native tool_use blocks and tool_result events are
+/// STRIPPED from loaded history. Tool ids are provider-specific (Anthropic,
+/// MiniMax, OpenRouter, etc all use different formats), and lazar's cascading
+/// provider failover means a session log can mix providers. Sending a raw
 /// `tool_result` with a foreign tool_use_id back to any single provider
-/// produces an "unknown tool id" 400.
+/// produces an "unknown tool id" 400. Instead, the loader converts kernel
+/// evidence into bounded plain-text user messages: command + exit status,
+/// VERIFY outcome, fabrication flags, and grounding retry/failure state.
 ///
 /// Truncation can also break tool_use→tool_result pairing (drop the
 /// assistant message and you have an orphan tool_result).
 ///
-/// The clean, provider-portable, truncation-safe choice is: load only
-/// text content. The agent loses fine-grained "what tools did I run"
-/// detail in continued sessions, but stream.jsonl still has it for
-/// archeology — and the multi-turn referential bug is fixed regardless.
+/// This keeps history provider-portable and truncation-safe without erasing
+/// the evidence that distinguishes a real action from a narrated one.
 ///
 /// The returned messages are guaranteed to:
 ///   - Start with a user-role message
@@ -202,12 +202,119 @@ fn load_messages_from_path(path: &Path) -> Vec<Value> {
                     }
                 }
             }
-            // tool_result events are intentionally dropped — see doc above.
-            _ => {}
+            _ => {
+                if let Some(summary) = evidence_summary(&event) {
+                    push_message(&mut messages, "user", json!(summary));
+                }
+            }
         }
     }
 
     truncate_to_byte_cap(messages)
+}
+
+/// Convert kernel-owned events into bounded, provider-neutral evidence. Never
+/// include provider tool ids or raw output: ids cannot cross providers, while
+/// output can be both huge and sensitive.
+fn evidence_summary(event: &Value) -> Option<String> {
+    let kind = event.get("kind").and_then(Value::as_str)?;
+    match kind {
+        "tool_result" => {
+            let command = event
+                .get("executed_command")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("requested_command").and_then(Value::as_str))
+                .or_else(|| event.get("command").and_then(Value::as_str))
+                .unwrap_or("<unknown command>");
+            let command = safe_command_summary(command);
+            let result = event
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .and_then(|code| i32::try_from(code).ok())
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_else(|| "exit status unavailable".into());
+            Some(format!(
+                "[KERNEL TOOL EVIDENCE]\ncommand: {command}\nresult: {result}"
+            ))
+        }
+        "verify_report" => {
+            let report = event.get("report")?;
+            let passed = report.get("passed_count").and_then(Value::as_u64).unwrap_or(0);
+            let failed = report.get("failed_count").and_then(Value::as_u64).unwrap_or(0);
+            let outcome = if failed > 0 { "FAILED" } else { "PASSED" };
+            let mut summary = format!(
+                "[KERNEL VERIFY EVIDENCE]\nresult: {outcome} ({passed} passed, {failed} failed)"
+            );
+            if let Some(claims) = report.get("claims").and_then(Value::as_array) {
+                for claim in claims
+                    .iter()
+                    .filter(|claim| claim.get("passed").and_then(Value::as_bool) == Some(false))
+                    .take(5)
+                {
+                    let name = claim
+                        .get("claim")
+                        .and_then(Value::as_str)
+                        .map(|s| bounded_one_line(s, 160))
+                        .unwrap_or_else(|| "unknown claim".into());
+                    let note = claim
+                        .get("note")
+                        .and_then(Value::as_str)
+                        .map(|s| bounded_one_line(s, 160))
+                        .unwrap_or_else(|| "failed".into());
+                    summary.push_str(&format!("\nfailed: {name} — {note}"));
+                }
+            }
+            Some(summary)
+        }
+        "fabrication_check" if event.get("flagged").and_then(Value::as_bool) == Some(true) => {
+            let tools = event
+                .get("tool_uses_in_invocation")
+                .or_else(|| event.get("tool_uses_in_turn"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let signals = event
+                .get("suspicion_kinds")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "unspecified".into());
+            Some(format!(
+                "[KERNEL GROUNDING EVIDENCE]\nresult: FABRICATION FLAGGED\nvalid bash calls: {tools}\nsignals: {signals}"
+            ))
+        }
+        "grounding_retry" | "grounding_failure" => {
+            let reason = event
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(|s| bounded_one_line(s, 320))
+                .unwrap_or_else(|| "grounding check failed".into());
+            let outcome = if kind == "grounding_retry" { "RETRY REQUIRED" } else { "TURN REJECTED" };
+            Some(format!(
+                "[KERNEL GROUNDING EVIDENCE]\nresult: {outcome}\nreason: {reason}"
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn bounded_one_line(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn safe_command_summary(command: &str) -> String {
+    let argument_count = command.split_whitespace().count().saturating_sub(1);
+    let suffix = if argument_count == 1 { "argument" } else { "arguments" };
+    format!(
+        "shell command ({} {}; {} bytes)",
+        argument_count,
+        suffix,
+        command.len()
+    )
 }
 
 /// Keep provider history valid after persisted tool blocks/results have been
@@ -440,6 +547,47 @@ mod tests {
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1]["content"], "I will inspect.\n\nInspection complete.");
+    }
+
+    #[test]
+    fn tool_results_become_provider_neutral_evidence() {
+        let event = json!({
+            "kind": "tool_result",
+            "tool_use_id": "provider-specific-id",
+            "requested_command": "OPENAI_API_KEY=sk-secret curl example.invalid",
+            "executed_command": "OPENAI_API_KEY=sk-secret curl example.invalid",
+            "content": "hook-rewritten\n[exit 0]",
+            "exit_code": 1
+        });
+        let summary = evidence_summary(&event).unwrap();
+
+        assert!(summary.contains("command: shell command (2 arguments"));
+        assert!(summary.contains("result: exit 1"));
+        assert!(!summary.contains("provider-specific-id"));
+        assert!(!summary.contains("hook-rewritten\n[exit 0]"));
+        assert!(!summary.contains("sk-secret"));
+        assert!(!summary.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn failed_verify_survives_session_reload_as_evidence() {
+        let event = json!({
+            "kind": "verify_report",
+            "report": {
+                "passed_count": 0,
+                "failed_count": 16,
+                "claims": [{
+                    "claim": "Exists(\"/tmp/made-up\")",
+                    "passed": false,
+                    "note": "not found"
+                }]
+            }
+        });
+        let summary = evidence_summary(&event).unwrap();
+
+        assert!(summary.contains("FAILED (0 passed, 16 failed)"));
+        assert!(summary.contains("/tmp/made-up"));
+        assert!(summary.contains("not found"));
     }
 
     #[test]
