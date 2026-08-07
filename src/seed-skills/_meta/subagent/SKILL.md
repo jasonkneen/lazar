@@ -69,3 +69,16 @@ child prose. On `matched:false`, fix the BRIEF and retry within ceilings.
 ## Self-test
 
 `bash skills/_meta/subagent/selftest.sh`
+
+## Async (optional)
+
+```bash
+bash "$LAZAR_HOME/bin/lazar-spawn" --detach <task-id> <prompt-file>
+# → {"status":"running","job_id":"..."}
+
+bash "$LAZAR_HOME/bin/lazar-spawn" --status <job-id>
+bash "$LAZAR_HOME/bin/lazar-spawn" --await <job-id>
+```
+
+Prefer sync spawn for single tasks. Use `--detach` only for parallel fan-out; still gate on `matched` via --await/--status.
+
