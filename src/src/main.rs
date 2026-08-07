@@ -648,14 +648,14 @@ fn emit_event(mut event: Value) {
 fn parse_sse_stream(
     resp: reqwest::blocking::Response,
     format: OutputFormat,
-) -> Result<(Value, String), Box<dyn std::error::Error>> {
+) -> Result<(Value, String, u64, u64), Box<dyn std::error::Error>> {
     parse_sse_reader(std::io::BufReader::new(resp), format)
 }
 
 fn parse_sse_reader<R: BufRead>(
     reader: R,
     format: OutputFormat,
-) -> Result<(Value, String), Box<dyn std::error::Error>> {
+) -> Result<(Value, String, u64, u64), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
 
     let mut blocks: HashMap<u64, Value> = HashMap::new();
@@ -664,6 +664,8 @@ fn parse_sse_reader<R: BufRead>(
     let mut stop_reason = String::new();
     let mut printed_any_text = false;
     let mut saw_message_stop = false;
+    let mut usage_input_tokens: u64 = 0;
+    let mut usage_output_tokens: u64 = 0;
 
     for line in reader.lines() {
         let line = line?;
@@ -769,6 +771,14 @@ fn parse_sse_reader<R: BufRead>(
                 if let Some(r) = v["delta"]["stop_reason"].as_str() {
                     stop_reason = r.to_string();
                 }
+                if let Some(u) = v.get("usage") {
+                    if let Some(n) = u.get("input_tokens").and_then(|x| x.as_u64()) {
+                        usage_input_tokens = n;
+                    }
+                    if let Some(n) = u.get("output_tokens").and_then(|x| x.as_u64()) {
+                        usage_output_tokens = n;
+                    }
+                }
             }
             "message_stop" => {
                 saw_message_stop = true;
@@ -835,7 +845,7 @@ fn parse_sse_reader<R: BufRead>(
         .filter_map(|i| blocks.get(i).cloned())
         .collect();
 
-    Ok((json!(content), stop_reason))
+    Ok((json!(content), stop_reason, usage_input_tokens, usage_output_tokens))
 }
 
 /// RAII guard that fires the `session-end` hook on drop. Defaults to
@@ -1210,7 +1220,7 @@ fn run_agent(
             return Err(abort_invoke(format, &session_guard, "error", msg));
         }
 
-        let (content, stop_reason_str) = match parse_sse_stream(resp, format) {
+        let (content, stop_reason_str, usage_in, usage_out) = match parse_sse_stream(resp, format) {
             Ok(parsed) => parsed,
             Err(e) => {
                 let msg = e.to_string();
@@ -1488,13 +1498,20 @@ fn run_agent(
                 );
             }
 
-            append_stream(json!({"kind": "invoke_end", "stop_reason": stop_reason}));
+            append_stream(json!({
+                "kind": "invoke_end",
+                "stop_reason": stop_reason,
+                "input_tokens": usage_in,
+                "output_tokens": usage_out,
+            }));
 
             if format == OutputFormat::StreamJson {
                 emit_event(json!({
                     "type": "invoke_end",
                     "stop_reason": stop_reason,
                     "duration_ms": duration_ms,
+                    "input_tokens": usage_in,
+                    "output_tokens": usage_out,
                 }));
             } else if format == OutputFormat::Json {
                 let result = json!({
@@ -1504,6 +1521,8 @@ fn run_agent(
                     "result": final_text,
                     "content": content,
                     "duration_ms": duration_ms,
+                    "input_tokens": usage_in,
+                    "output_tokens": usage_out,
                 });
                 println!("{result}");
             }
@@ -1986,7 +2005,7 @@ data: {"type":"content_block_stop","index":0}
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 "#;
 
-        let (content, stop_reason) =
+        let (content, stop_reason, _, _) =
             parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
 
         assert_eq!(stop_reason, "end_turn");
@@ -2005,7 +2024,7 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 data: {"type":"message_stop"}
 "#;
 
-        let (content, stop_reason) =
+        let (content, stop_reason, _, _) =
             parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
 
         assert_eq!(stop_reason, "end_turn");
@@ -2022,7 +2041,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}
 "#;
 
-        let (content, stop_reason) =
+        let (content, stop_reason, _, _) =
             parse_sse_reader(Cursor::new(&data[..]), OutputFormat::Json).unwrap();
 
         assert_eq!(stop_reason, "end_turn");
