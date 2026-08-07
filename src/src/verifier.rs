@@ -290,10 +290,16 @@ pub fn should_flag(suspicions: &[Suspicion], tool_uses_in_turn: usize) -> bool {
 }
 
 /// Explain why a terminal response cannot be accepted as grounded.
+///
+/// Prefer specific diagnosis over a single catch-all string: operators (and the
+/// model on retry) need to know whether claims failed, the block was malformed,
+/// a line was invalid, or completion language lacked any VERIFY proof.
 pub fn grounding_failure_reason(
     report: &VerifyReport,
     fabrication_flagged: bool,
-    verify_contract_broken: bool,
+    parsed: &ParsedVerifyBlocks,
+    has_verify_marker: bool,
+    has_completion_claim: bool,
 ) -> Option<String> {
     if report.any_failed() {
         return Some(format!(
@@ -302,9 +308,40 @@ pub fn grounding_failure_reason(
             report.claims.len()
         ));
     }
-    if verify_contract_broken {
+    if parsed.malformed {
         return Some(
-            "completion claims require a valid, passing [VERIFY] block; the block was missing or malformed"
+            "VERIFY block is malformed (unbalanced [VERIFY] / [/VERIFY] markers; close must be exactly [/VERIFY])"
+                .into(),
+        );
+    }
+    if !parsed.invalid_lines.is_empty() {
+        let preview = parsed
+            .invalid_lines
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let extra = if parsed.invalid_lines.len() > 3 {
+            format!(" (+{} more)", parsed.invalid_lines.len() - 3)
+        } else {
+            String::new()
+        };
+        return Some(format!(
+            "VERIFY block has {} invalid line(s) (only exists/not_exists/size/size_at_least/size_at_most/contains/mtime_within allowed): {}{}",
+            parsed.invalid_lines.len(),
+            preview,
+            extra
+        ));
+    }
+    if has_verify_marker && parsed.claims.is_empty() {
+        return Some(
+            "VERIFY markers present but no parseable claims were found inside the block".into(),
+        );
+    }
+    if has_completion_claim && !report.all_passed() {
+        return Some(
+            "completion claims require a valid, passing [VERIFY] block; the block was missing or did not all pass"
                 .into(),
         );
     }
@@ -338,8 +375,14 @@ pub fn format_grounding_retry_prompt(
         if report.failed_count() > 8 {
             out.push_str(&format!("- and {} more failed claims\n", report.failed_count() - 8));
         }
+    } else if report.all_passed() {
+        out.push_str(
+            "Some claims in your [VERIFY] block passed, but the VERIFY contract itself is still broken (malformed markers, invalid claim lines, or completion language without a fully valid block). Fix the block shape — close with exactly [/VERIFY] on its own line, one supported claim per line, no comments.\n",
+        );
     } else {
-        out.push_str("The kernel flagged unsupported completion language in your response.\n");
+        out.push_str(
+            "The kernel flagged unsupported completion language and/or a missing [VERIFY] block in your response.\n",
+        );
     }
     if !suspicions.is_empty() {
         let kinds = suspicions
@@ -426,6 +469,11 @@ impl VerifyReport {
 /// Strict VERIFY parser used by the kernel acceptance gate. Unknown or
 /// malformed non-empty lines and unbalanced markers remain visible as contract
 /// failures instead of being silently discarded beside a passing claim.
+///
+/// Close-tag note: models frequently emit `[/VERIFY` (missing the trailing
+/// `]`). Treat that as a valid close — the intent is unambiguous, and rejecting
+/// otherwise-passing claim sets for a one-character typo caused endemic
+/// `grounding_failed` after N/N claim passes.
 pub fn parse_verify_blocks_strict(text: &str) -> ParsedVerifyBlocks {
     let mut claims = Vec::new();
     let mut invalid_lines = Vec::new();
@@ -434,28 +482,43 @@ pub fn parse_verify_blocks_strict(text: &str) -> ParsedVerifyBlocks {
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
-        match line {
-            "[VERIFY]" => {
-                if in_block { malformed = true; } else { in_block = true; }
+        if is_verify_open_marker(line) {
+            if in_block {
+                malformed = true;
+            } else {
+                in_block = true;
             }
-            "[/VERIFY]" => {
-                if in_block { in_block = false; } else { malformed = true; }
+        } else if is_verify_close_marker(line) {
+            if in_block {
+                in_block = false;
+            } else {
+                malformed = true;
             }
-            "" => {}
-            _ if in_block => {
-                if let Some(claim) = parse_claim_line(line) {
-                    claims.push(claim);
-                } else {
-                    invalid_lines.push(line.chars().take(160).collect());
-                }
+        } else if line.is_empty() {
+            // skip blank lines inside/outside blocks
+        } else if in_block {
+            if let Some(claim) = parse_claim_line(line) {
+                claims.push(claim);
+            } else {
+                invalid_lines.push(line.chars().take(160).collect());
             }
-            _ => {}
         }
     }
     if in_block {
         malformed = true;
     }
     ParsedVerifyBlocks { claims, invalid_lines, malformed }
+}
+
+/// Canonical open marker only — do not accept prose-adjacent variants.
+fn is_verify_open_marker(line: &str) -> bool {
+    line == "[VERIFY]"
+}
+
+/// Accept the canonical close and the endemic truncated form `[/VERIFY`.
+/// Reject anything else so junk lines stay visible as invalid_lines.
+fn is_verify_close_marker(line: &str) -> bool {
+    line == "[/VERIFY]" || line == "[/VERIFY"
 }
 
 /// Normalize a string before path comparison:
@@ -909,7 +972,14 @@ mod tests {
         let report = VerifyReport { claims };
 
         assert_eq!(
-            grounding_failure_reason(&report, false, false).as_deref(),
+            grounding_failure_reason(
+                &report,
+                false,
+                &ParsedVerifyBlocks::default(),
+                false,
+                false,
+            )
+            .as_deref(),
             Some("kernel verification failed: 16 of 16 declared claims did not match filesystem state")
         );
         let prompt = format_grounding_retry_prompt(&report, &[], 0, 1, 1);
@@ -930,9 +1000,54 @@ mod tests {
             .any(|s| s.kind == SuspicionKind::CompletionClaim));
         assert!(should_flag(&suspicions, 0));
         assert_eq!(
-            grounding_failure_reason(&VerifyReport::default(), true, true).as_deref(),
-            Some("completion claims require a valid, passing [VERIFY] block; the block was missing or malformed")
+            grounding_failure_reason(
+                &VerifyReport::default(),
+                true,
+                &ParsedVerifyBlocks::default(),
+                false,
+                true,
+            )
+            .as_deref(),
+            Some("completion claims require a valid, passing [VERIFY] block; the block was missing or did not all pass")
         );
+    }
+
+    #[test]
+    fn truncated_close_marker_is_accepted() {
+        // Endemic model typo from stream.jsonl: closes with `[/VERIFY` not `[/VERIFY]`.
+        let text = "[VERIFY]\nexists=/tmp\nsize_at_least=/tmp:0\n[/VERIFY";
+        let parsed = parse_verify_blocks_strict(text);
+        assert!(!parsed.malformed, "truncated close must not mark the block malformed");
+        assert!(parsed.invalid_lines.is_empty());
+        assert_eq!(parsed.claims.len(), 2);
+    }
+
+    #[test]
+    fn truncated_close_with_passing_claims_is_not_a_grounding_failure() {
+        let text = "[VERIFY]\nexists=/tmp\n[/VERIFY";
+        let parsed = parse_verify_blocks_strict(text);
+        let report = verify_all(&parsed.claims);
+        assert!(report.all_passed());
+        assert!(
+            grounding_failure_reason(&report, false, &parsed, true, false).is_none(),
+            "passing claims + truncated close must accept the turn"
+        );
+    }
+
+    #[test]
+    fn invalid_lines_get_a_specific_grounding_reason() {
+        let text = "[VERIFY]\nexists=/tmp\nbogus=nope\n[/VERIFY]";
+        let parsed = parse_verify_blocks_strict(text);
+        let report = verify_all(&parsed.claims);
+        let reason = grounding_failure_reason(&report, false, &parsed, true, false);
+        assert!(
+            reason
+                .as_deref()
+                .unwrap_or("")
+                .contains("invalid line"),
+            "got: {reason:?}"
+        );
+        assert!(reason.as_deref().unwrap_or("").contains("bogus=nope"));
     }
 
     #[test]

@@ -1,71 +1,71 @@
 ---
 name: subagent
-description: The ONLY sanctioned way to delegate work to a lazar sub-agent. Uses locked bin/lazar-spawn (not agent-writable skills logic) — lints the prompt, bounds retries, wall-clock-kills wedged children, and gates success by re-checking declared claims against the filesystem. Raw `lazar -p` is vetoed by a pre-tool hook. Use whenever you need to fan out work, isolate context, or run something as a separate agent. Provider-agnostic.
+description: The ONLY sanctioned way to delegate work to a lazar sub-agent. Uses locked bin/lazar-spawn — lints the prompt, bounds retries, wall-clock-kills wedged children, and gates success by re-checking declared claims against the filesystem. Prefer pack-and-spawn.sh to write a BRIEF context pack then dispatch. Raw `lazar -p` is vetoed by a pre-tool hook. Use for isolated file-verifiable tasks and parallel fan-out — not for routine bash.
 ---
 
 # subagent — how I extend myself
 
 Delegation is a core skill. I never call `lazar -p` directly (a pre-tool hook
-vetoes it). I go through the **locked** spawn surface:
+vetoes it). I go through the **locked** spawn surface, preferably with a
+**context pack**:
 
 ```bash
+# Recommended: BRIEF.md + thin prompt + lazar-spawn
+bash "$LAZAR_HOME/skills/_meta/subagent/pack-and-spawn.sh" <task-id> \
+  --objective "..." \
+  --out /absolute/deliverable \
+  --path /absolute/input \
+  --skill create-skill \
+  --note "user wants terse output"
+
+# Lower-level (already-written prompt file):
 bash "$LAZAR_HOME/bin/lazar-spawn" <task-id> <prompt-file>
-# equivalent thin re-exec (same binary):
-bash skills/_meta/subagent/spawn.sh <task-id> <prompt-file>
 ```
 
 `bin/lazar-spawn` is installed by `setup.sh` with the same immutability story
-as `bin/lazar` (not under sandbox-writable `skills/`). Budget state lives in
-`logs/subagent/` (sandbox cannot write logs/). The copy under `skills/` is
-**only** a re-exec stub — never the real control plane.
+as `bin/lazar`. Budget state lives in `logs/subagent/`. The copy under
+`skills/_meta/subagent/spawn.sh` is **only** a re-exec stub.
 
-This is the same path for every model/provider. No provider-specific shortcuts.
+## When to spawn vs do it yourself
 
-## The translation (run this on every delegation)
+| Do it yourself (bash in-process) | Spawn a child |
+|----------------------------------|---------------|
+| < ~3 tool steps | Isolated unit with a file deliverable |
+| Needs live conversational deixis | Context isolation would help the parent |
+| Exploratory one-off | 2+ independent units (parallel via agent-dispatch) |
+| Result is just stdout to reason on | SUCCESS can be checked on disk |
 
-1. **Gate.** One task that needs my full context → I do it myself. Independent
-   chunks or context-isolation helps → delegate.
-2. **Decompose.** Units a stranger with zero context and only the filesystem
-   can complete.
-3. **Translate each unit into a self-contained spawn prompt**, written to a file:
-   - Imperative objective.
-   - **Absolute paths, never names** (`/Users/.../x.md`, not "the file").
-   - A `SUCCESS:` line — the criterion in one sentence.
-   - An `EXPECT-VERIFY:` block — claims that must become true, one per indented
-     line: `exists=/abs`, `contains=/abs:token`, or `size_at_least=/abs:bytes`.
-     I author these; the child cannot pass by declaring its own.
-   - "Report honest failure; do not fabricate."
-4. **Dispatch:** `bash "$LAZAR_HOME/bin/lazar-spawn" <task-id> <prompt-file>`.
-   Never raw `lazar -p`.
-5. **Gate on the envelope.** The wrapper re-checks EXPECT-VERIFY and returns
-   `{"status":"ok","matched":true}` only if they hold. I trust `matched`, not
-   the child's prose. On `matched:false` I fix the task and retry within bounds.
-6. **Aggregate + terminate** on success-met or ceiling-hit. Never respawn the
-   same failing prompt unbounded.
+**Never** wrap every bash call as a subagent — latency and token cost explode.
 
-## Prompt example
+## Context pack (enough context without cloning chat)
 
-```
-Write the current UTC date to /Users/jkneen/lazar/workspace/out/stamp.txt.
-SUCCESS: stamp.txt exists and contains a 2026 date
-EXPECT-VERIFY:
-  exists=/Users/jkneen/lazar/workspace/out/stamp.txt
-  contains=/Users/jkneen/lazar/workspace/out/stamp.txt:2026
-```
+Children are **strangers with a filesystem**. Do not dump parent history.
+Write `workspace/tasks/<id>/BRIEF.md` (pack-and-spawn does this) containing:
 
-Dispatch: `bash "$LAZAR_HOME/bin/lazar-spawn" stamp /tmp/stamp-task.txt`
+1. Imperative objective
+2. Absolute input/output paths
+3. `SUCCESS:` + `EXPECT-VERIFY:` claims **you** author
+4. Relevant skill names (not full INDEX)
+5. ≤ ~20 lines of prior decisions / constraints
+6. Out-of-scope list
+7. RESULT.md protocol (`DONE` / `BLOCKED`)
+
+The spawn `-p` string stays thin and points at the BRIEF.
+
+## Gate on the envelope
+
+`lazar-spawn` re-checks EXPECT-VERIFY and returns
+`{"status":"ok","matched":true}` only if claims hold. Trust `matched`, not
+child prose. On `matched:false`, fix the BRIEF and retry within ceilings.
 
 ## Bounds (all models)
-
-Three layers — do not remove one:
 
 1. Kernel stall-nudges (in-child recovery, bounded)
 2. Per-task ceiling `LAZAR_SPAWN_CEILING` (default 2)
 3. Session budget `LAZAR_SPAWN_BUDGET` (default 10)
-
-Wall-clock kill: `LAZAR_SPAWN_TIMEOUT` (default 300s).
+4. Wall-clock `LAZAR_SPAWN_TIMEOUT` (default 300s)
+5. Recursion depth cap (kernel `MAX_DEPTH`)
 
 ## Self-test
 
-`bash skills/_meta/subagent/selftest.sh` — lint, ceiling, claim re-check, veto,
-and that production state is under `logs/subagent/`.
+`bash skills/_meta/subagent/selftest.sh`

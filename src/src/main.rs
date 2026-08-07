@@ -444,6 +444,9 @@ where
 
 #[cfg(unix)]
 pub(crate) fn kill_process_group(pid: u32) {
+    if pid <= 1 {
+        return;
+    }
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
@@ -928,23 +931,35 @@ fn run_agent(
     model_override: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let api_key = match env::var("ANTHROPIC_API_KEY") {
-        Ok(key) => key,
-        Err(_) => {
-            let msg = "ANTHROPIC_API_KEY is not set";
-            emit_stream_error(format, msg);
-            return Err(msg.into());
-        }
+    let (api_key, is_minimax_fallback) = match env::var("ANTHROPIC_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => (key, false),
+        _ => match env::var("MINIMAX_API_KEY") {
+            Ok(key) if !key.trim().is_empty() => (key, true),
+            _ => {
+                let msg = "ANTHROPIC_API_KEY is not set (nor MINIMAX_API_KEY)";
+                emit_stream_error(format, msg);
+                return Err(msg.into());
+            }
+        },
     };
     let api_url = {
-        let base = env::var("ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+        let base = match env::var("ANTHROPIC_BASE_URL") {
+            Ok(base) if !base.trim().is_empty() => base,
+            _ if is_minimax_fallback => "https://api.minimax.io/anthropic".to_string(),
+            _ => "https://api.anthropic.com".to_string(),
+        };
         let trimmed = base.trim_end_matches('/');
         format!("{trimmed}/v1/messages")
     };
     let model = model_override
         .or_else(|| env::var("LAZAR_MODEL").ok())
-        .unwrap_or_else(|| DEFAULT_MODEL.into());
+        .unwrap_or_else(|| {
+            if is_minimax_fallback {
+                "MiniMax-M3".to_string()
+            } else {
+                DEFAULT_MODEL.into()
+            }
+        });
     let depth: u32 = env::var("LAZAR_DEPTH")
         .ok()
         .and_then(|d| d.parse().ok())
@@ -1080,6 +1095,7 @@ fn run_agent(
     let client = match reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Duration::from_secs(30))
         .build()
     {
         Ok(client) => client,
@@ -1324,9 +1340,9 @@ fn run_agent(
             // This is the ironclad layer: model can't lie about file
             // state because the kernel does the stat, not the model.
             let parsed_verify = verifier::parse_verify_blocks_strict(&final_text);
-            let claims = parsed_verify.claims;
+            let claims = &parsed_verify.claims;
             let verify_report = if !claims.is_empty() {
-                verifier::verify_all(&claims)
+                verifier::verify_all(claims)
             } else {
                 Default::default()
             };
@@ -1351,12 +1367,10 @@ fn run_agent(
             let has_completion_claim = suspicions
                 .iter()
                 .any(|s| s.kind == verifier::SuspicionKind::CompletionClaim);
+            // Marker detection: also treat the endemic truncated close
+            // `[/VERIFY` as a marker so empty/broken blocks still surface.
             let has_verify_marker = final_text.contains("[VERIFY]")
                 || final_text.contains("[/VERIFY]");
-            let verify_contract_broken = parsed_verify.malformed
-                || !parsed_verify.invalid_lines.is_empty()
-                || (has_verify_marker && claims.is_empty())
-                || (has_completion_claim && !verify_report.all_passed());
 
             if flagged {
                 let warning = verifier::format_warning(&suspicions, tool_uses_in_invocation);
@@ -1384,7 +1398,9 @@ fn run_agent(
             if let Some(reason) = verifier::grounding_failure_reason(
                 &verify_report,
                 flagged,
-                verify_contract_broken,
+                &parsed_verify,
+                has_verify_marker,
+                has_completion_claim,
             ) {
                 if grounding_retries_used < max_grounding_retries {
                     grounding_retries_used += 1;
@@ -2066,5 +2082,12 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert!(redacted.contains("API endpoint: https://example.test"));
         assert!(!redacted.contains("secret"));
         assert!(!redacted.contains("hidden"));
+    }
+
+    #[test]
+    fn kill_process_group_ignores_non_positive_pids() {
+        // Must return safely without sending signals to process group 0 or 1
+        kill_process_group(0);
+        kill_process_group(1);
     }
 }

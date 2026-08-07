@@ -17,12 +17,8 @@ fn sandbox_profile(policy: &AccessPolicy) -> String {
         return profile;
     }
     profile.push_str("\n;; operator-approved runtime project roots\n(allow file-write*\n");
-    for path in policy.allowed_write_dirs() {
-        let escaped = path
-            .to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"");
-        profile.push_str(&format!("  (subpath \"{escaped}\")\n"));
+    for (i, _path) in policy.allowed_write_dirs().iter().enumerate() {
+        profile.push_str(&format!("  (subpath (param \"ALLOWED_WRITE_DIR_{i}\"))\n"));
     }
     profile.push_str(")\n");
     profile
@@ -83,8 +79,11 @@ pub(crate) fn bash_command(payload: BashPayload, lazar: &str, policy: &AccessPol
             .arg(format!(
                 "USER_HOME={}",
                 env::var("HOME").unwrap_or_else(|_| "/".to_string())
-            ))
-            .arg("-p")
+            ));
+        for (i, dir) in policy.allowed_write_dirs().iter().enumerate() {
+            c.arg("-D").arg(format!("ALLOWED_WRITE_DIR_{i}={}", dir.display()));
+        }
+        c.arg("-p")
             .arg(sandbox_profile(policy))
             .arg("/bin/bash");
         match payload {
@@ -222,7 +221,7 @@ mod tests {
             "lazar-allowed-profile-{}", std::process::id()
         ));
         std::fs::create_dir_all(&requested).expect("create allowed dir");
-        let canonical = requested.canonicalize().expect("canonical allowed dir");
+        let _canonical = requested.canonicalize().expect("canonical allowed dir");
         let policy = AccessPolicy::new(
             false,
             None,
@@ -231,7 +230,7 @@ mod tests {
         ).expect("valid policy");
         let profile = sandbox_profile(&policy);
 
-        assert!(profile.contains(&format!("(subpath \"{}\")", canonical.display())));
+        assert!(profile.contains("(subpath (param \"ALLOWED_WRITE_DIR_0\"))"));
         std::fs::remove_dir_all(requested).expect("remove allowed dir");
     }
 
