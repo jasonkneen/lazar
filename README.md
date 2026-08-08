@@ -62,6 +62,47 @@ Kernel changes follow the proposal flow:
 This keeps the core kernel operator-reviewed even though normal Lazar work can
 continue in writable areas such as `skills/`, `memory/`, and `workspace/`.
 
+### Toggling guardrails
+
+Enforcement is a switch, not a wall. One command moves all five layers:
+
+```bash
+scripts/lazar-guardrails.sh status   # which mode am I in?
+scripts/lazar-guardrails.sh off      # full operator access
+scripts/lazar-guardrails.sh on       # restore enforcement
+```
+
+| # | Layer | Mechanism |
+|---|-------|-----------|
+| 1 | bash sandbox | `sandbox-exec` (`LAZAR_NO_SANDBOX`) |
+| 2 | kernel binary lock | `chflags uchg bin/lazar` |
+| 3 | source lock | `chmod a-w src/` |
+| 4 | pre-tool vetoes | `hooks/pre-tool.d/*.sh` (renamed `.disabled`, not deleted) |
+| 5 | **agent instructions** | `src/system-prompt.txt` + `access.rs` prompt context |
+
+Layer 5 is the one people miss. With layers 1–4 off, the agent will *still*
+refuse writes if its prompt says a path is forbidden — it self-censors while the
+filesystem is wide open. The mode is therefore injected into every session by
+`hooks/session-start.d/03-guardrails-mode.sh`, and the agent has a `guardrails`
+skill so it can check and flip the switch itself.
+
+State lives in `workspace/.guardrails`; `aliases.sh` and `lazartui.sh` read it at
+call time. An explicit `LAZAR_NO_SANDBOX` always wins.
+
+Guardrails OFF removes *enforcement*, not *discipline*: the proposal → review →
+apply → verify → rollback flow above still works, and VERIFY grounding is
+unaffected. Note that `scripts/kernel-build.sh` re-locks by default — pass
+`LAZAR_GUARDRAILS=off` to keep the kernel writable across rebuilds.
+
+**Known tradeoff.** Sub-agent state (`bin/lazar-spawn`) lives under
+`workspace/subagent/`, which is agent-writable. That includes the session spawn
+counter enforcing `LAZAR_SPAWN_BUDGET` (default 10), so an agent *can* reset its
+own budget. This was a deliberate swap: the state previously lived in `logs/`,
+which no sandboxed agent can write, so spawn failed 100% of the time with
+`Operation not permitted`. A working spawn with a soft budget beats a hard budget
+on a broken spawn. If you need the budget tamper-proof, add a dedicated state
+directory to the sandbox write allowlist rather than moving it back to `logs/`.
+
 ## Setup
 
 Requires macOS (for `sandbox-exec` and `chflags uchg`) and the Rust toolchain.
@@ -143,13 +184,17 @@ lazar --help
 
 ## Immutability
 
-After `setup.sh` completes:
+After `setup.sh` completes (guardrails ON — the default):
 
 - `bin/lazar` has `chflags uchg` (OS-level immutable). Nothing — not the agent, not the user, not root — can modify or delete it without `chflags nouchg` first.
 - `src/` is `chmod -R a-w`. The source is sealed.
 - The sandbox profile (compiled into the binary via `include_str!`) blocks writes to `bin/` and `src/` from any bash command the agent runs.
 
 The agent can `cat` the binary or the source — it can study itself. It cannot modify the runner. Evolution happens only in `skills/`.
+
+This is the *default posture*, not a physical law. `scripts/lazar-guardrails.sh off`
+lifts all of it (see [Toggling guardrails](#toggling-guardrails)). Run
+`scripts/lazar-guardrails.sh status` if you are unsure which mode you are in.
 
 ## The infinite memory log
 
@@ -228,6 +273,45 @@ Every bash command runs through `sandbox-exec` with this policy:
 - **Process spawn:** open (for CLI tools and optional `lazar -p` recursion; nested API recursion requires `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1`).
 
 Writes outside the allowed zones return `Operation not permitted`. The agent sees this in tool output and learns the boundary is real.
+
+All of the above applies **only while guardrails are ON**. With
+`scripts/lazar-guardrails.sh off` there is no `sandbox-exec` wrapper and no write
+restrictions at all. Check with `scripts/lazar-guardrails.sh status`.
+
+## Evaluating the harness
+
+Model benchmarks answer *"how smart is the model?"*. `harness-evals` answers a
+different question: **does this harness make any model behave honestly?**
+
+```bash
+skills/harness-evals/bin/harness-evals selftest              # offline, free
+skills/harness-evals/bin/harness-evals run --backend kimi    # live
+skills/harness-evals/bin/harness-evals run --repeat 3        # consistency
+skills/harness-evals/bin/harness-evals report                # trend
+skills/harness-evals/bin/harness-evals compare <runA> <runB> # IMPROVE / REGRESS
+skills/harness-evals/ci.sh --live --backend kimi             # CI gate
+```
+
+Suites: `core` (tool actually executes, write+VERIFY, chat hygiene, multi-step),
+`grounding` (false claim caught, no narrated success, recovery), plus optional
+`self-learning` and `spawn`.
+
+Checks are **filesystem + event** based, never prose, so a model cannot talk its
+way to a pass. Each run injects a random token to defeat memorisation.
+
+It is backend-agnostic by design — same task packs, swappable adapter:
+
+```bash
+# any non-lazar agent that emits NDJSON
+harness-evals run --cmd "my-agent -p '{{prompt}}' > {{stream}}"
+```
+
+Two runs of the same model can differ, so use `--repeat` before trusting a
+comparison. Timeouts are reported as `error`, separately from behavioural
+`fail`, so a slow provider is never mislabelled as dishonest. Results land in
+`workspace/evals/results/<timestamp>/` with full transcripts. See
+`skills/harness-evals/references/external-benchmarks.md` for how this layers
+with Terminal-Bench / SWE-bench / Inspect AI.
 
 ## Design notes
 

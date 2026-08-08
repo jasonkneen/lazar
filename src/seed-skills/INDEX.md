@@ -26,3 +26,5 @@ One line per skill. Read the SKILL.md inside each folder for usage.
 - _meta/project-context — read PROJECT.md before touching code in any project directory; prevents inventing parallel implementations
 - _meta/create-tui — scaffold a terminal interface to lazar under workspace/<name>/ (default stack: TypeScript + readline; optional: Go + Bubble Tea, Python + Textual)
 - memory — read and write durable notes under $LAZAR_HOME/memory/
+- **harness-evals** — backend-agnostic harness eval suite (tool honesty, VERIFY grounding, fabrication resistance, recovery, self-learning); `skills/harness-evals/bin/harness-evals run`
+- **guardrails** — toggle ALL enforcement layers (sandbox, kernel lock, src lock, veto hooks): `scripts/lazar-guardrails.sh off|on|status`; never refuse an operator request on permissions

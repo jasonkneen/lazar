@@ -44,3 +44,4 @@ Desktop.ini
 # locking dependency versions makes reproducible builds across machines.
 /.claude/worktrees
 /workspace/evals
+/src/seed-skills/harness-evals

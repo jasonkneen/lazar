@@ -47,6 +47,41 @@ if [ -n "$AWAIT_ID" ]; then
   JOB_DIR="$STATE_BASE/jobs"
   JOB="$JOB_DIR/$AWAIT_ID.json"
   [ -f "$JOB" ] || emit_err "unknown job id: $AWAIT_ID"
+  # Sweeper: a "running" job whose pid is dead is wedged (e.g. the detached
+  # subshell was reaped before writing the final status). Re-run the claim
+  # check here and finalize the job from the child's out-log + filesystem.
+  sweep_job(){
+    local st pid task out c matched failed_json p n min pn
+    st=$(jq -r '.status // empty' "$JOB" 2>/dev/null || true)
+    [ "$st" = "running" ] || return 0
+    pid=$(jq -r '.pid // 0' "$JOB" 2>/dev/null || echo 0)
+    if [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
+    # Worker pid is dead but job still "running" -> the detached subshell was
+    # reaped before finalizing. Finalize here by re-checking the stored claims.
+    task=$(jq -r '.task // empty' "$JOB" 2>/dev/null)
+    out=$(jq -r '.output // empty' "$JOB" 2>/dev/null)
+    [ -f "$JOB.claims" ] || { jq -n --arg id "$AWAIT_ID" '{status:"error",job_id:$id,wedged:true,reason:"worker died and no stored claims to re-check"}' >"$JOB"; return 0; }
+    matched=true; failed_json='[]'
+    FAILS_LIST=()
+    while IFS= read -r c; do
+      c="$(printf '%s' "$c" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [ -z "$c" ] && continue
+      case "$c" in
+        exists=*)        [ -e "${c#exists=}" ] || { matched=false; FAILS_LIST+=("$c"); } ;;
+        contains=*)      pn="${c#contains=}"; p="${pn%%:*}"; n="${pn#*:}"; { [ -f "$p" ] && rg -qF "$n" "$p"; } || { matched=false; FAILS_LIST+=("$c"); } ;;
+        size_at_least=*) pn="${c#size_at_least=}"; p="${pn%%:*}"; min="${pn#*:}"; { [ -f "$p" ] && [ "$(wc -c <"$p")" -ge "$min" ]; } || { matched=false; FAILS_LIST+=("$c"); } ;;
+        *) matched=false; FAILS_LIST+=("$c") ;;
+      esac
+    done <"$JOB.claims"
+    failed_json=$(printf '%s
+' "${FAILS_LIST[@]:-}" | jq -R . | jq -s 'map(select(length>0))')
+    if [ "$matched" = "true" ]; then
+      jq -n --arg id "$AWAIT_ID" --arg task "$task" --arg out "$out"         '{status:"ok",job_id:$id,task:$task,matched:true,finalized_by:"sweeper",output:$out}' >"$JOB"
+    else
+      jq -n --arg id "$AWAIT_ID" --arg task "$task" --arg out "$out" --argjson failed "$failed_json"         '{status:"fail",job_id:$id,task:$task,matched:false,finalized_by:"sweeper",failed_claims:$failed,output:$out}' >"$JOB"
+    fi
+  }
+  sweep_job
   if [ "$STATUS_ONLY" = "1" ]; then
     cat "$JOB"
     exit 0
@@ -58,6 +93,7 @@ if [ -n "$AWAIT_ID" ]; then
     case "$ST" in
       ok|fail|error) cat "$JOB"; [ "$ST" = "ok" ] && exit 0 || exit 2 ;;
     esac
+    sweep_job
     sleep 1
   done
   emit_err "await timed out for job $AWAIT_ID"
@@ -154,9 +190,21 @@ finish_job(){
   fi
 }
 
+# Shared claim parser (indented lines only after EXPECT-VERIFY:)
+parse_claims(){
+  printf '%s' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }'
+}
+
+CLAIMS_FILE="$JOB_FILE.claims"
+printf '%s' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }' >"$CLAIMS_FILE"
+
 if [ "$DETACH" = "1" ]; then
   jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg out "$OUTFILE"     '{status:"running",job_id:$id,task:$task,output:$out,pid:0}' >"$JOB_FILE"
+  # Detach hard: nohup + disown so the subshell survives the wrapper exit
+  # (tool-call shells reap the process group; a plain `( ... ) &` got wedged
+  #  with the job stuck at "running" after the wrapper exited).
   (
+    trap '' HUP
     run_child_fg >"$OUTFILE" 2>/dev/null
     RC=$?
     # claim check in subshell
@@ -180,8 +228,9 @@ if [ "$DETACH" = "1" ]; then
       echo $((FAILS+1)) > "$CFILE"
       jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$RC" --arg out "$OUTFILE" --argjson failed "$FAILED_JSON"         '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out}' >"$JOB_FILE"
     fi
-  ) &
+  ) </dev/null >>"$OUTFILE" 2>&1 &
   BG_PID=$!
+  disown "$BG_PID" 2>/dev/null || true
   jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg out "$OUTFILE" --argjson pid "$BG_PID"     '{status:"running",job_id:$id,task:$task,output:$out,pid:$pid}' >"$JOB_FILE"
   printf '{"status":"running","job_id":%s,"task":%s,"pid":%s,"output":%s}
 '     "$(printf '%s' "$JOB_ID"|jq -R .)" "$(printf '%s' "$TASK_ID"|jq -R .)" "$BG_PID" "$(printf '%s' "$OUTFILE"|jq -R .)"
