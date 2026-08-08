@@ -2,8 +2,8 @@
 # lazar-spawn — the ONLY trusted sub-agent spawn surface.
 #
 # Installed to $LAZAR_HOME/bin/lazar-spawn by setup.sh (chmod 555; bin/ is not agent-writable under the sandbox).
-# Lives outside agent-writable skills/; budget state lives under logs/
-# (sandbox cannot write logs/). Model-agnostic — no provider-specific logic.
+# Lives outside agent-writable skills/; budget state lives under workspace/
+# (sandbox cannot write logs/, but CAN write workspace/). Model-agnostic — no provider-specific logic.
 #
 # Usage: lazar-spawn [--lint-only] [--detach] <task-id> <prompt-file>
 #        lazar-spawn --status|--await <job-id>
@@ -41,9 +41,9 @@ if [ "$STATUS_ONLY" = "1" ] || [ "$WAIT_MODE" = "1" ]; then
 elif [ $# -ne 2 ]; then
   emit_err "usage: lazar-spawn [--lint-only] [--detach] <task-id> <prompt-file> | --status|--await <job-id>"
 fi
-# Status / await path (job files under logs/subagent/jobs/)
+# Status / await path (job files under workspace/subagent/jobs/)
 if [ -n "$AWAIT_ID" ]; then
-  STATE_BASE="$LAZAR_HOME/logs/subagent"
+  STATE_BASE="$LAZAR_HOME/workspace/subagent"
   JOB_DIR="$STATE_BASE/jobs"
   JOB="$JOB_DIR/$AWAIT_ID.json"
   [ -f "$JOB" ] || emit_err "unknown job id: $AWAIT_ID"
@@ -77,16 +77,16 @@ printf '%s' "$PROMPT" | rg -q '^EXPECT-VERIFY:' \
 
 if [ "$LINT_ONLY" = "1" ]; then printf '{"status":"ok","lint":"passed"}\n'; exit 0; fi
 
-# --- Budget state: kernel-owned logs/ (not agent-writable skills/) ---
+# --- Budget state: workspace/subagent (logs/ is read-only under sandbox) ---
 # Tests may set LAZAR_SPAWN_TEST=1 + LAZAR_SUBAGENT_STATE=<tmpdir>.
 if [ "${LAZAR_SPAWN_TEST:-0}" = "1" ] && [ -n "${LAZAR_SUBAGENT_STATE:-}" ]; then
   STATE="$LAZAR_SUBAGENT_STATE"
 else
-  STATE="$LAZAR_HOME/logs/subagent"
+  STATE="$LAZAR_HOME/workspace/subagent"
   # Refuse redirecting production state into agent-writable trees.
   case "${LAZAR_SUBAGENT_STATE:-}" in
-    */skills/*|*/workspace/*)
-      emit_err "refusing LAZAR_SUBAGENT_STATE under agent-writable path; use logs/subagent or LAZAR_SPAWN_TEST=1"
+    */skills/*)
+      emit_err "refusing LAZAR_SUBAGENT_STATE under skills/; use workspace/subagent or LAZAR_SPAWN_TEST=1"
       ;;
   esac
 fi

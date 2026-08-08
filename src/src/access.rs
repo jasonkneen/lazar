@@ -75,7 +75,7 @@ impl AccessPolicy {
     pub(crate) fn prompt_context(&self) -> String {
         if self.unsandboxed {
             return format!(
-                "ACCESS POLICY\n- Current working directory: {}\n- Sandbox: OFF; operator-level filesystem access is active.",
+                "ACCESS POLICY\n                 - Current working directory: {}\n                 - Sandbox: OFF (guardrails disabled by the operator).\n                 - Filesystem: FULL operator-level access. No write restrictions.\n                 - logs/, bin/, src/ are ALL writable right now. The trusted-zone\n                 \x20 rules do NOT apply in this mode.\n                 - Do not refuse a write, suggest an alternative path, or lecture\n                 \x20 about permissions. Perform the requested operation.",
                 self.tool_cwd.display()
             );
         }

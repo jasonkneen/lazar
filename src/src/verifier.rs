@@ -334,7 +334,21 @@ pub fn grounding_failure_reason(
             extra
         ));
     }
-    if has_verify_marker && parsed.claims.is_empty() {
+    // Empty `[VERIFY]…[/VERIFY]` with no claims:
+    // - If the model also made completion/fabrication claims → hard fail (must prove work).
+    // - If it's a pure chat/analysis turn (hello, status, Q&A) → ignore the empty block.
+    //   Models often emit a decorative empty VERIFY out of habit; forcing a loud
+    //   "Kernel requested correction 1/2" on "hello" is worse than silent ignore.
+    if has_verify_marker && parsed.claims.is_empty() && !parsed.malformed && parsed.invalid_lines.is_empty()
+    {
+        if has_completion_claim || fabrication_flagged {
+            return Some(
+                "VERIFY markers present but no parseable claims were found inside the block".into(),
+            );
+        }
+        // Decorative empty VERIFY on a non-claim turn — not a grounding failure.
+    } else if has_verify_marker && parsed.claims.is_empty() {
+        // Malformed/invalid empty block still fails when markers are broken.
         return Some(
             "VERIFY markers present but no parseable claims were found inside the block".into(),
         );
@@ -1111,6 +1125,27 @@ mod tests {
     }
 
     #[test]
+    fn empty_verify_without_completion_claims_is_not_a_grounding_failure() {
+        let text = "Hello! I'm here. What would you like to work on?\n\n[VERIFY]\n[/VERIFY]";
+        let parsed = parse_verify_blocks_strict(text);
+        assert!(parsed.claims.is_empty());
+        assert!(!parsed.malformed);
+        let report = verify_all(&parsed.claims);
+        assert!(
+            grounding_failure_reason(&report, false, &parsed, true, false).is_none(),
+            "decorative empty VERIFY on a greeting must not force a correction retry"
+        );
+    }
+
+    #[test]
+    fn empty_verify_with_completion_claim_still_fails() {
+        let parsed = parse_verify_blocks_strict("[VERIFY]\n[/VERIFY]");
+        let report = verify_all(&parsed.claims);
+        let reason = grounding_failure_reason(&report, false, &parsed, true, true);
+        assert!(reason.is_some());
+    }
+
+    #[test]
     fn invalid_lines_get_a_specific_grounding_reason() {
         let text = "[VERIFY]\nexists=/tmp\nbogus=nope\n[/VERIFY]";
         let parsed = parse_verify_blocks_strict(text);
@@ -1257,7 +1292,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn contains_finds_match_beyond_64kb() {
         let path = std::env::temp_dir().join(format!(
             "lazar-contains-deep-{}-{}",
@@ -1296,6 +1330,7 @@ mod tests {
     }
 
 
+    #[test]
     fn contains_claim_survives_multibyte_char_at_read_cap() {
         // Regression: a '─' straddling the 64KB cap panicked
         // ("end byte index 65536 is not a char boundary").

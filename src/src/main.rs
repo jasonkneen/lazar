@@ -669,9 +669,14 @@ fn parse_sse_reader<R: BufRead>(
 
     for line in reader.lines() {
         let line = line?;
-        let data = match line.strip_prefix("data: ") {
-            Some(d) => d,
-            None => continue,
+        // Anthropic sends `data: {...}` (space after colon). Kimi Code / Allegro
+        // sends `data:{...}` (no space). Accept both.
+        let data = if let Some(d) = line.strip_prefix("data: ") {
+            d
+        } else if let Some(d) = line.strip_prefix("data:") {
+            d
+        } else {
+            continue;
         };
         if data.is_empty() {
             continue;

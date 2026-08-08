@@ -43,3 +43,4 @@ Desktop.ini
 # We DO commit src/Cargo.lock — lazar is a binary, not a library, and
 # locking dependency versions makes reproducible builds across machines.
 /.claude/worktrees
+/workspace/evals

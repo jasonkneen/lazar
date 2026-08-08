@@ -34,8 +34,16 @@ chmod 555 "$TMP_BIN"
 chflags nouchg "$LAZAR_HOME/bin/lazar" 2>/dev/null || true
 mv -f "$TMP_BIN" "$LAZAR_HOME/bin/lazar"
 
-chflags uchg "$LAZAR_HOME/bin/lazar"
-chmod -R a-w "$LAZAR_HOME/src"
-
-echo "[kernel-build] done. Kernel rebuilt and locked."
+# Guardrails: re-lock unless the operator has opted out.
+# LAZAR_GUARDRAILS=off keeps bin/ + src/ writable after a rebuild.
+if [ "${LAZAR_GUARDRAILS:-on}" = "off" ]; then
+    chflags nouchg "$LAZAR_HOME/bin/lazar" 2>/dev/null || true
+    chmod u+w "$LAZAR_HOME/bin/lazar" 2>/dev/null || true
+    chmod -R u+w "$LAZAR_HOME/src"
+    echo "[kernel-build] done. Kernel rebuilt — LEFT UNLOCKED (LAZAR_GUARDRAILS=off)."
+else
+    chflags uchg "$LAZAR_HOME/bin/lazar"
+    chmod -R a-w "$LAZAR_HOME/src"
+    echo "[kernel-build] done. Kernel rebuilt and locked."
+fi
 echo "[kernel-build] try:  lazar -p 'hello'"
