@@ -1173,7 +1173,7 @@ fn run_agent(
     let max_grounding_retries = env::var("LAZAR_GROUNDING_RETRIES")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+        .unwrap_or(2);
     let mut grounding_retries_used: u32 = 0;
 
     loop {
@@ -1349,7 +1349,19 @@ fn run_agent(
             // The agent declares testable claims; the kernel runs them.
             // This is the ironclad layer: model can't lie about file
             // state because the kernel does the stat, not the model.
-            let parsed_verify = verifier::parse_verify_blocks_strict(&final_text);
+            let mut parsed_verify = verifier::parse_verify_blocks_strict(&final_text);
+            // Hard budget: models that dump 14 fragile contains= claims thrash
+            // the correction loop. Cap at 8; excess lines become invalid.
+            const MAX_VERIFY_CLAIMS: usize = 8;
+            if parsed_verify.claims.len() > MAX_VERIFY_CLAIMS {
+                let extra = parsed_verify.claims.len() - MAX_VERIFY_CLAIMS;
+                parsed_verify.invalid_lines.push(format!(
+                    "too many VERIFY claims ({}); max {MAX_VERIFY_CLAIMS} — drop contains= prose matches; prefer exists=/size_at_least=",
+                    parsed_verify.claims.len()
+                ));
+                parsed_verify.claims.truncate(MAX_VERIFY_CLAIMS);
+                let _ = extra;
+            }
             let claims = &parsed_verify.claims;
             let verify_report = if !claims.is_empty() {
                 verifier::verify_all(claims)

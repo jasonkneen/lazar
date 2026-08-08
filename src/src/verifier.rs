@@ -395,8 +395,16 @@ pub fn format_grounding_retry_prompt(
         "Valid bash calls observed in this invocation: {tool_uses_in_invocation}.\n"
     ));
     out.push_str(
-        "Use bash now to inspect the real state and correct the work. Do not repeat a completion claim unless the evidence supports it. End with a new [VERIFY] block that matches the actual filesystem. If the task cannot be completed, state that plainly without claiming success.",
+        r#"CORRECTIVE RULES (mandatory):
+1. Run bash now. Inspect real paths with rg/wc/ls - do not invent substrings from memory.
+2. DROP every failed claim. Do not rephrase a failed contains= into another guessed quote.
+3. Prefer exists= and size_at_least= over contains=. Use contains= only with a SHORT unique token (<=80 chars) copied from this turn's tool output.
+4. Max 8 VERIFY claims. Never claim line counts, paraphrased comments, or whole-file prose matches.
+5. Analysis/summary answers: omit [VERIFY] entirely and avoid past-tense completion language (I fixed / implemented and tested).
+6. If you cannot prove an outcome, say so plainly without a VERIFY block.
+End with either (a) a new minimal [VERIFY] that only asserts what tools just proved, or (b) no VERIFY and no success claims."#,
     );
+
     out
 }
 
@@ -415,7 +423,7 @@ pub fn format_grounding_retry_prompt(
 //   size=<path>:<n>           — file size in bytes (exact)
 //   size_at_least=<path>:<n>  — file size >= n bytes
 //   size_at_most=<path>:<n>   — file size <= n bytes
-//   contains=<path>:<substr>  — file contains substring (head 64KB)
+//   contains=<path>:<substr>  — file contains substring (full file, max 8MB; needle max 160 chars)
 //   mtime_within=<path>:<sec> — file mtime within last <sec> seconds
 //
 // One claim per line inside `[VERIFY]...[/VERIFY]`.
@@ -692,20 +700,31 @@ pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
         }),
         VerifyClaim::Contains(path, needle) => {
             let p = expand_path(path);
-            const READ_CAP: usize = 65_536;
-            match read_regular_file_head(&p, READ_CAP) {
-                Ok(s) => {
-                    let ok = s.contains(needle.as_str());
-                    ClaimResult {
-                        claim: claim.clone(),
-                        passed: ok,
-                        note: if ok {
-                            format!("contains '{}'", short(needle, 40))
-                        } else {
-                            format!("missing '{}' in head 64KB", short(needle, 40))
-                        },
-                    }
-                }
+            if needle.is_empty() {
+                return ClaimResult {
+                    claim: claim.clone(),
+                    passed: false,
+                    note: "empty contains needle is not allowed".into(),
+                };
+            }
+            if needle.chars().count() > 160 {
+                return ClaimResult {
+                    claim: claim.clone(),
+                    passed: false,
+                    note: "contains needle too long (max 160 chars) — use a short unique token from tool output".into(),
+                };
+            }
+            match file_contains_substr(&p, needle) {
+                Ok(true) => ClaimResult {
+                    claim: claim.clone(),
+                    passed: true,
+                    note: format!("contains '{}'", short(needle, 40)),
+                },
+                Ok(false) => ClaimResult {
+                    claim: claim.clone(),
+                    passed: false,
+                    note: format!("missing '{}' in file (scanned up to 8MB)", short(needle, 40)),
+                },
                 Err(e) => ClaimResult {
                     claim: claim.clone(),
                     passed: false,
@@ -758,6 +777,62 @@ fn read_regular_file_head(path: &Path, cap: usize) -> io::Result<String> {
     let mut bytes = Vec::with_capacity(cap);
     file.read_to_end(&mut bytes)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Full-file substring search for VERIFY `contains=` claims.
+/// Caps scan at 8MB so a malicious/huge path cannot hang the kernel.
+/// Uses overlapping windows so matches across chunk boundaries are found.
+fn file_contains_substr(path: &Path, needle: &str) -> io::Result<bool> {
+    use std::io::Read;
+    const MAX_SCAN: u64 = 8 * 1024 * 1024;
+    const CHUNK: usize = 256 * 1024;
+
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "VERIFY contains requires a regular non-symlink file",
+        ));
+    }
+    let needle_b = needle.as_bytes();
+    if needle_b.is_empty() {
+        return Ok(true);
+    }
+    let mut file = fs::File::open(path)?;
+    let mut buf = vec![0u8; CHUNK];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut scanned: u64 = 0;
+    let overlap = needle_b.len().saturating_sub(1);
+
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let take = n.min(MAX_SCAN.saturating_sub(scanned) as usize);
+        if take == 0 {
+            break;
+        }
+        scanned += take as u64;
+        let chunk = &buf[..take];
+        // Search in carry+chunk
+        let mut window = Vec::with_capacity(carry.len() + chunk.len());
+        window.extend_from_slice(&carry);
+        window.extend_from_slice(chunk);
+        if window.windows(needle_b.len()).any(|w| w == needle_b) {
+            return Ok(true);
+        }
+        // Keep tail for boundary matches
+        if window.len() > overlap {
+            carry = window[window.len() - overlap..].to_vec();
+        } else {
+            carry = window;
+        }
+        if scanned >= MAX_SCAN {
+            break;
+        }
+    }
+    Ok(false)
 }
 
 /// Run every claim, return a report.
@@ -986,7 +1061,7 @@ mod tests {
         assert!(prompt.contains("16 of 16 claims failed"));
         assert!(prompt.contains("/tmp/fabricated-0"));
         assert!(prompt.contains("and 8 more failed claims"));
-        assert!(prompt.contains("Do not repeat a completion claim"));
+        assert!(prompt.contains("DROP every failed claim"));
         assert!(prompt.contains("Valid bash calls observed in this invocation: 0"));
     }
 
@@ -1181,6 +1256,45 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn contains_finds_match_beyond_64kb() {
+        let path = std::env::temp_dir().join(format!(
+            "lazar-contains-deep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut data = vec![b'x'; 70_000];
+        data.extend_from_slice(b"UNIQUE_TOKEN_DEEP_IN_FILE");
+        std::fs::write(&path, &data).unwrap();
+        let claim = VerifyClaim::Contains(path.clone(), "UNIQUE_TOKEN_DEEP_IN_FILE".into());
+        let result = check_claim(&claim);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.passed, "note={}", result.note);
+    }
+
+    #[test]
+    fn contains_rejects_overlong_needle() {
+        let path = std::env::temp_dir().join(format!(
+            "lazar-contains-long-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"hello").unwrap();
+        let needle = "n".repeat(200);
+        let claim = VerifyClaim::Contains(path.clone(), needle);
+        let result = check_claim(&claim);
+        let _ = std::fs::remove_file(&path);
+        assert!(!result.passed);
+        assert!(result.note.contains("too long"));
+    }
+
+
     fn contains_claim_survives_multibyte_char_at_read_cap() {
         // Regression: a '─' straddling the 64KB cap panicked
         // ("end byte index 65536 is not a char boundary").

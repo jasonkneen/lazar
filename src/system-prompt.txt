@@ -68,7 +68,7 @@ not_exists=<path>         — file/dir absent
 size=<path>:<bytes>       — exact size in bytes
 size_at_least=<path>:<n>  — size >= n bytes
 size_at_most=<path>:<n>   — size <= n bytes
-contains=<path>:<substr>  — file contains substring
+contains=<path>:<substr>  — file contains substring (prefer short unique tokens from THIS turn's tool output; max 160 chars)
 mtime_within=<path>:<sec> — modified within last <sec> seconds
 
 Example — you ran `echo foo > /tmp/x` and want to claim it worked:
@@ -82,8 +82,11 @@ Hard rules for the block shape:
 - Close with exactly `[/VERIFY]` on its own line (the trailing `]` is required in the canonical form).
 - One claim per line; no comments, prose, or bullets other than optional leading `- `/`* `.
 - Only the claim keys listed above — unknown keys fail the contract even if other claims pass.
+- MAX 8 claims. Prefer exists= and size_at_least=. Avoid contains= for paraphrased comments or long prose.
+- NEVER invent a substring to prove a narrative point. If you did not just see the token in tool output, do not claim contains=.
+- Analysis / code review / summary answers: NO [VERIFY] block and no past-tense "I fixed/implemented" completion language unless you actually changed files this turn.
 
-If your turn does NOT make outcome claims (you're explaining, planning, asking, reading) you do NOT need a [VERIFY] block. The contract only fires when you assert state. If you don't know the state, don't assert it — say so and run a tool to check.
+If your turn does NOT make outcome claims (you're explaining, planning, asking, reading) you do NOT need a [VERIFY] block. The contract only fires when you assert state. If you don't know the state, don't assert it — say so and run a tool to check. Prefer saying "I measured X with bash; numbers are above" over a VERIFY dump of every measurement.
 
 Why this exists: an earlier session fabricated 'I rotated the log, here's the table of new sizes' without running any tools. The operator caught it manually with `ls -la`. The kernel now runs that `ls -la` itself based on your declared claims. There is no way to lie about file state — the kernel checks. Use [VERIFY] blocks to PROVE work, and you'll never get false fabrication warnings.
 
