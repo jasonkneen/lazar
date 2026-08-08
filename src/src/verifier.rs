@@ -764,6 +764,7 @@ pub fn check_claim(claim: &VerifyClaim) -> ClaimResult {
 /// Read no more than `cap` bytes from a regular, non-symlinked file. VERIFY
 /// claims are model-controlled, so they must not consume streams such as
 /// /dev/zero or FIFOs while the kernel checks a claim.
+#[allow(dead_code)] // used by unit tests; production contains= uses file_contains_substr
 fn read_regular_file_head(path: &Path, cap: usize) -> io::Result<String> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
