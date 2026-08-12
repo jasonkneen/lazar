@@ -9,6 +9,7 @@ nav:
       - Configuration: getting-started/configuration.md
   - Concepts:
       - Architecture: concepts/architecture.md
+      - VERIFY contract: concepts/verify-contract.md
       - Sandbox: concepts/sandbox.md
       - Kernel guardrails: concepts/kernel-guardrails.md
   - CLI:

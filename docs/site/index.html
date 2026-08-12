@@ -316,6 +316,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#tent-pole-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tent-pole features
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#what-is-lazar" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -538,6 +549,34 @@
     
   
     Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="concepts/verify-contract/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    VERIFY contract
   
 
     
@@ -1269,6 +1308,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#tent-pole-features" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tent-pole features
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#what-is-lazar" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1340,12 +1390,45 @@ Everything else is emergent.</p>
 ├── workspace/             scratchpad, the agent&#39;s cwd, projects you build
 └── logs/stream.jsonl      append-only event stream (kernel auto-rotates at ~10MB)
 </code></pre></div>
+<h2 id="tent-pole-features">Tent-pole features<a class="headerlink" href="#tent-pole-features" title="Permanent link">#</a></h2>
+<p><strong>1. The agent can't lie about what it did — <a href="concepts/verify-contract/">VERIFY contract</a></strong>
+When the agent claims it created, rotated, or fixed a file, the kernel parses
+its <code>[VERIFY]</code> block and re-checks every claim against the real filesystem
+(<code>stat</code>, <code>exists</code>, <code>contains</code>) before accepting the answer. Failed claims force
+a correction turn; a second failure ends the run with <code>grounding_failed</code>.
+"Done" is verified, not trusted — and the check is compiled into the kernel,
+so the agent can never patch it away.</p>
+<p><strong>2. Sealed kernel, evolving agent — <a href="concepts/architecture/">Architecture</a></strong>
+The runner is locked with <code>chflags uchg</code> after build. The agent can read its
+own source but can never modify it. All growth happens in <code>skills/</code> — markdown
+files the agent reads and writes itself. New capability needed? The agent
+authors a new skill. The kernel stays small and permanent; the <em>being</em> grows.</p>
+<p><strong>3. Every event, on disk, forever — <a href="integration/sessions/">Sessions &amp; memory</a></strong>
+The kernel appends everything — prompts, responses, tool calls, results,
+verify reports — to an append-only JSONL stream, and deliberately does <strong>not</strong>
+auto-load it into the next conversation. Memory management, context loading,
+summarization, recency heuristics: all of it lives in skills, where it can
+evolve. Nothing is hidden in a black-box database.</p>
+<p><strong>4. One tool, full power, real guardrails</strong>
+The agent gets exactly one tool: <code>bash(command)</code>, run through <code>sandbox-exec</code>.
+Write zones, blocked paths, and command vetoes are enforced at the syscall
+boundary — not by asking the model nicely. Guardrails can be toggled off
+explicitly (<code>lazar-guardrails.sh off</code>), and the system prompt tells the agent
+which mode it's in so it never guesses.</p>
+<p><strong>5. Delegation with receipts — <a href="integration/subagents/">Sub-agents</a></strong>
+<code>bin/lazar-spawn</code> runs child agents for isolated, file-verifiable work. Child
+prompts must be stranger-complete (absolute paths, a SUCCESS line, EXPECT-VERIFY
+claims authored by the parent), and the spawn binary re-checks the child's
+declared claims before reporting success. Bounded retries, wedged-child kills,
+recursion depth caps — no runaway agent trees.</p>
+<p><strong>6. A lifecycle you can hook — <a href="integration/hooks/">Hooks protocol</a></strong>
+User-controlled scripts in <code>hooks/&lt;event&gt;.d/</code> fire at session-start,
+user-prompt, pre-tool, post-tool, session-end, and tick. Hooks can inject
+context, veto tool calls, and shape behavior — without touching the kernel.</p>
 <h2 id="what-is-lazar">What is lazar?<a class="headerlink" href="#what-is-lazar" title="Permanent link">#</a></h2>
 <p>lazar is a small Rust runner that gives a language model exactly one tool —
 sandboxed <code>bash</code> — and gets out of the way. There is no autopilot, no planner
-framework, no plugin SDK. The agent's <em>capabilities</em> are markdown files
-("skills") on disk that it reads and writes itself. State lives on disk.
-Everything else is emergent.</p>
+framework, no plugin SDK. State lives on disk. Everything else is emergent.</p>
 <p>The kernel does three things:</p>
 <ol>
 <li>Takes a prompt via <code>-p</code>.</li>
@@ -1357,17 +1440,18 @@ Everything else is emergent.</p>
 <li><a href="getting-started/install/">Install</a> — clone, <code>setup.sh</code>, first prompt</li>
 <li><a href="getting-started/configuration/">Configuration</a> — API keys, model selection, backends</li>
 <li><a href="concepts/architecture/">Architecture</a> — kernel vs skills vs memory vs workspace</li>
+<li><a href="concepts/verify-contract/">VERIFY contract</a> — kernel-enforced honesty: the agent can't lie about file state</li>
 <li><a href="cli/lazar/"><code>lazar</code> CLI reference</a> — every flag, verified from <code>--help</code></li>
 <li><a href="api/env-vars/">Environment variables</a> — the complete <code>LAZAR_*</code> table</li>
 <li><a href="integration/hooks/">Hooks protocol</a> — lifecycle scripts in <code>hooks/&lt;event&gt;.d/</code></li>
 <li><a href="integration/subagents/">Sub-agents</a> — the <code>bin/lazar-spawn</code> delegation surface</li>
 </ul>
 <h2 id="the-bet">The bet<a class="headerlink" href="#the-bet" title="Permanent link">#</a></h2>
-<p>The kernel records <em>everything</em> to an append-only JSONL stream and deliberately
-does <strong>not</strong> auto-load it into the next conversation. Memory management, context
-loading, summarization, recency heuristics — all of it lives in skills, where it
-can evolve. The kernel is sealed (<code>chflags uchg</code>); the agent can read its own
-source but can never modify its runner. Evolution happens only in <code>skills/</code>.</p>
+<p>A language model plus one honest tool, a sealed runner, and a filesystem it
+can grow into is enough. Capabilities are data, not code paths. Trust is
+enforced, not assumed. The interesting parts — memory, judgment, delegation,
+self-repair — are all skills, which means they improve every session instead
+of waiting for a kernel release.</p>
 
 
 
