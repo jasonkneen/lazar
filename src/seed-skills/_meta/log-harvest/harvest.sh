@@ -18,9 +18,9 @@
 # add new material. The current stream.jsonl is always re-scanned (it grows).
 set -uo pipefail
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
-LOGS="$LAZAR_HOME/logs"
-JOURNAL="$LAZAR_HOME/memory/work-journal.md"
-MARKER="$LAZAR_HOME/memory/.harvested"
+LOGS="$LAZAR_HOME/user/logs"
+JOURNAL="$LAZAR_HOME/user/memory/work-journal.md"
+MARKER="$LAZAR_HOME/user/memory/.harvested"
 mkdir -p "$(dirname "$JOURNAL")"
 touch "$MARKER"
 

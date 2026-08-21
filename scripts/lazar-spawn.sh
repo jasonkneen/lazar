@@ -18,8 +18,38 @@
 # against the filesystem — the child's self-report is not trusted.
 set -uo pipefail
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
+HELPER_DIR=$(cd "$(dirname "$0")" && pwd)
 
 emit_err(){ printf '{"status":"error","reason":%s}\n' "$(printf '%s' "$1" | jq -R .)"; exit 1; }
+
+# --- Claim checking: ONE implementation shared by the foreground, detached
+# and sweeper paths. `check_claims` reads one claim per line on stdin and
+# sets CLAIMS_MATCHED (true|false), CLAIMS_COUNT and the FAILED_CLAIMS array.
+# The child's self-report is never consulted: every claim is re-checked
+# against the real filesystem.
+check_one(){
+  local c="$1" p n min pn
+  case "$c" in
+    exists=*)        [ -e "${c#exists=}" ] ;;
+    contains=*)      pn="${c#contains=}"; p="${pn%%:*}"; n="${pn#*:}"; [ -f "$p" ] && rg -qF -- "$n" "$p" ;;
+    size_at_least=*) pn="${c#size_at_least=}"; p="${pn%%:*}"; min="${pn#*:}"; [ -f "$p" ] && [ "$(wc -c <"$p")" -ge "$min" ] ;;
+    *) return 1 ;;
+  esac
+}
+check_claims(){
+  local claim
+  CLAIMS_MATCHED=true; CLAIMS_COUNT=0; FAILED_CLAIMS=()
+  while IFS= read -r claim; do
+    claim="$(printf '%s' "$claim" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [ -z "$claim" ] && continue
+    CLAIMS_COUNT=$((CLAIMS_COUNT+1))
+    check_one "$claim" || { CLAIMS_MATCHED=false; FAILED_CLAIMS+=("$claim"); }
+  done
+  [ "$CLAIMS_COUNT" -gt 0 ] || CLAIMS_MATCHED=false
+}
+failed_claims_json(){
+  printf '%s\n' "${FAILED_CLAIMS[@]:-}" | jq -R . | jq -s 'map(select(length>0))'
+}
 
 LINT_ONLY=0
 DETACH=0
@@ -43,43 +73,19 @@ elif [ $# -ne 2 ]; then
 fi
 # Status / await path (job files under workspace/subagent/jobs/)
 if [ -n "$AWAIT_ID" ]; then
-  STATE_BASE="$LAZAR_HOME/workspace/subagent"
+  [[ "$AWAIT_ID" =~ ^[A-Za-z0-9._-]+$ ]] || emit_err "job id must be a safe slug"
+  STATE_BASE="$LAZAR_HOME/user/workspace/subagent"
   JOB_DIR="$STATE_BASE/jobs"
   JOB="$JOB_DIR/$AWAIT_ID.json"
   [ -f "$JOB" ] || emit_err "unknown job id: $AWAIT_ID"
-  # Sweeper: a "running" job whose pid is dead is wedged (e.g. the detached
-  # subshell was reaped before writing the final status). Re-run the claim
-  # check here and finalize the job from the child's out-log + filesystem.
+  # A missing supervisor cannot provide a trustworthy exit status.
   sweep_job(){
-    local st pid task out c matched failed_json p n min pn
-    st=$(jq -r '.status // empty' "$JOB" 2>/dev/null || true)
+    local st pid
+    st=$(jq -r '.status // empty' "$JOB")
     [ "$st" = "running" ] || return 0
-    pid=$(jq -r '.pid // 0' "$JOB" 2>/dev/null || echo 0)
-    if [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null; then return 0; fi
-    # Worker pid is dead but job still "running" -> the detached subshell was
-    # reaped before finalizing. Finalize here by re-checking the stored claims.
-    task=$(jq -r '.task // empty' "$JOB" 2>/dev/null)
-    out=$(jq -r '.output // empty' "$JOB" 2>/dev/null)
-    [ -f "$JOB.claims" ] || { jq -n --arg id "$AWAIT_ID" '{status:"error",job_id:$id,wedged:true,reason:"worker died and no stored claims to re-check"}' >"$JOB"; return 0; }
-    matched=true; failed_json='[]'
-    FAILS_LIST=()
-    while IFS= read -r c; do
-      c="$(printf '%s' "$c" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-      [ -z "$c" ] && continue
-      case "$c" in
-        exists=*)        [ -e "${c#exists=}" ] || { matched=false; FAILS_LIST+=("$c"); } ;;
-        contains=*)      pn="${c#contains=}"; p="${pn%%:*}"; n="${pn#*:}"; { [ -f "$p" ] && rg -qF "$n" "$p"; } || { matched=false; FAILS_LIST+=("$c"); } ;;
-        size_at_least=*) pn="${c#size_at_least=}"; p="${pn%%:*}"; min="${pn#*:}"; { [ -f "$p" ] && [ "$(wc -c <"$p")" -ge "$min" ]; } || { matched=false; FAILS_LIST+=("$c"); } ;;
-        *) matched=false; FAILS_LIST+=("$c") ;;
-      esac
-    done <"$JOB.claims"
-    failed_json=$(printf '%s
-' "${FAILS_LIST[@]:-}" | jq -R . | jq -s 'map(select(length>0))')
-    if [ "$matched" = "true" ]; then
-      jq -n --arg id "$AWAIT_ID" --arg task "$task" --arg out "$out"         '{status:"ok",job_id:$id,task:$task,matched:true,finalized_by:"sweeper",output:$out}' >"$JOB"
-    else
-      jq -n --arg id "$AWAIT_ID" --arg task "$task" --arg out "$out" --argjson failed "$failed_json"         '{status:"fail",job_id:$id,task:$task,matched:false,finalized_by:"sweeper",failed_claims:$failed,output:$out}' >"$JOB"
-    fi
+    pid=$(jq -r '.pid // 0' "$JOB")
+    [ "$pid" != "0" ] && kill -0 "$pid" 2>/dev/null && return 0
+    jq '. + {status:"error",matched:false,reason:"job supervisor exited without a final record"}' "$JOB" >"$JOB.tmp" && mv "$JOB.tmp" "$JOB"
   }
   sweep_job
   if [ "$STATUS_ONLY" = "1" ]; then
@@ -100,7 +106,10 @@ if [ -n "$AWAIT_ID" ]; then
 fi
 
 TASK_ID="$1"; PROMPT_FILE="$2"
+[[ "$TASK_ID" =~ ^[A-Za-z0-9._-]+$ ]] || emit_err "task id must be a safe slug"
 [ -f "$PROMPT_FILE" ] || emit_err "prompt file not found: $PROMPT_FILE"
+PROMPT_BYTES=$(wc -c <"$PROMPT_FILE" | tr -d '[:space:]')
+[ "$PROMPT_BYTES" -le 9000 ] || emit_err "prompt is $PROMPT_BYTES bytes; context limit is 9000 bytes"
 PROMPT="$(cat "$PROMPT_FILE")"
 
 # --- Lint ---
@@ -111,6 +120,14 @@ printf '%s' "$PROMPT" | rg -q '^SUCCESS:' \
 printf '%s' "$PROMPT" | rg -q '^EXPECT-VERIFY:' \
   || emit_err "prompt has no EXPECT-VERIFY: block — declare the claims the child must satisfy"
 
+CLAIMS=$(printf '%s\n' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }')
+[ -n "$(printf '%s' "$CLAIMS" | tr -d '[:space:]')" ] || emit_err "EXPECT-VERIFY block parsed to zero claims"
+while IFS= read -r claim; do
+  claim=$(printf '%s' "$claim" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -z "$claim" ] && continue
+  case "$claim" in exists=/*|contains=/*:*|size_at_least=/*:*) ;; *) emit_err "invalid verification claim: $claim" ;; esac
+done <<< "$CLAIMS"
+
 if [ "$LINT_ONLY" = "1" ]; then printf '{"status":"ok","lint":"passed"}\n'; exit 0; fi
 
 # --- Budget state: workspace/subagent (logs/ is read-only under sandbox) ---
@@ -118,7 +135,7 @@ if [ "$LINT_ONLY" = "1" ]; then printf '{"status":"ok","lint":"passed"}\n'; exit
 if [ "${LAZAR_SPAWN_TEST:-0}" = "1" ] && [ -n "${LAZAR_SUBAGENT_STATE:-}" ]; then
   STATE="$LAZAR_SUBAGENT_STATE"
 else
-  STATE="$LAZAR_HOME/workspace/subagent"
+  STATE="$LAZAR_HOME/user/workspace/subagent"
   # Refuse redirecting production state into agent-writable trees.
   case "${LAZAR_SUBAGENT_STATE:-}" in
     */skills/*)
@@ -136,21 +153,21 @@ SESS_KEY=$(printf '%s' "$SESS_KEY" | tr -c 'A-Za-z0-9._-' '_')
 SESS="$STATE/.session-${SESS_KEY}-spawns"
 LOCK="$STATE/.session-${SESS_KEY}.lock"
 
-bump_session(){
-  local count
-  count=$(cat "$SESS" 2>/dev/null || echo 0)
-  [ "$count" -ge "$BUDGET" ] && return 1
-  echo $((count+1)) > "$SESS"
-  return 0
-}
-
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"$LOCK"
-  flock 9 || emit_err "could not lock session spawn budget"
-  bump_session || emit_err "session spawn budget ($BUDGET) exhausted — stop and reassess"
-else
-  bump_session || emit_err "session spawn budget ($BUDGET) exhausted — stop and reassess"
-fi
+# POSIX flock via Python works on macOS too, and is released before execution.
+python3 - "$LOCK" "$SESS" "$BUDGET" <<'PYBUDGET'
+import fcntl, pathlib, sys
+lock, state, budget = sys.argv[1:]
+with open(lock, 'a') as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX)
+    path = pathlib.Path(state)
+    count = int(path.read_text()) if path.exists() else 0
+    if count >= int(budget):
+        raise SystemExit(1)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(str(count + 1))
+    temporary.replace(path)
+PYBUDGET
+[ "$?" -eq 0 ] || emit_err "session spawn budget ($BUDGET) exhausted — stop and reassess"
 
 # --- Per-task/prompt ceiling ---
 KEY=$(printf '%s' "$TASK_ID"$'\x00'"$PROMPT" | shasum -a 256 | cut -d' ' -f1)
@@ -159,12 +176,16 @@ FAILS=$(cat "$CFILE" 2>/dev/null || echo 0)
 [ "$FAILS" -ge "$CEILING" ] && emit_err "task '$TASK_ID' hit failure ceiling ($CEILING) — fix the task, don't respawn"
 
 # --- Test hook: simulate a failed attempt without a real child ---
-if [ "${SPAWN_TEST_NOOP:-}" = "fail" ]; then echo $((FAILS+1)) > "$CFILE"; emit_err "noop-fail (test)"; fi
+if [ "${SPAWN_TEST_NOOP:-}" = "fail" ]; then python3 "$HELPER_DIR/spawn-supervisor.py" --failure "$CFILE"; emit_err "noop-fail (test)"; fi
 
 # --- Bounded child spawn ---
 LAZAR_BIN="${LAZAR_BIN:-$LAZAR_HOME/bin/lazar}"
-TIMEOUT_CMD="$(command -v timeout || command -v gtimeout || true)"
+HELPER_DIR=$(cd "$(dirname "$0")" && pwd)
+TIMEOUT_RUNNER="$HELPER_DIR/run-with-timeout.py"
+SUPERVISOR="$HELPER_DIR/spawn-supervisor.py"
+[ -f "$TIMEOUT_RUNNER" ] || emit_err "missing bounded runner: $TIMEOUT_RUNNER"
 KILL_AFTER="${LAZAR_SPAWN_TIMEOUT:-300}"
+[[ "$KILL_AFTER" =~ ^[0-9]+$ && "$KILL_AFTER" -gt 0 ]] || emit_err "spawn timeout must be a positive integer"
 CHILD_DEPTH=$(( ${LAZAR_DEPTH:-0} + 1 ))
 OUTFILE="$STATE/out-$KEY.log"
 
@@ -174,106 +195,68 @@ JOB_ID="${TASK_ID}-$(date +%s)-$$"
 JOB_FILE="$JOB_DIR/$JOB_ID.json"
 
 run_child_fg(){
-  if [ -n "$TIMEOUT_CMD" ]; then
-    "$TIMEOUT_CMD" "$KILL_AFTER" env LAZAR_DEPTH="$CHILD_DEPTH" "$LAZAR_BIN" -p "$PROMPT" --output-format stream-json
-  else
-    env LAZAR_DEPTH="$CHILD_DEPTH" "$LAZAR_BIN" -p "$PROMPT" --output-format stream-json
-  fi
+  python3 "$TIMEOUT_RUNNER" --timeout "$KILL_AFTER" -- env LAZAR_DEPTH="$CHILD_DEPTH" "$LAZAR_BIN" -p "$PROMPT" --output-format stream-json
 }
 
+# Write the final job record. $1 = matched (true|false), $2 = child rc,
+# $3 = failed-claims JSON array (only read when matched=false).
 finish_job(){
   local matched="$1" rc="$2" failed_json="$3"
-  if [ "$matched" = "true" ]; then
-    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE"       '{status:"ok",job_id:$id,task:$task,matched:true,child_rc:$rc,output:$out}' >"$JOB_FILE"
+  if [ "$matched" = "true" ] && [ "$rc" -eq 0 ]; then
+    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" \
+      '{status:"ok",job_id:$id,task:$task,matched:true,child_rc:$rc,output:$out}' >"$JOB_FILE"
   else
-    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" --argjson failed "$failed_json"       '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out}' >"$JOB_FILE"
+    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" --argjson failed "$failed_json" \
+      '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out}' >"$JOB_FILE"
   fi
 }
 
-# Shared claim parser (indented lines only after EXPECT-VERIFY:)
+# Claims are the indented lines that follow EXPECT-VERIFY: in the prompt.
 parse_claims(){
   printf '%s' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }'
 }
 
+# Persist the claims beside the job record so --status/--await can finalize a
+# wedged job without the original prompt.
 CLAIMS_FILE="$JOB_FILE.claims"
-printf '%s' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }' >"$CLAIMS_FILE"
+parse_claims >"$CLAIMS_FILE"
 
 if [ "$DETACH" = "1" ]; then
-  jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg out "$OUTFILE"     '{status:"running",job_id:$id,task:$task,output:$out,pid:0}' >"$JOB_FILE"
-  # Detach hard: nohup + disown so the subshell survives the wrapper exit
-  # (tool-call shells reap the process group; a plain `( ... ) &` got wedged
-  #  with the job stuck at "running" after the wrapper exited).
-  (
-    trap '' HUP
-    run_child_fg >"$OUTFILE" 2>/dev/null
-    RC=$?
-    # claim check in subshell
-    MATCHED=true
-    FAILED=()
-    while IFS= read -r claim; do
-      claim="$(printf '%s' "$claim" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-      [ -z "$claim" ] && continue
-      case "$claim" in
-        exists=*) [ -e "${claim#exists=}" ] || { MATCHED=false; FAILED+=("$claim"); } ;;
-        contains=*) pn="${claim#contains=}"; p="${pn%%:*}"; n="${pn#*:}"; [ -f "$p" ] && rg -qF "$n" "$p" || { MATCHED=false; FAILED+=("$claim"); } ;;
-        size_at_least=*) pn="${claim#size_at_least=}"; p="${pn%%:*}"; min="${pn#*:}"; [ -f "$p" ] && [ "$(wc -c <"$p")" -ge "$min" ] || { MATCHED=false; FAILED+=("$claim"); } ;;
-        *) MATCHED=false; FAILED+=("$claim") ;;
-      esac
-    done < <(printf '%s' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }')
-    FAILED_JSON=$(printf '%s
-' "${FAILED[@]:-}" | jq -R . | jq -s 'map(select(length>0))')
-    if [ "$MATCHED" = "true" ]; then
-      jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$RC" --arg out "$OUTFILE"         '{status:"ok",job_id:$id,task:$task,matched:true,child_rc:$rc,output:$out}' >"$JOB_FILE"
-    else
-      echo $((FAILS+1)) > "$CFILE"
-      jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$RC" --arg out "$OUTFILE" --argjson failed "$FAILED_JSON"         '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out}' >"$JOB_FILE"
-    fi
-  ) </dev/null >>"$OUTFILE" 2>&1 &
-  BG_PID=$!
-  disown "$BG_PID" 2>/dev/null || true
-  jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg out "$OUTFILE" --argjson pid "$BG_PID"     '{status:"running",job_id:$id,task:$task,output:$out,pid:$pid}' >"$JOB_FILE"
-  printf '{"status":"running","job_id":%s,"task":%s,"pid":%s,"output":%s}
-'     "$(printf '%s' "$JOB_ID"|jq -R .)" "$(printf '%s' "$TASK_ID"|jq -R .)" "$BG_PID" "$(printf '%s' "$OUTFILE"|jq -R .)"
+  [ -f "$SUPERVISOR" ] || emit_err "missing job supervisor: $SUPERVISOR"
+  jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg output "$OUTFILE" \
+    --arg failure_file "$CFILE" --arg claims "$CLAIMS_FILE" --arg runner "$TIMEOUT_RUNNER" --arg binary "$LAZAR_BIN" \
+    --arg prompt "$PROMPT" --arg depth "$CHILD_DEPTH" --argjson timeout "$KILL_AFTER" \
+    '{id:$id,task:$task,output:$output,claims:$claims,runner:$runner,timeout:$timeout,failure_file:$failure_file,
+      argv:["env",("LAZAR_DEPTH="+$depth),$binary,"-p",$prompt,"--output-format","stream-json"]}' >"${JOB_FILE%.json}.spec.json"
+  jq -n --arg id "$JOB_ID" '{status:"starting",job_id:$id}' >"$JOB_FILE"
+  BG_PID=$(python3 "$SUPERVISOR" --detach "$JOB_FILE") || emit_err "cannot start job supervisor"
+  jq -cn --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson pid "$BG_PID" --arg output "$OUTFILE" \
+    '{status:"running",job_id:$id,task:$task,pid:$pid,output:$output}'
   exit 0
 fi
 
 run_child_fg >"$OUTFILE" 2>/dev/null; RC=$?
-if [ "$RC" -eq 124 ]; then echo $((FAILS+1)) > "$CFILE"; emit_err "child timed out after ${KILL_AFTER}s (wedged) — killed"; fi
+if [ "$RC" -eq 124 ]; then python3 "$HELPER_DIR/spawn-supervisor.py" --failure "$CFILE"; emit_err "child timed out after ${KILL_AFTER}s (wedged) — killed"; fi
 
 # --- Independently re-check parent's claims (wrapper is the judge) ---
-check_one(){
-  local c="$1" p n min pn
-  case "$c" in
-    exists=*)        [ -e "${c#exists=}" ] ;;
-    contains=*)      pn="${c#contains=}"; p="${pn%%:*}"; n="${pn#*:}"; [ -f "$p" ] && rg -qF "$n" "$p" ;;
-    size_at_least=*) pn="${c#size_at_least=}"; p="${pn%%:*}"; min="${pn#*:}"; [ -f "$p" ] && [ "$(wc -c <"$p")" -ge "$min" ] ;;
-    *) return 1 ;;
-  esac
-}
-MATCHED=true
-NCLAIMS=0
-FAILED=()
-while IFS= read -r claim; do
-  claim="$(printf '%s' "$claim" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-  [ -z "$claim" ] && continue
-  NCLAIMS=$((NCLAIMS+1))
-  if ! check_one "$claim"; then MATCHED=false; FAILED+=("$claim"); fi
-done < <(printf '%s' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }')
+check_claims <"$CLAIMS_FILE"
 
-if [ "$NCLAIMS" -eq 0 ]; then
-  echo $((FAILS+1)) > "$CFILE"
+if [ "$CLAIMS_COUNT" -eq 0 ]; then
+  python3 "$HELPER_DIR/spawn-supervisor.py" --failure "$CFILE"
   emit_err "EXPECT-VERIFY block parsed to zero claims — malformed prompt, refusing to declare success"
 fi
 
-FAILED_JSON=$(printf '%s\n' "${FAILED[@]:-}" | jq -R . | jq -s 'map(select(length>0))')
+FAILED_JSON=$(failed_claims_json)
 
-if [ "$MATCHED" = "true" ]; then
-  jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$RC" --arg out "$OUTFILE"     '{status:"ok",job_id:$id,task:$task,matched:true,child_rc:$rc,output:$out}' >"$JOB_FILE" 2>/dev/null || true
-  printf '{"status":"ok","job_id":%s,"task":%s,"matched":true,"child_rc":%s,"output":%s}\n'     "$(printf '%s' "$JOB_ID"|jq -R .)" "$(printf '%s' "$TASK_ID"|jq -R .)" "$RC" "$(printf '%s' "$OUTFILE"|jq -R .)"
+if [ "$CLAIMS_MATCHED" = "true" ] && [ "$RC" -eq 0 ]; then
+  finish_job true "$RC" '[]' 2>/dev/null || true
+  printf '{"status":"ok","job_id":%s,"task":%s,"matched":true,"child_rc":%s,"output":%s}\n' \
+    "$(printf '%s' "$JOB_ID"|jq -R .)" "$(printf '%s' "$TASK_ID"|jq -R .)" "$RC" "$(printf '%s' "$OUTFILE"|jq -R .)"
   exit 0
 else
-  echo $((FAILS+1)) > "$CFILE"
-  jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$RC" --arg out "$OUTFILE" --argjson failed "$FAILED_JSON"     '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out}' >"$JOB_FILE" 2>/dev/null || true
-  printf '{"status":"fail","job_id":%s,"task":%s,"matched":false,"child_rc":%s,"failed_claims":%s,"output":%s}\n'     "$(printf '%s' "$JOB_ID"|jq -R .)" "$(printf '%s' "$TASK_ID"|jq -R .)" "$RC" "$FAILED_JSON" "$(printf '%s' "$OUTFILE"|jq -R .)"
+  python3 "$HELPER_DIR/spawn-supervisor.py" --failure "$CFILE"
+  finish_job false "$RC" "$FAILED_JSON" 2>/dev/null || true
+  printf '{"status":"fail","job_id":%s,"task":%s,"matched":false,"child_rc":%s,"failed_claims":%s,"output":%s}\n' \
+    "$(printf '%s' "$JOB_ID"|jq -R .)" "$(printf '%s' "$TASK_ID"|jq -R .)" "$RC" "$FAILED_JSON" "$(printf '%s' "$OUTFILE"|jq -R .)"
   exit 2
 fi

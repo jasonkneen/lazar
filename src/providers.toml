@@ -1,0 +1,86 @@
+# lazar provider catalog.
+#
+# The kernel embeds this file as its built-in default and reads the
+# operator copy at $LAZAR_HOME/providers.toml when present (setup.sh seeds
+# it). Edit the operator copy to add or change providers; it lives outside
+# the agent-writable zones, so a sandboxed agent cannot alter it.
+#
+# Every provider must speak the Anthropic Messages API (the kernel POSTs to
+# <base_url>/v1/messages with an x-api-key header).
+#
+#   id            short handle for --provider / LAZAR_PROVIDER / the TUI picker
+#   name          display name
+#   base_url      endpoint base (no trailing /v1/messages)
+#   key_env       environment variable holding the API key; when unset the
+#                 kernel looks the same name up in the macOS Keychain
+#                 (service "lazar", account = key_env), the convention the
+#                 _meta/env-vars skill uses. Store one with:
+#                   security add-generic-password -a KEY_ENV -s lazar -w
+#   default_model model used when --model / LAZAR_MODEL are not given
+#   models        picker entries (the kernel accepts any model id)
+#   context_window  optional: the model's context window in tokens. The kernel
+#                 compacts a turn (elide old tool output, then summarise old
+#                 rounds) as it nears this, instead of refusing. Default
+#                 200000; LAZAR_CONTEXT_WINDOW overrides it. A provider that
+#                 still reports "too long" triggers one harder compaction.
+#
+# A selected provider is authoritative for endpoint and key; --model and
+# LAZAR_MODEL still override the model. Without --provider / LAZAR_PROVIDER
+# the kernel behaves exactly as before (ANTHROPIC_BASE_URL / ANTHROPIC_API_KEY
+# / MINIMAX_API_KEY), so existing launchers keep working unchanged.
+
+[[providers]]
+id = "anthropic"
+name = "Anthropic"
+base_url = "https://api.anthropic.com"
+key_env = "ANTHROPIC_API_KEY"
+default_model = "claude-sonnet-4-6"
+models = ["claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5"]
+
+[[providers]]
+id = "minimax"
+name = "MiniMax"
+base_url = "https://api.minimax.io/anthropic"
+key_env = "MINIMAX_API_KEY"
+default_model = "MiniMax-M3"
+models = ["MiniMax-M3"]
+
+[[providers]]
+id = "kimi"
+name = "Kimi (Moonshot open platform)"
+base_url = "https://api.moonshot.ai/anthropic"
+key_env = "KIMI_API_KEY"
+default_model = "kimi-k3[1m]"
+models = ["kimi-k3[1m]", "kimi-k3", "kimi-k2.7-code"]
+
+[[providers]]
+id = "kimi-code"
+name = "Kimi Code"
+base_url = "https://api.kimi.com/coding"
+key_env = "KIMI_CODING_API_KEY"
+default_model = "kimi-k3"
+models = ["kimi-k3", "kimi-k2.7-code"]
+
+[[providers]]
+id = "openrouter"
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api"
+key_env = "OPENROUTER_API_KEY"
+default_model = "anthropic/claude-haiku-4.5"
+models = [
+  "anthropic/claude-haiku-4.5",
+  "anthropic/claude-sonnet-5",
+  "openai/gpt-5.1",
+  "openai/o4-mini",
+  "x-ai/grok-4.3",
+  "google/gemini-3.5-flash",
+  "mistralai/mistral-large",
+]
+
+[[providers]]
+id = "freellmapi"
+name = "FreeLLMApi"
+base_url = "http://localhost:3001"
+key_env = "FREELLM_API_KEY"
+default_model = "auto"
+models = ["auto"]

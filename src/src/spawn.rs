@@ -70,11 +70,15 @@ pub(crate) fn bash_command(payload: BashPayload, lazar: &str, policy: &AccessPol
     } else {
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-D")
-            .arg(format!("SKILLS_PATH={lazar}/skills"))
+            .arg(format!("SKILLS_PATH={lazar}/user/skills"))
             .arg("-D")
-            .arg(format!("MEMORY_PATH={lazar}/memory"))
+            .arg(format!("MEMORY_PATH={lazar}/user/memory"))
             .arg("-D")
-            .arg(format!("WORKSPACE_PATH={lazar}/workspace"))
+            .arg(format!("WORKSPACE_PATH={lazar}/user/workspace"))
+            .arg("-D")
+            .arg(format!("KERNEL_SRC={lazar}/src"))
+            .arg("-D")
+            .arg(format!("TUI_SRC={lazar}/tui"))
             .arg("-D")
             .arg(format!(
                 "USER_HOME={}",
@@ -127,10 +131,10 @@ pub(crate) fn apply_base_env(
         )
         .env("HOME", bash_home)
         .env("LAZAR_HOME", lazar)
-        .env("LAZAR_SKILLS", format!("{lazar}/skills"))
-        .env("LAZAR_MEMORY", format!("{lazar}/memory"))
-        .env("LAZAR_WORKSPACE", format!("{lazar}/workspace"))
-        .env("LAZAR_LOGS", format!("{lazar}/logs"))
+        .env("LAZAR_SKILLS", format!("{lazar}/user/skills"))
+        .env("LAZAR_MEMORY", format!("{lazar}/user/memory"))
+        .env("LAZAR_WORKSPACE", format!("{lazar}/user/workspace"))
+        .env("LAZAR_LOGS", format!("{lazar}/user/logs"))
         .env(crate::access::INHERITED_CWD_ENV, policy.tool_cwd())
         .env(
             crate::access::INHERITED_DIRS_ENV,
@@ -174,6 +178,79 @@ pub(crate) fn isolate_process_group(command: &mut Command) {
 #[cfg(not(unix))]
 pub(crate) fn isolate_process_group(_command: &mut Command) {}
 
+/// Keeps the command group's lifetime tied to the kernel, including SIGKILL.
+/// The write end is close-on-exec, so nested commands cannot retain ownership.
+pub(crate) struct ProcessOwner {
+    #[cfg(unix)]
+    _lifetime: std::os::fd::OwnedFd,
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_owned(mut command: Command) -> std::io::Result<(std::process::Child, ProcessOwner)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+
+    let mut descriptors = [-1; 2];
+    if unsafe { libc::pipe(descriptors.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reader = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    let writer = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    for descriptor in [&reader, &writer] {
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let descriptor_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    if descriptor_limit <= 0 || descriptor_limit > i32::MAX as libc::c_long {
+        return Err(std::io::Error::other("cannot determine guardian descriptor limit"));
+    }
+    let read_fd = reader.as_raw_fd();
+    let write_fd = writer.as_raw_fd();
+    isolate_process_group(&mut command);
+    unsafe {
+        command.pre_exec(move || {
+            let group = libc::getpid();
+            libc::close(write_fd);
+            let guardian = libc::fork();
+            if guardian == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if guardian == 0 {
+                // Only async-signal-safe operations are allowed after this fork.
+                // In particular, close the Command exec-error pipe and captured
+                // stdio so the guardian cannot hold spawn or output readers open.
+                if libc::setpgid(0, 0) == -1 {
+                    libc::kill(-group, libc::SIGKILL);
+                    libc::_exit(1);
+                }
+                for fd in 0..descriptor_limit as i32 {
+                    if fd != read_fd { libc::close(fd); }
+                }
+                let mut byte = 0u8;
+                loop {
+                    let read = libc::read(read_fd, (&mut byte as *mut u8).cast(), 1);
+                    if read == 0 { break; }
+                    if read == -1 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break;
+                    }
+                }
+                libc::kill(-group, libc::SIGKILL);
+                libc::_exit(0);
+            }
+            libc::close(read_fd);
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    Ok((child, ProcessOwner { _lifetime: writer }))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_owned(mut command: Command) -> std::io::Result<(std::process::Child, ProcessOwner)> {
+    command.spawn().map(|child| (child, ProcessOwner {}))
+}
+
 /// try_wait poll loop with timeout; kills the process group on expiry.
 /// Returns `Ok((exit_status, timed_out))` on a normal wait (whether it
 /// completed or was killed for timing out), or `Err` if `try_wait` itself
@@ -190,6 +267,12 @@ pub(crate) fn wait_with_timeout(
     let started = Instant::now();
     let mut timed_out = false;
     loop {
+        if crate::core::invocation::is_cancelled() {
+            crate::kill_process_group(child_pid);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+        }
         match child.try_wait() {
             Ok(Some(status)) => return Ok((Some(status), timed_out)),
             Ok(None) => {
@@ -202,7 +285,9 @@ pub(crate) fn wait_with_timeout(
                 thread::sleep(poll);
             }
             Err(e) => {
+                crate::kill_process_group(child_pid);
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(e);
             }
         }
@@ -214,6 +299,56 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     use std::process::Stdio;
+
+    #[test]
+    fn dropping_process_ownership_terminates_the_child() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("60");
+        let (mut child, owner) = spawn_owned(command).unwrap();
+        drop(owner);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(!status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                crate::kill_process_group(child.id());
+                child.wait().unwrap();
+                panic!("child outlived its owner");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn owned_spawn_preserves_exec_errors() {
+        let error = spawn_owned(Command::new("/does-not-exist/lazar-test-command")).err().expect("spawn error");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn cancellation_interrupts_a_running_process_group() {
+        let id = format!("spawn-cancel-{}", std::process::id());
+        let _scope = crate::core::invocation::scope_session(id.clone());
+        let mut command = Command::new("/bin/bash");
+        command.args(["-c", "sleep 60 & wait"]);
+        isolate_process_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let cancel_id = id.clone();
+        let cancel = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            crate::core::invocation::cancel_session(&cancel_id);
+        });
+        let started = Instant::now();
+        let result = wait_with_timeout(&mut child, pid, Duration::from_secs(60), Duration::from_millis(10));
+        cancel.join().unwrap();
+        crate::core::invocation::clear_cancel(&id);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_some());
+    }
 
     #[test]
     fn sandbox_profile_grants_the_canonical_allowed_directory() {

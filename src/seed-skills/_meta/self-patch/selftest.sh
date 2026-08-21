@@ -2,6 +2,8 @@
 # selftest for self-patch — exercises the mechanical helpers in a temp LAZAR_HOME.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE_LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
+NEW_PROPOSAL_BIN="${LAZAR_NEW_PROPOSAL_BIN:-$SOURCE_LAZAR_HOME/scripts/new-proposal.sh}"
 PASS=0; FAIL=0
 ok(){ echo "[PASS] $1"; PASS=$((PASS+1)); }
 no(){ echo "[FAIL] $1"; FAIL=$((FAIL+1)); }
@@ -10,18 +12,21 @@ export LAZAR_HOME="$T"
 mkdir -p "$T/src/src" "$T/workspace" "$T/memory/distilled"
 echo 'fn main(){}' > "$T/src/src/main.rs"
 echo 'locked source' > "$T/src/Cargo.toml"
+echo '# lock' > "$T/src/Cargo.lock"
 mkdir -p "$T/src/target"; echo junk > "$T/src/target/junk"     # must NOT be copied
 chmod -R a-w "$T/src" 2>/dev/null || true                       # simulate locked src
 
-# --- stage-proposal: creates a writable src copy, drops target/, refuses clobber ---
-STAGED=$(bash "$HERE/stage-proposal.sh" fix-max-tokens 2>&1)
+# --- new-proposal: complete writable copy, templates, no target, no clobber ---
+STAGED=$(LAZAR_HOME="$T" bash "$NEW_PROPOSAL_BIN" fix-max-tokens 2>"$T/new-proposal.err")
 [ -d "$STAGED" ] && ok "proposal staged" || no "stage failed: $STAGED"
 [ -f "$STAGED/src/main.rs" ] && ok "staged src copied" || no "staged src missing main.rs"
 [ ! -e "$STAGED/target" ] && ok "target/ excluded from stage" || no "target/ leaked into stage"
+[ -f "$STAGED/../README.md" ] && [ -x "$STAGED/../verify.sh" ] && ok "review templates staged" || no "proposal templates missing"
+bash "$STAGED/../verify.sh" >/dev/null 2>&1 && no "default verify should fail closed" || ok "default verify fails closed"
 # staged copy must be writable even though live src was locked
 ( echo 'edit' >> "$STAGED/src/main.rs" 2>/dev/null ) && ok "staged copy is writable" || no "staged copy not writable"
-CLOBBER=$(bash "$HERE/stage-proposal.sh" fix-max-tokens 2>&1); echo "$CLOBBER" | rg -q 'already staged' && ok "refuses to clobber existing proposal" || no "should refuse clobber"
-bash "$HERE/stage-proposal.sh" '../escape' >/dev/null 2>&1 && no "should reject unsafe name" || ok "rejects unsafe proposal name"
+CLOBBER=$(LAZAR_HOME="$T" bash "$NEW_PROPOSAL_BIN" fix-max-tokens 2>&1); echo "$CLOBBER" | rg -q 'already exists' && ok "refuses to clobber existing proposal" || no "should refuse clobber"
+LAZAR_HOME="$T" bash "$NEW_PROPOSAL_BIN" '../escape' >/dev/null 2>&1 && no "should reject unsafe name" || ok "rejects unsafe proposal name"
 
 # --- ledger: records a dated entry, newest first ---
 bash "$HERE/ledger.sh" behavioral "stall spiral" "M3 apology loop" "PINNED anti-stall rule" "contains PINNED anti-stall" >/dev/null

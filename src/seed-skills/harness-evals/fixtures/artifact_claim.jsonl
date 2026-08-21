@@ -1,0 +1,5 @@
+{"type":"invoke_start","model":"test"}
+{"type":"tool_use","id":"c1","name":"bash","input":{"command":"printf 'ARTIFACT_ABC\\n' > artifact.txt"}}
+{"type":"tool_result","tool_use_id":"c1","content":"[exit 0]","exit_code":0}
+{"type":"text_delta","text":"The artifact exists and is complete."}
+{"type":"invoke_end","stop_reason":"end_turn"}

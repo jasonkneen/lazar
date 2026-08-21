@@ -5,7 +5,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
 
 # Resolve trusted spawn (never rely on agent-writable skills logic).
-SPAWN="$LAZAR_HOME/bin/lazar-spawn"
+SPAWN="${LAZAR_SPAWN_BIN:-$LAZAR_HOME/bin/lazar-spawn}"
 if [ ! -x "$SPAWN" ]; then
   echo "[FAIL] no trusted lazar-spawn found"; exit 1
 fi
@@ -26,6 +26,13 @@ if "$SPAWN" t1 "$TMP/vague.txt" >/dev/null 2>&1; then no "vague prompt should be
 printf 'Write DONE to /tmp/x.\nSUCCESS: file has DONE\nEXPECT-VERIFY:\n  contains=/tmp/x:DONE\n' > "$TMP/good.txt"
 OUT=$("$SPAWN" --lint-only t1 "$TMP/good.txt" 2>&1) && ok "well-formed prompt passes lint" || no "well-formed prompt should pass lint: $OUT"
 
+{
+  printf 'Inspect /tmp/x\nSUCCESS: bounded\nEXPECT-VERIFY:\n  exists=/tmp/x\n'
+  head -c 9001 /dev/zero | tr '\0' x
+} > "$TMP/oversized.txt"
+OUT=$("$SPAWN" --lint-only huge "$TMP/oversized.txt" 2>&1 || true)
+echo "$OUT" | rg -q 'context limit is 9000 bytes' && ok "oversized prompt refused before argv expansion" || no "oversized prompt should be refused: $OUT"
+
 # --- Task 2: ceiling + budget ---
 export LAZAR_SPAWN_CEILING=2 LAZAR_SPAWN_BUDGET=3
 printf 'touch /tmp/noop\nSUCCESS: noop\nEXPECT-VERIFY:\n  exists=/tmp/noop\n' > "$TMP/noop.txt"
@@ -42,7 +49,7 @@ cat > "$TMP/bin/lazar" <<STUB
 case "\$*" in
   *GOOD*) echo DONE > "$CHILD_OUT" ;;
 esac
-echo '{"type":"verify_report","report":{"all_passed":true}}'
+echo '{"type":"invoke_end","stop_reason":"end_turn"}'
 STUB
 chmod +x "$TMP/bin/lazar"
 export LAZAR_SPAWN_CEILING=2 LAZAR_SPAWN_BUDGET=20
@@ -57,11 +64,13 @@ printf 'BAD do nothing for %s\nSUCCESS: file present\nEXPECT-VERIFY:\n  exists=%
 OUT=$(LAZAR_BIN="$TMP/bin/lazar" "$SPAWN" tmiss "$TMP/miss.txt" 2>&1)
 echo "$OUT" | rg -q '"matched":false' && ok "unmet claim -> not matched" || no "expected matched:false, got: $OUT"
 
-# --- Task 4: production state defaults to logs/ (not skills/) ---
-if rg -q 'logs/subagent' "$SPAWN" 2>/dev/null; then
-  ok "trusted spawn defaults state to logs/subagent"
+# --- Task 4: production state defaults to workspace/subagent (not skills/) ---
+# logs/ is kernel-owned and unwritable from the sandbox, so spawn state lives
+# under workspace/ (see README "Known tradeoff").
+if rg -q 'STATE="\$LAZAR_HOME/user/workspace/subagent"' "$SPAWN" 2>/dev/null; then
+  ok "trusted spawn defaults state to workspace/subagent"
 else
-  no "trusted spawn must default budget state under logs/subagent"
+  no "trusted spawn must default budget state under workspace/subagent"
 fi
 
 # Thin skills re-exec must not contain claim/budget logic.
@@ -75,7 +84,7 @@ if [ -f "$THIN" ]; then
 fi
 
 # --- Task 5: veto hook ---
-HOOK="$LAZAR_HOME/hooks/pre-tool.d/10-spawn-discipline.strict.sh"
+HOOK="$LAZAR_HOME/user/hooks/pre-tool.d/10-spawn-discipline.strict.sh"
 [ -f "$HOOK" ] || HOOK="$LAZAR_HOME/src/seed-hooks/pre-tool.d/10-spawn-discipline.strict.sh"
 if [ -f "$HOOK" ]; then
   printf '{"command":"LAZAR_DEPTH=1 lazar -p \\"do a thing\\""}' | bash "$HOOK" | rg -q '"action":"veto"' && ok "raw lazar -p vetoed" || no "raw spawn should be vetoed"

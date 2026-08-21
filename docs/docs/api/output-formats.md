@@ -41,8 +41,8 @@ of `type`). Observed kinds in `src/`:
 | `user` | The prompt, as received |
 | `assistant` | Each assistant message (content blocks) |
 | `tool_result` | Result of a bash tool call |
-| `auto_nudge` | Kernel stall-recovery nudge fired (bounded by `LAZAR_STALL_NUDGES`) |
 | `invoke_end` | End of invocation; carries `stop_reason` |
+| `skill_inject` | The prompt began with `[skill:name]` or `/name`; the kernel inlined `skills/name/SKILL.md` into the user message (`name`, `path`, `bytes`, `truncated`) |
 | `hook_start` / `hook_end` | A lifecycle hook fired; `hook_end` carries `action`, `exit_code`, `duration_ms`, `timed_out` |
 | `tick_start` / `tick_end` | A `--tick` heartbeat run |
 | `session_continuation` | Prior session turns were prepended (`--session` / `--resume`) |
@@ -62,8 +62,3 @@ of `type`). Observed kinds in `src/`:
 
 Consumers should treat unknown `type` values as forward-compatible noise and
 keep reading — the kernel may add event kinds without notice.
-
-## `--input-format`
-
-`text` (default) takes the prompt from `-p`. `stream-json` is **reserved**:
-stdin JSONL input is currently treated as text.

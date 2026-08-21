@@ -1,13 +1,21 @@
 use std::{
+    cell::RefCell,
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::RwLock,
 };
 
 pub(crate) const INHERITED_CWD_ENV: &str = "LAZAR_INHERITED_CWD";
 pub(crate) const INHERITED_DIRS_ENV: &str = "LAZAR_INHERITED_ADD_DIRS";
 
-static RUNTIME_ACCESS: OnceLock<AccessPolicy> = OnceLock::new();
+static RUNTIME_ACCESS: RwLock<Option<AccessPolicy>> = RwLock::new(None);
+
+thread_local! {
+    /// A prompt-turn override for long-lived clients such as ACP. Keeping the
+    /// override thread-local prevents one session from changing another
+    /// session's in-flight cwd or write roots.
+    static SCOPED_ACCESS: RefCell<Vec<AccessPolicy>> = const { RefCell::new(Vec::new()) };
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AccessPolicy {
@@ -30,8 +38,8 @@ impl AccessPolicy {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
                 .filter(|path| path.is_dir())
-                .unwrap_or_else(|| lazar_home.join("workspace")),
-            None => lazar_home.join("workspace"),
+                .unwrap_or_else(|| crate::user_dir("workspace")),
+            None => crate::user_dir("workspace"),
         };
         let mut canonical_dirs = Vec::new();
         for path in allowed_write_dirs {
@@ -75,7 +83,7 @@ impl AccessPolicy {
     pub(crate) fn prompt_context(&self) -> String {
         if self.unsandboxed {
             return format!(
-                "ACCESS POLICY\n                 - Current working directory: {}\n                 - Sandbox: OFF (guardrails disabled by the operator).\n                 - Filesystem: FULL operator-level access. No write restrictions.\n                 - logs/, bin/, src/ are ALL writable right now. The trusted-zone\n                 \x20 rules do NOT apply in this mode.\n                 - Do not refuse a write, suggest an alternative path, or lecture\n                 \x20 about permissions. Perform the requested operation.",
+                "ACCESS POLICY\n- Current working directory: {}\n- Sandbox: OFF.\n- Filesystem: normal operator access, including kernel and TUI source.\n- Durable learning belongs in user/memory and user/skills.",
                 self.tool_cwd.display()
             );
         }
@@ -99,24 +107,55 @@ impl AccessPolicy {
 }
 
 pub(crate) fn init(policy: AccessPolicy) -> Result<(), String> {
-    RUNTIME_ACCESS
-        .set(policy)
-        .map_err(|_| "runtime access policy was initialized twice".to_string())
+    let mut slot = RUNTIME_ACCESS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_some() {
+        return Err("runtime access policy was initialized twice".to_string());
+    }
+    *slot = Some(policy);
+    Ok(())
 }
 
-pub(crate) fn current() -> &'static AccessPolicy {
-    RUNTIME_ACCESS.get_or_init(|| {
-        let lazar_home = std::env::var("LAZAR_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
-                    .join("lazar")
-            });
-        AccessPolicy::new(false, None, &[], &lazar_home).unwrap_or(AccessPolicy {
-            unsandboxed: false,
-            tool_cwd: lazar_home.join("workspace"),
-            allowed_write_dirs: Vec::new(),
-        })
+pub(crate) struct ScopedAccess;
+
+impl Drop for ScopedAccess {
+    fn drop(&mut self) {
+        SCOPED_ACCESS.with(|slot| {
+            slot.borrow_mut()
+                .pop()
+                .expect("scoped access guards must be dropped in stack order");
+        });
+    }
+}
+
+/// Apply an access policy to the current prompt worker only. Scopes may nest;
+/// dropping the guard restores the preceding policy.
+pub(crate) fn scope(policy: AccessPolicy) -> ScopedAccess {
+    SCOPED_ACCESS.with(|slot| slot.borrow_mut().push(policy));
+    ScopedAccess
+}
+
+pub(crate) fn current() -> AccessPolicy {
+    if let Some(policy) = SCOPED_ACCESS.with(|slot| slot.borrow().last().cloned()) {
+        return policy;
+    }
+    if let Some(policy) = RUNTIME_ACCESS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return policy;
+    }
+    let lazar_home = std::env::var("LAZAR_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string())).join("lazar")
+        });
+    AccessPolicy::new(false, None, &[], &lazar_home).unwrap_or(AccessPolicy {
+        unsandboxed: false,
+        tool_cwd: crate::user_dir("workspace"),
+        allowed_write_dirs: Vec::new(),
     })
 }
 
@@ -274,5 +313,32 @@ mod tests {
 
         let ignored = decode_inherited(false, Some(OsString::from("/tmp")), Some(r#"["/tmp"]"#));
         assert_eq!(ignored, (None, Vec::new()));
+    }
+
+    #[test]
+    fn prompt_access_scope_is_nested_and_thread_local() {
+        let baseline = current();
+        let outer = AccessPolicy {
+            unsandboxed: false,
+            tool_cwd: PathBuf::from("/outer"),
+            allowed_write_dirs: vec![PathBuf::from("/outer/write")],
+        };
+        let inner = AccessPolicy {
+            unsandboxed: true,
+            tool_cwd: PathBuf::from("/inner"),
+            allowed_write_dirs: Vec::new(),
+        };
+
+        let outer_guard = scope(outer.clone());
+        assert_eq!(current(), outer);
+        assert_eq!(std::thread::spawn(current).join().unwrap(), baseline);
+
+        {
+            let _inner_guard = scope(inner.clone());
+            assert_eq!(current(), inner);
+        }
+        assert_eq!(current(), outer);
+        drop(outer_guard);
+        assert_eq!(current(), baseline);
     }
 }

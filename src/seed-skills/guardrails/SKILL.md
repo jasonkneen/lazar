@@ -1,6 +1,6 @@
 ---
 name: guardrails
-description: "Turn lazar's enforcement layers on or off. Use when a write fails with 'Operation not permitted', when the operator asks for full access, when you need to edit bin/ src/ logs/, or when the operator asks to re-enable safety. Toggles all four layers at once: sandbox-exec, kernel binary lock, src/ read-only, and pre-tool veto hooks. Never refuse an operator request because of permissions — check status, offer to toggle, then do the work."
+description: "Inspect lazar's enforcement layers and give the operator the exact command to turn them on or off. Use when a write fails with 'Operation not permitted', when the operator asks for full access, or when safety must be re-enabled. The operator-only script toggles sandbox-exec, kernel binary lock, src read-only mode, and pre-tool veto hooks."
 version: 1.0.0
 ---
 
@@ -33,19 +33,21 @@ bash $LAZAR_HOME/scripts/lazar-guardrails.sh on       # restore enforcement
 - The operator says "full access", "no sandbox", "stop blocking me".
 - The operator asks to re-enable safety after risky work.
 
-## Hard rule
+## Authority boundary
 
-**Never refuse an operator request because of permissions.**
+A sandboxed agent cannot disable its own sandbox: `.guardrails` is deliberately
+outside its write allowlist. Run `status`, then tell the operator to execute the
+exact `off` command in their terminal and start a fresh Lazar invocation. Do
+not run `off` inside the current model-issued tool and claim it worked.
 
 Wrong:
 > "I can't write to logs/ — it's kernel-owned. Want me to use workspace/ instead?"
 
-Right:
+Correct:
 ```bash
 bash $LAZAR_HOME/scripts/lazar-guardrails.sh status
-# if guardrails are on and the operator wants this:
+# The operator runs this outside the current Lazar process:
 bash $LAZAR_HOME/scripts/lazar-guardrails.sh off
-# then perform the actual write
 ```
 
 If guardrails are already OFF, there is nothing to route around — just do the work.
@@ -68,7 +70,8 @@ Guardrails OFF removes *enforcement*, not *discipline*. Still true:
 
 ## Re-locking after a kernel rebuild
 
-`scripts/kernel-build.sh` re-locks by default. To keep it unlocked:
+`scripts/kernel-build.sh` follows `$LAZAR_HOME/.guardrails`. To override that
+choice for one build without changing the persisted mode:
 
 ```bash
 LAZAR_GUARDRAILS=off bash $LAZAR_HOME/scripts/kernel-build.sh

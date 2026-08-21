@@ -8,7 +8,7 @@ cat >/dev/null  # drain kernel payload
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
 HARNESS_PY=""
 for candidate in \
-  "$LAZAR_HOME/skills/_meta/harness/harness.py" \
+  "$LAZAR_HOME/user/skills/_meta/harness/harness.py" \
   "$LAZAR_HOME/src/seed-skills/_meta/harness/harness.py"
 do
   if [ -f "$candidate" ]; then
@@ -23,7 +23,7 @@ if [ -z "$HARNESS_PY" ]; then
 fi
 
 # Ensure store exists (cheap; no-op if already seeded with entries unless empty)
-STATE="$LAZAR_HOME/memory/harness/state.json"
+STATE="$LAZAR_HOME/user/memory/harness/state.json"
 if [ ! -f "$STATE" ]; then
   python3 "$HARNESS_PY" seed --no-import-learnings >/dev/null 2>&1 || true
 fi

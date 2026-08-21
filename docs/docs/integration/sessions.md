@@ -13,8 +13,24 @@ lazar -p --resume "continue"
 
 With `--session <id>` or `--resume`, prior turns from the session log are
 prepended to the message array (bounded by
-`LAZAR_SESSION_HISTORY_MAX_BYTES`). This is the only mode in which
-referential prompts ("yes", "do that") resolve against real prior turns.
+`LAZAR_SESSION_HISTORY_MAX_BYTES`, default and compiled ceiling 32 KB). This is the only mode in
+which referential prompts ("yes", "do that") resolve against real prior turns.
+
+History is replayed faithfully: each past assistant turn keeps its text and
+its `tool_use` blocks, and the results follow as real `tool_result` blocks.
+Tool ids are retained exactly so an unchanged replay prefix stays byte-stable;
+a call whose result was never logged gets an explicit "no result recorded"
+result, and thinking blocks are dropped. Tool results have one fixed 2 KB
+replay shape regardless of age. The byte cap drops the oldest operator turns
+whole so a `tool_result` is never separated from its `tool_use`. For explicit
+skills the exact expanded model-facing prompt is logged and replayed, rather
+than replacing it with the raw slash directive.
+
+An earlier loader stripped every tool call and result and replaced them with
+a kernel-written `[KERNEL TOOL EVIDENCE] … exit 0` summary in the *user*
+role. A long session then showed the model a transcript where its own turns
+were bare "Let me check…" and the tool happened in the operator's turn — and
+it learned to narrate and stop. Do not reintroduce that.
 
 ## The event stream
 

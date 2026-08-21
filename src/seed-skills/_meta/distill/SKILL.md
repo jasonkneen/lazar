@@ -23,7 +23,7 @@ Do NOT use this on every invocation. It costs an LLM call per archive, and learn
 
 ```bash
 # Pick the archive to distill (default: most recent rotation)
-ARCHIVE=$(ls -t $LAZAR_HOME/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
+ARCHIVE=$(ls -t $LAZAR_HOME/user/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
 [ -z "$ARCHIVE" ] && { echo "no archives to distill"; exit 0; }
 
 # Bounded sample: last 30 user prompts + assistant responses, capped at 30KB
@@ -61,7 +61,7 @@ $SAMPLE" > /tmp/distill-out.md 2>/dev/null
 rg -qi "nothing durable" /tmp/distill-out.md && { echo "no durable learnings found"; exit 0; }
 
 # Write to memory, tagged with source + date
-mkdir -p $LAZAR_HOME/memory/distilled
+mkdir -p $LAZAR_HOME/user/memory/distilled
 TS=$(basename "$ARCHIVE" | rg -o '[0-9]+')
 DATE=$(date -u +%Y-%m-%d)
 
@@ -75,7 +75,7 @@ awk -v ts="$TS" -v date="$DATE" -v home="$LAZAR_HOME" '
   }
 ' /tmp/distill-out.md
 
-echo "distilled into $LAZAR_HOME/memory/distilled/ (sections: $(ls $LAZAR_HOME/memory/distilled/ 2>/dev/null | tr '\n' ' '))"
+echo "distilled into $LAZAR_HOME/user/memory/distilled/ (sections: $(ls $LAZAR_HOME/user/memory/distilled/ 2>/dev/null | tr '\n' ' '))"
 rm -f /tmp/distill-out.md
 ```
 
@@ -84,7 +84,7 @@ rm -f /tmp/distill-out.md
 After running, you'll have files like:
 
 ```
-$LAZAR_HOME/memory/distilled/
+$LAZAR_HOME/user/memory/distilled/
 ├── gotchas.md
 ├── conventions.md
 ├── recipes.md
@@ -95,7 +95,7 @@ Each file contains tagged bullets:
 
 ```markdown
 - When using bufio.Scanner on lazar's stream-json, set buffer to 10MB or it'll error on big tool_results _(distilled 2026-04-29, from archive .1745928000.bak)_
-- The TUI lives at workspace/lazartui — never create parallel implementations _(distilled 2026-04-29, from archive .1745928000.bak)_
+- Lazar's shipped TUI source lives at `tui/` and installs as `bin/lazartui` — change that crate instead of creating a parallel client _(distilled 2026-04-29, from archive .1745928000.bak)_
 ```
 
 ## Composing with other memory tiers
@@ -113,7 +113,7 @@ Distilled bullets carry `(distilled <date>, from archive ...)` tags. To prune st
 
 ```bash
 # delete bullets older than 180 days
-find $LAZAR_HOME/memory/distilled -name '*.md' -exec sed -i '' '/distilled 202[0-5]-/d' {} +
+find $LAZAR_HOME/user/memory/distilled -name '*.md' -exec sed -i '' '/distilled 202[0-5]-/d' {} +
 ```
 
 Or do this lazily: when reading a `distilled/` file at task start, the agent can filter on date and warn the user about stale entries. Don't over-engineer the lifecycle — markdown search with `rg` is fine.

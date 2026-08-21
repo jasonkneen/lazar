@@ -24,7 +24,7 @@ If any FAIL appears, the user should investigate before doing real work — most
 ## Setup
 
 ```bash
-HC="$LAZAR_HOME/workspace/.health-check-$(date +%s)"
+HC="$LAZAR_HOME/user/workspace/.health-check-$(date +%s)"
 mkdir -p "$HC"
 echo "[health-check] starting in $HC"
 PASS=0; FAIL=0; SKIP=0
@@ -131,7 +131,7 @@ AFTER=$(ls "$LAZAR_LOGS"/stream.jsonl.*.bak 2>/dev/null | wc -l | tr -d ' ')
 if [ "$AFTER" -gt "$BEFORE" ]; then
     pass "log auto-rotation fired ($BEFORE -> $AFTER archives)"
     # confirm the kernel wrote a summary too
-    NEWEST=$(ls -t "$LAZAR_HOME/memory/log-summaries/"*.md 2>/dev/null | head -n 1)
+    NEWEST=$(ls -t "$LAZAR_HOME/user/memory/log-summaries/"*.md 2>/dev/null | head -n 1)
     [ -f "$NEWEST" ] && pass "rotation summary written: $(basename "$NEWEST")" || fail "no log-summary written"
 else
     fail "log did not rotate despite tiny threshold"
@@ -230,10 +230,10 @@ echo "    SKIP: $SKIP"
 echo "════════════════════════════════════════════════════"
 
 if [ "$FAIL" -gt 0 ]; then
-    echo "  ⚠  $FAIL check(s) failed. Investigate before doing real work."
+    echo "  [WARN] $FAIL check(s) failed. Investigate before doing real work."
     exit 1
 else
-    echo "  ✓  all checks passed."
+    echo "  [OK] all checks passed."
     exit 0
 fi
 ```

@@ -30,6 +30,7 @@ use crate::{lazar_home, now_millis};
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 5;
 const HOOK_STDOUT_CAP_BYTES: usize = 16_384;
 const HOOK_STDERR_CAP_BYTES: usize = 8_192;
+const MAX_HOOKS_PER_EVENT: usize = 32;
 
 /// Lifecycle events. `as_str` is the directory name under `hooks/`
 /// (suffixed `.d`).
@@ -73,9 +74,8 @@ pub enum HookAction {
     /// Post-tool only: rewrite the captured tool output before it
     /// gets posted back to the model.
     TransformOutput(String),
-    /// Session-start / user-prompt: append context to the model's system
-    /// prompt or user prompt. Currently advisory — wired in on a per-event
-    /// basis by the caller.
+    /// Session-start / user-prompt: appended to the system prompt under
+    /// "RUNTIME CONTEXT (from hooks)" (see `collect_hook_context`).
     InjectContext(String),
 }
 
@@ -125,7 +125,9 @@ struct DiscoveryCache {
 
 fn discovery_for(event: HookEvent) -> Vec<PathBuf> {
     let home = lazar_home();
-    let mut guard = DISCOVERY_CACHE.lock().expect("hook discovery cache poisoned");
+    let mut guard = DISCOVERY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let cache = guard.get_or_insert_with(|| DiscoveryCache {
         home: home.clone(),
         by_event: Default::default(),
@@ -143,8 +145,8 @@ fn discovery_for(event: HookEvent) -> Vec<PathBuf> {
         .clone()
 }
 
-fn scan_hooks_dir(home: &Path, event: HookEvent) -> Vec<PathBuf> {
-    let dir = home.join("hooks").join(format!("{}.d", event.as_str()));
+fn scan_hooks_dir(_home: &Path, event: HookEvent) -> Vec<PathBuf> {
+    let dir = crate::user_dir("hooks").join(format!("{}.d", event.as_str()));
     let entries = match fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return vec![], // no dir = no hooks; not an error
@@ -181,6 +183,15 @@ fn scan_hooks_dir(home: &Path, event: HookEvent) -> Vec<PathBuf> {
         })
         .collect();
     paths.sort();
+    if paths.len() > MAX_HOOKS_PER_EVENT {
+        eprintln!(
+            "[lazar] WARN: {} has {} hooks; running the first {}",
+            event.as_str(),
+            paths.len(),
+            MAX_HOOKS_PER_EVENT
+        );
+        paths.truncate(MAX_HOOKS_PER_EVENT);
+    }
     paths
 }
 
@@ -209,26 +220,19 @@ pub fn fire(event: HookEvent, payload: Value) -> Vec<HookResult> {
 
     let mut results = Vec::with_capacity(scripts.len());
     for script in scripts {
+        if crate::core::invocation::is_cancelled() {
+            break;
+        }
         let result = run_hook(&script, &payload_str, timeout, event);
         results.push(result);
     }
     results
 }
 
-
-fn strict_pre_tool_hook(event: HookEvent, script_name: &str) -> bool {
-    matches!(event, HookEvent::PreTool)
-        && (env::var("LAZAR_STRICT_PRE_TOOL_HOOKS")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-            || script_name.ends_with(".strict")
-            || script_name.contains(".strict."))
-}
-
 fn hook_failure_action(event: HookEvent, script_name: &str, msg: String) -> HookAction {
-    if strict_pre_tool_hook(event, script_name) {
+    if matches!(event, HookEvent::PreTool) {
         HookAction::Veto {
-            reason: format!("strict pre-tool hook {script_name} failed: {msg}"),
+            reason: format!("pre-tool hook {script_name} failed: {msg}"),
         }
     } else {
         HookAction::Continue
@@ -248,6 +252,9 @@ fn run_hook(
         .unwrap_or("?")
         .to_string();
 
+    if crate::env_flag_enabled("LAZAR_TRACE_HOOKS") {
+        crate::emit_event(json!({"type": "hook_start", "event": event.as_str(), "script": &script_name}));
+    }
     append_stream(json!({
         "kind": "hook_start",
         "event": event.as_str(),
@@ -258,15 +265,16 @@ fn run_hook(
     let workspace = format!("{lazar}/workspace");
     let _ = fs::create_dir_all(&workspace);
 
-    // Honor LAZAR_NO_SANDBOX (set by main when --no-sandbox is passed).
-    // Hooks run in the same trust mode as the agent — if the operator
-    // disabled sandboxing, hooks aren't sandboxed either.
-    let unsandboxed = crate::no_sandbox_active();
-
+    // Hooks run in the same trust mode as the agent: the runtime access
+    // policy decides both the sandbox wrapper and the HOME the script sees,
+    // exactly as run_bash does. (main/acp set LAZAR_NO_SANDBOX and the
+    // policy together, so this is the single source of truth.)
+    let policy = crate::access::current();
+    let unsandboxed = policy.unsandboxed();
     let mut command = crate::spawn::bash_command(
         crate::spawn::BashPayload::Script(script),
         &lazar,
-        crate::access::current(),
+        &policy,
     );
 
     let bash_home = crate::spawn::bash_home(&lazar, unsandboxed);
@@ -276,19 +284,15 @@ fn run_hook(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    crate::spawn::apply_base_env(
-        &mut command,
-        &lazar,
-        &bash_home,
-        crate::access::current(),
-    );
+    crate::spawn::apply_base_env(&mut command, &lazar, &bash_home, &policy);
     command
         .env("LAZAR_HOOK_EVENT", event.as_str())
         .env("LAZAR_HOOK_PAYLOAD_LEN", payload_str.len().to_string());
+    if let Some(session_id) = crate::core::invocation::session_id() {
+        command.env("LAZAR_SESSION_ID", session_id);
+    }
 
-    crate::spawn::isolate_process_group(&mut command);
-
-    let mut child = match command.spawn() {
+    let (mut child, _owner) = match crate::spawn::spawn_owned(command) {
         Ok(c) => c,
         Err(e) => {
             let msg = format!("hook spawn failed: {e}");
@@ -374,7 +378,7 @@ fn run_hook(
 
     let mut action = parse_action(&stdout_bytes, event, &script_name);
 
-    if strict_pre_tool_hook(event, &script_name) && !matches!(action, HookAction::Veto { .. }) {
+    if matches!(event, HookEvent::PreTool) && !matches!(action, HookAction::Veto { .. }) {
         if timed_out {
             action = hook_failure_action(event, &script_name, "timed out".to_string());
         } else if exit_code != 0 {
@@ -414,7 +418,7 @@ fn reject(event: HookEvent, script_name: &str, msg: String, lenient_note: &str) 
         script_name,
         event.as_str(),
         msg,
-        if strict_pre_tool_hook(event, script_name) { "failing closed" } else { lenient_note }
+        if matches!(event, HookEvent::PreTool) { "failing closed" } else { lenient_note }
     );
     hook_failure_action(event, script_name, msg)
 }
@@ -525,10 +529,20 @@ pub fn join_injected_contexts(results: &[HookResult]) -> String {
     for r in results {
         if let Some(ctx) = r.inject_context() {
             if !ctx.is_empty() {
-                if !out.is_empty() {
-                    out.push_str("\n\n");
+                let separator = if out.is_empty() { "" } else { "\n\n" };
+                if out.len().saturating_add(separator.len())
+                    >= crate::core::context::MAX_HOOK_CONTEXT_BYTES
+                {
+                    break;
                 }
-                out.push_str(ctx);
+                out.push_str(separator);
+                let remaining =
+                    crate::core::context::MAX_HOOK_CONTEXT_BYTES.saturating_sub(out.len());
+                let bounded = crate::text::head_bytes(ctx, remaining);
+                out.push_str(bounded);
+                if bounded.len() < ctx.len() {
+                    break;
+                }
             }
         }
     }
@@ -543,6 +557,21 @@ mod tests {
     fn parse_action_continue_on_empty() {
         let action = parse_action(b"", HookEvent::PreTool, "test");
         assert!(matches!(action, HookAction::Continue));
+    }
+
+    #[test]
+    fn injected_hook_context_has_one_aggregate_budget() {
+        let results = (0..3)
+            .map(|n| HookResult {
+                script: PathBuf::from(format!("{n}.sh")),
+                action: HookAction::InjectContext("x".repeat(crate::core::context::MAX_HOOK_CONTEXT_BYTES / 2)),
+                exit_code: 0,
+                duration_ms: 1,
+                timed_out: false,
+            })
+            .collect::<Vec<_>>();
+        let joined = join_injected_contexts(&results);
+        assert_eq!(joined.len(), crate::core::context::MAX_HOOK_CONTEXT_BYTES);
     }
 
     #[test]
@@ -601,29 +630,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_action_invalid_json_falls_back_to_continue() {
-        let action = parse_action(b"not json", HookEvent::PreTool, "test");
-        assert!(matches!(action, HookAction::Continue));
+    fn parse_action_invalid_json_vetoes_pre_tool_and_continues_post_tool() {
+        let pre = parse_action(b"not json", HookEvent::PreTool, "test");
+        assert_veto_contains(pre, "invalid JSON");
+        let post = parse_action(b"not json", HookEvent::PostTool, "test");
+        assert!(matches!(post, HookAction::Continue));
     }
 
     #[test]
-    fn parse_action_unknown_action_falls_back_to_continue() {
-        let action = parse_action(
-            br#"{"action":"explode"}"#,
-            HookEvent::PreTool,
-            "test",
-        );
-        assert!(matches!(action, HookAction::Continue));
-    }
-
-    #[test]
-    fn strict_unknown_action_vetoes_while_non_strict_continues() {
+    fn parse_action_unknown_action_vetoes_every_pre_tool_hook() {
         let non_strict = parse_action(
             br#"{"action":"explode"}"#,
             HookEvent::PreTool,
             "guard",
         );
-        assert!(matches!(non_strict, HookAction::Continue));
+        assert_veto_contains(non_strict, "unknown action");
 
         let strict = parse_action(
             br#"{"action":"explode"}"#,
@@ -687,10 +708,13 @@ mod tests {
         root: PathBuf,
         old_lazar_home: Option<std::ffi::OsString>,
         old_no_sandbox: Option<std::ffi::OsString>,
+        _guard: std::sync::MutexGuard<'static, ()>,
     }
 
     impl HookTestEnv {
         fn new(label: &str) -> Self {
+            // Mutates LAZAR_HOME: serialize with every other env-mutating test.
+            let guard = crate::test_support::env_lock();
             let root = std::env::temp_dir().join(format!(
                 "lazar-hook-{label}-{}-{}",
                 std::process::id(),
@@ -708,6 +732,7 @@ mod tests {
                 root,
                 old_lazar_home,
                 old_no_sandbox,
+                _guard: guard,
             }
         }
 

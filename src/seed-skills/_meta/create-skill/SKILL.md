@@ -12,14 +12,14 @@ When you need a capability that isn't in INDEX.md, author a new skill.
 
 1. Confirm the gap:
 
-       cat $LAZAR_HOME/skills/INDEX.md
+       cat $LAZAR_HOME/user/skills/INDEX.md
 
 2. Pick a short, descriptive kebab-case name (e.g. `web-search`, `file-watch`, `git-status`).
 
 3. Create the skill folder and SKILL.md:
 
-       mkdir -p $LAZAR_HOME/skills/<name>
-       cat > $LAZAR_HOME/skills/<name>/SKILL.md <<'EOF'
+       mkdir -p $LAZAR_HOME/user/skills/<name>
+       cat > $LAZAR_HOME/user/skills/<name>/SKILL.md <<'EOF'
        # <name>
 
        <one-line purpose>
@@ -36,12 +36,12 @@ When you need a capability that isn't in INDEX.md, author a new skill.
 
 4. Register it in the index:
 
-       echo "- <name> — <one-line purpose>" >> $LAZAR_HOME/skills/INDEX.md
+       echo "- <name> — <one-line purpose>" >> $LAZAR_HOME/user/skills/INDEX.md
 
 5. Verify:
 
-       cat $LAZAR_HOME/skills/INDEX.md
-       cat $LAZAR_HOME/skills/<name>/SKILL.md
+       cat $LAZAR_HOME/user/skills/INDEX.md
+       cat $LAZAR_HOME/user/skills/<name>/SKILL.md
 
 ## Principles
 
@@ -49,4 +49,4 @@ When you need a capability that isn't in INDEX.md, author a new skill.
 - Prefer composition: existing skills + bash + `lazar -p` recursion.
 - Bash-first. If the recipe can't be expressed in bash, the skill is too big.
 - Document the failure modes you hit while designing it. Future-you will thank you.
-- Skills go in `$LAZAR_HOME/skills/`. Never write outside that tree to extend your capabilities.
+- Skills go in `$LAZAR_HOME/user/skills/`. Never write outside that tree to extend your capabilities.

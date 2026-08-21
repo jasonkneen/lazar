@@ -8,7 +8,7 @@ JSON blobs, no databases.
 
 | Layer | Path | Purpose |
 |---|---|---|
-| Pinned context | `memory/PINNED.md` | Read every session start: provider truth, code ownership, anti-stall rules, search rules. |
+| Pinned context | `memory/PINNED.md` | Read every session start: provider truth, code ownership, act-don't-narrate rules, search rules. |
 | Working notes | `memory/*.md` | Timestamped notes, breadcrumbs for future invocations. |
 | Work journal | `memory/work-journal.md` | Durable record of what was built (harvested by `_meta/log-harvest`). |
 | Harness lessons | `memory/harness/` | Ranked durable lessons, managed by `_meta/harness/harness.py`. |

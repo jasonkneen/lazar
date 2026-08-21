@@ -10,11 +10,11 @@ Whenever a task requires something beyond bare bash one-liners.
 
 1. Read the index:
 
-       cat $LAZAR_HOME/skills/INDEX.md
+       cat $LAZAR_HOME/user/skills/INDEX.md
 
 2. If a single skill matches, read it and use it:
 
-       cat $LAZAR_HOME/skills/<name>/SKILL.md
+       cat $LAZAR_HOME/user/skills/<name>/SKILL.md
 
    Done.
 

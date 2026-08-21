@@ -5,7 +5,7 @@ Before modifying any code in a project directory, read the project's `PROJECT.md
 ## When to use
 
 - The user references a directory or codebase ("the TUI", "the parser", "the lazartui").
-- You're about to write code under `$LAZAR_HOME/workspace/<project>/` or similar.
+- You're about to write code under `$LAZAR_HOME/user/workspace/<project>/` or similar.
 - You need to know "where does X live?" or "what language/framework does this project use?"
 
 ## How to use

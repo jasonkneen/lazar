@@ -25,17 +25,24 @@ flow below remains the supported path.
 
 Kernel changes follow a four-step, operator-reviewed flow:
 
-1. **Stage.** Write a full proposed source tree under
-   `workspace/proposals/<name>/src/`. The `new-proposal.sh` script copies a
-   skeleton; the `_meta/propose-kernel-patch` skill guides the agent.
-2. **Review.** `scripts/kernel-apply.sh <name>` produces a diff against the
-   current kernel for the operator to read.
+1. **Stage.** `scripts/new-proposal.sh <name>` copies the complete live source
+   (excluding generated `target/`) and creates README, checklist, and
+   fail-closed verification templates under `workspace/proposals/<name>/`.
+2. **Freeze + review.** `scripts/kernel-apply.sh <name>` atomically moves the
+   proposal to `.archive/kernel-proposals/`, outside the agent-writable
+   sandbox, then prints its README, verification script, and full source diff.
 3. **Confirm** from an interactive operator terminal — the script prompts
    before touching anything.
-4. **Apply + rebuild.** The script backs up the current source, applies with
-   delete semantics, rebuilds, and re-locks the installed binary.
-   `scripts/kernel-verify.sh <name>` runs an optional per-proposal
-   `verify.sh` (via `LAZAR_PROPOSAL_DIR` / `LAZAR_PROPOSAL_NAME`).
+4. **Apply + prove.** The script stores the current source under
+   `.archive/kernel-backups/`, applies the frozen source with checksum/delete
+   semantics, rebuilds with the checked-in lockfile, and runs mandatory
+   proposal-specific `verify.sh`. Failure restores and rebuilds the trusted
+   backup. The successful snapshot remains archived.
+
+The apply command prints a backup ID. Use
+`scripts/kernel-rollback.sh <backup-id>` for a later manual rollback. It shows
+the reverse diff, requires interactive confirmation, saves the current source
+as a pre-rollback safety copy, restores, and rebuilds.
 
 ## The `scripts/kernel-*.sh` family
 
@@ -43,8 +50,10 @@ Kernel changes follow a four-step, operator-reviewed flow:
 |---|---|
 | `kernel-unlock.sh` | Unseal the kernel source/binary for editing (pairs with `kernel-build.sh`) |
 | `kernel-edit.sh` | One-shot: unlock, open `main.rs` in `$EDITOR`, rebuild, relock |
-| `kernel-build.sh` | Rebuild the kernel and relock; on failure the source stays writable so you can fix and retry. Pass `LAZAR_GUARDRAILS=off` to keep the kernel writable across rebuilds |
-| `kernel-apply.sh` | Diff, confirm, and apply a staged proposal from `workspace/proposals/<name>/`, then rebuild |
-| `kernel-verify.sh` | Run patch-specific verification (`verify.sh`) for a staged proposal |
+| `kernel-build.sh` | Rebuild the kernel and follow the persisted guardrails mode; `LAZAR_GUARDRAILS=on|off` overrides that mode for one build |
+| `kernel-apply.sh` | Freeze, review, confirm, back up, apply, rebuild, and verify a staged proposal |
+| `kernel-verify.sh` | Run mandatory patch-specific verification (`verify.sh`) |
+| `kernel-rollback.sh` | Interactively restore a trusted backup and rebuild, preserving a pre-rollback safety copy |
+| `kernel-ceremony-selftest.sh` | Exercise successful apply, automatic recovery, fail-closed verification, and manual rollback in an isolated fake install |
 
 The agent's role stops at step 1. Applying is always an operator act.

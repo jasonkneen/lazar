@@ -1,0 +1,4 @@
+{"type":"invoke_start","model":"test"}
+this is not json
+{"type":"text_delta","text":"CHAT_OK_ABC"}
+{"type":"invoke_end","stop_reason":"end_turn"}

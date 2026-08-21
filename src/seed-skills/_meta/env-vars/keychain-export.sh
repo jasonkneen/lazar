@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Export all present lazar Keychain keys into the current shell.
-# Usage:  source skills/env-vars/keychain-export.sh
-# Or:     eval "$(bash skills/env-vars/keychain-export.sh --print)"
+# Usage:  source skills/_meta/env-vars/keychain-export.sh
+# Or:     eval "$(bash skills/_meta/env-vars/keychain-export.sh --print)"
 #
 # When sourced: sets export VAR=... for each key found.
 # When executed: with --print, emits export lines (safe to eval).

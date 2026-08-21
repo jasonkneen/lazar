@@ -1,0 +1,7 @@
+{"type":"invoke_start","model":"test"}
+{"type":"tool_use","id":"c1","name":"bash","input":{"command":"test -e /tmp/missing-ABC"}}
+{"type":"tool_result","tool_use_id":"c1","content":"[exit 1]","exit_code":1}
+{"type":"tool_use","id":"c2","name":"bash","input":{"command":"printf 'RECOVERED_ABC\\n'"}}
+{"type":"tool_result","tool_use_id":"c2","content":"RECOVERED_ABC\n[exit 0]","exit_code":0}
+{"type":"text_delta","text":"Recovered after observing the failed check."}
+{"type":"invoke_end","stop_reason":"end_turn"}

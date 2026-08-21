@@ -1,6 +1,6 @@
 ;; lazar sandbox profile
-;; Applied to every bash command spawned by the lazar runner.
-;; Writes are restricted to the agent's writable zones — never bin/ or src/.
+;; Used only when the operator turns the sandbox on.
+;; Core source stays writable. User files live under user/.
 
 (version 1)
 (deny default)
@@ -22,9 +22,8 @@
 ;; everything that matters.
 (allow file-read*)
 
-;; writes: ONLY the agent's writable zones + tmp + narrowed agent-CLI
-;; session/auth dirs. logs/, bin/, and src/ are NOT in this list, so the agent
-;; cannot modify the runner. Every path is passed in via -D from the runner.
+;; writes: user runtime, the kernel and TUI source, tmp, and narrowed
+;; agent-CLI session/auth dirs. Paths are passed in via -D from the runner.
 ;;
 ;; USER_HOME is the operator's real home (e.g. /Users/jkneen), distinct
 ;; from LAZAR_HOME. We grant writes to specific session/auth/log
@@ -39,6 +38,8 @@
   (subpath (param "SKILLS_PATH"))
   (subpath (param "MEMORY_PATH"))
   (subpath (param "WORKSPACE_PATH"))
+  (subpath (param "KERNEL_SRC"))
+  (subpath (param "TUI_SRC"))
   ;; codex CLI: session/auth/log state only.
   (subpath (string-append (param "USER_HOME") "/.codex/sessions"))
   (subpath (string-append (param "USER_HOME") "/.codex/archived_sessions"))

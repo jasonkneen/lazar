@@ -4,7 +4,7 @@ Lazar emits one JSON object per line on stdout when invoked as:
 
     lazar -p "..." --output-format stream-json
 
-Every event has a `type` field and a `ts_ms` field (Unix milliseconds, added by the kernel). All events are also written to `$LAZAR_HOME/logs/stream.jsonl` for offline replay.
+Every event has a `type` field and a `ts_ms` field (Unix milliseconds, added by the kernel). All events are also written to `$LAZAR_HOME/user/logs/stream.jsonl` for offline replay.
 
 ## Event types
 
@@ -42,7 +42,7 @@ Marks end of a text block. After this, the block at `index` is complete and will
 ### `tool_use`
 
 ```json
-{"type":"tool_use","index":1,"id":"toolu_abc","name":"execute","input":{"command":"cat $LAZAR_HOME/skills/INDEX.md"},"ts_ms":1745928000789}
+{"type":"tool_use","index":1,"id":"toolu_abc","name":"execute","input":{"command":"cat $LAZAR_HOME/user/skills/INDEX.md"},"ts_ms":1745928000789}
 ```
 
 Emitted when the model has decided on a tool call (after the input JSON has fully streamed and parsed).

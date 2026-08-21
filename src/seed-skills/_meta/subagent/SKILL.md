@@ -11,7 +11,7 @@ vetoes it). I go through the **locked** spawn surface, preferably with a
 
 ```bash
 # Recommended: BRIEF.md + thin prompt + lazar-spawn
-bash "$LAZAR_HOME/skills/_meta/subagent/pack-and-spawn.sh" <task-id> \
+bash "$LAZAR_HOME/user/skills/_meta/subagent/pack-and-spawn.sh" <task-id> \
   --objective "..." \
   --out /absolute/deliverable \
   --path /absolute/input \
@@ -23,7 +23,7 @@ bash "$LAZAR_HOME/bin/lazar-spawn" <task-id> <prompt-file>
 ```
 
 `bin/lazar-spawn` is installed by `setup.sh` with the same immutability story
-as `bin/lazar`. Budget state lives in `logs/subagent/`. The copy under
+as `bin/lazar`. Budget state lives in `workspace/subagent/`. The copy under
 `skills/_meta/subagent/spawn.sh` is **only** a re-exec stub.
 
 ## When to spawn vs do it yourself
@@ -60,11 +60,19 @@ child prose. On `matched:false`, fix the BRIEF and retry within ceilings.
 
 ## Bounds (all models)
 
-1. Kernel stall-nudges (in-child recovery, bounded)
+1. Prompt context cap (9000 bytes)
 2. Per-task ceiling `LAZAR_SPAWN_CEILING` (default 2)
 3. Session budget `LAZAR_SPAWN_BUDGET` (default 10)
 4. Wall-clock `LAZAR_SPAWN_TIMEOUT` (default 300s)
 5. Recursion depth cap (kernel `MAX_DEPTH`)
+
+## Provider credentials
+
+Children are credential-isolated by default. If they need model access, the
+operator must start the parent Lazar process with
+`LAZAR_TOOL_INHERIT_PROVIDER_KEY=1`; the kernel then passes only the active
+catalog provider's named key to tool subprocesses. Setting the variable inside
+a tool command is too late because that subprocess cannot change its parent.
 
 ## Self-test
 
@@ -81,4 +89,3 @@ bash "$LAZAR_HOME/bin/lazar-spawn" --await <job-id>
 ```
 
 Prefer sync spawn for single tasks. Use `--detach` only for parallel fan-out; still gate on `matched` via --await/--status.
-

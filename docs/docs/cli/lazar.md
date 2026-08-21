@@ -8,7 +8,35 @@ invented.
 The smallest self-evolving agent.
 
 Usage: lazar [OPTIONS]
+       lazar acp [OPTIONS]
 ```
+
+## Commands
+
+### `acp`
+
+Start an [Agent Client Protocol](https://agentclientprotocol.com/) server on stdio using the official `agent-client-protocol` Rust SDK. Clients (Zed, grok-build, and any other ACP client) spawn `lazar acp` as a subprocess and speak newline-delimited JSON-RPC on stdin/stdout.
+
+This is a long-lived process. `session/new`, `session/load`, `session/resume`, and repeated `session/prompt` calls stay in-process. Assistant text and tool calls stream as `session/update` notifications. Session history is the kernel's existing `logs/sessions/<id>.jsonl`.
+
+```bash
+# Typical client spawn
+lazar acp
+
+# Same access flags as the one-shot CLI
+lazar acp --cwd ~/code/proj --add-dir ~/code/proj --no-sandbox
+```
+
+`stdout` is reserved for ACP messages. Logs go to stderr.
+
+Supported agent methods: `initialize`, `session/new`, `session/prompt`, `session/cancel`, `session/load`, `session/resume`, `session/close`, `session/list`, `session/delete`. Client-supplied MCP servers are ignored; Lazar's tool remains kernel `bash`.
+
+`session/cancel` interrupts both an in-flight HTTP request and an open SSE
+stream. The transport polls the session-scoped cancellation state every 25 ms
+and drops the request future; it does not wait for the provider's 600-second
+request timeout.
+
+The kernel reads `clientInfo` and `clientCapabilities` from `initialize`, logs them (`acp_client`), passes them to `session-start`/`session-end` hooks, and tells the model who is driving it. After `session/new` and `session/load` it sends `available_commands_update` listing every installed skill as a slash command; a prompt of `/name …` (or `[skill:name] …`) is resolved by the kernel, which inlines `skills/name/SKILL.md` into the user message — the model never has to go and read it.
 
 ## Flags
 
@@ -58,15 +86,6 @@ Output format. Default: `text`.
 | `stream-json` | JSONL events — one JSON object per line on stdout as they happen (for TUIs, log analyzers) |
 
 See [Output formats](../api/output-formats.md) for event shapes.
-
-### `--input-format <FORMAT>`
-
-Input format. Default: `text`.
-
-| Value | Behavior |
-|---|---|
-| `text` | Prompt comes from `-p` as a plain string (default) |
-| `stream-json` | Reserved: prompt comes as JSONL events on stdin. Currently treated as text |
 
 ### `--tick`
 
@@ -121,8 +140,7 @@ Print help (summary with `-h`, full with `--help`).
   `recursion depth <n> exceeds max 5`.
 - Budget guards: the loop aborts with `aborted after reaching
   LAZAR_MAX_TURNS=…` or `LAZAR_MAX_TOOL_CALLS=…` when the caps are hit.
-- Grounding: a terminal response whose `[VERIFY]` claims fail twice ends in a
-  non-zero `grounding_failed` result.
+- `lazar acp` stays running until the client closes stdin.
 
 ## Examples
 

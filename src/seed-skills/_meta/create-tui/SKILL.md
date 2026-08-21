@@ -5,7 +5,7 @@ description: Scaffold a terminal interface for lazar — a small client project 
 
 # create-tui
 
-Scaffold a terminal interface (TUI) that talks to lazar. The output is a small project under `$LAZAR_HOME/workspace/<name>/`. The TUI is a *client* — it spawns `lazar -p --output-format stream-json` as a subprocess and renders the JSONL events. Lazar itself is the agent; the TUI is just the mouth and ears.
+Scaffold a terminal interface (TUI) that talks to lazar. The output is a small project under `$LAZAR_HOME/user/workspace/<name>/`. The TUI is a *client* — it spawns `lazar -p --output-format stream-json` as a subprocess and renders the JSONL events. Lazar itself is the agent; the TUI is just the mouth and ears.
 
 This skill is for richer experiences than `scripts/lazar-chat.sh` (a 30-line shell loop with glow piping). If the user just wants to chat with markdown rendering, point them there first and skip this skill.
 
@@ -30,7 +30,7 @@ Don't pre-commit to a stack. Different users have very different terminal prefer
 | Stack | When to pick | Notes |
 |-------|--------------|-------|
 | **TypeScript + readline** (default) | Cross-platform, no compile step, easiest to extend | Single `src/cli.ts` file, adapts to terminal theme. See `references/typescript-readline.md`. |
-| **Go + Bubble Tea + Glamour** | User wants a polished split-pane TUI with markdown, viewport, textarea, image rendering | Heavier setup. Set `GOMODCACHE=workspace/<name>/.gocache/mod` (see _meta/log-rotation cousin). The user may already have one at `workspace/lazartui/` — read it first. |
+| **Go + Bubble Tea + Glamour** | User wants a polished split-pane TUI with markdown, viewport, textarea, image rendering | Heavier setup. Set `GOMODCACHE=workspace/<name>/.gocache/mod` (see _meta/log-rotation cousin). For changes to Lazar's shipped client, use the existing Rust crate at `tui/` instead. |
 | **Python + Textual** | Python users, widget-based design | Use a venv at `workspace/<name>/.venv/`. Textual handles streaming widgets cleanly. |
 | **Other** | User has a specific stack | Read `references/stream-json-protocol.md` and adapt. |
 
@@ -57,7 +57,7 @@ Present these as multi-select (defaults marked **ON**):
 | Style | Default | Description |
 |-------|---------|-------------|
 | `grouped` | ON | Bold action labels with tree-branch output |
-| `emoji` |  | Per-call `⚡`/`✓` markers with command preview and timing |
+| `status` |  | Per-call `[RUN]`/`[OK]` markers with command preview and timing |
 | `minimal` |  | One-liner summaries |
 | `hidden` |  | Show only assistant text; tools silent |
 
@@ -79,12 +79,12 @@ ASCII logo? Y/N. If yes, ask for the project name (1-2 short words, fits in 60 c
 - [ ] Confirm stack + customization with the user
 - [ ] Read references/stream-json-protocol.md
 - [ ] Read references/<stack>.md (default: typescript-readline.md)
-- [ ] mkdir -p $LAZAR_HOME/workspace/<name>
+- [ ] mkdir -p $LAZAR_HOME/user/workspace/<name>
 - [ ] Generate manifest (package.json / go.mod / pyproject.toml)
 - [ ] Generate entry point (src/cli.ts / main.go / __main__.py)
 - [ ] Set toolchain cache env (NPM_CONFIG_CACHE / GOMODCACHE / pip cache) inside workspace
 - [ ] Compile / build (don't try to run — it's interactive)
-- [ ] Add a shell alias via _meta/shell-handoff (e.g. alias <name>='$LAZAR_HOME/workspace/<name>/...')
+- [ ] Add a shell alias via _meta/shell-handoff (e.g. alias <name>='$LAZAR_HOME/user/workspace/<name>/...')
 - [ ] Write a PROJECT.md (see _meta/project-context) so future-you knows what this is
 - [ ] Tell the user the alias name and how to source it
 ```
@@ -92,6 +92,7 @@ ASCII logo? Y/N. If yes, ask for the project name (1-2 short words, fits in 60 c
 ## Hard rules
 
 - **Output goes under `workspace/<name>/`. Never** under `skills/`, `bin/`, `src/`, or anywhere outside `workspace/`.
+- **Do not replace the shipped client by accident.** Maintenance of Lazar's own TUI belongs in `$LAZAR_HOME/tui/`; this skill creates additional clients only when the user explicitly asks for one.
 - **Never call the Anthropic API directly from the TUI.** Always go through `lazar -p`. Lazar IS the agent; the TUI just renders.
 - **Never write to PATH.** Use the shell-handoff aliases.sh pattern.
 - **Set toolchain caches inside workspace.** Go: `GOMODCACHE=workspace/<name>/.gocache/mod`. npm: `NPM_CONFIG_CACHE=workspace/<name>/.npm`. Python: venv inside `workspace/<name>/.venv/`. Without this, the sandbox blocks `~/go/`, `~/.npm/`, `~/.cache/pip/` writes.
@@ -115,5 +116,5 @@ ASCII logo? Y/N. If yes, ask for the project name (1-2 short words, fits in 60 c
 
 - Generating a TUI without asking the stack. Always ask.
 - Re-implementing what `lazar-chat.sh` already does. If the request fits a 30-line shell loop, point at the loop.
-- Building a parallel implementation when one already exists at `workspace/lazartui/` (or wherever). Read first; modify in place if you can.
+- Building a parallel implementation when the request is to change the shipped client in `tui/`. Read and modify the existing crate.
 - Mixing event types: don't try to use `--output-format text` and parse it heuristically. Always use `stream-json` for programmatic consumers.

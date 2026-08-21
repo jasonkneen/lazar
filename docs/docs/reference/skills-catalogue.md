@@ -1,60 +1,41 @@
 # Skills catalogue
 
-As of the last ground-truth sweep, `~/lazar/skills/` holds **89 entries**
-(`ls ~/lazar/skills | wc -l`): 62 general skills plus 27 `_meta/` operating
-skills. This page is a map, not a replica — run `cat ~/lazar/skills/INDEX.md`
-for the live one-line index.
+The factory image contains 21 skills: 16 operating skills under `_meta/` and
+five user-facing skills. A runtime tree can evolve after installation, so the
+live directories remain authoritative. `LAZAR_REFRESH_BUNDLES=1 bash setup.sh`
+archives the live skill and hook trees and restores the bundled minimal set.
 
-## `_meta/` — operating basics
-
-Skills about being lazar. These outrank other skills on conflict.
+## Operating skills
 
 | Skill | Purpose |
 |---|---|
-| `memory` | Persistence across invocations; plain-markdown notes. |
-| `load-context` | Bounded recipes for reading `logs/stream.jsonl` (never `cat`). |
-| `subagent` | Delegation via `bin/lazar-spawn` / `pack-and-spawn.sh`. |
-| `harness` | Ranked durable lessons (`harness.py add/load/helpful`). |
-| `self-patch` | Fix your own recurring failures; draft kernel proposals, never self-apply. |
-| `create-skill` | Scaffold a new skill correctly. |
-| `heartbeat` | The `--tick` maintenance loop. |
-| `log-harvest` | Distill the event stream into `memory/work-journal.md`. |
-| `log-rotation` | Richer archive summaries after rotation. |
-| `checkpoint` / `session-compression` | Session state snapshots and compression. |
-| `health-check` / `first-run` / `session-startup` | Environment verification and bootstrapping. |
-| `distill` / `distill-large` | Session distillation. |
-| `propose-kernel-patch` | The only path for kernel changes (operator-applied). |
-| `find-capability` / `semantic-recall` / `embed-corpus` | Search over skills and memory. |
-| `archive-search` / `project-context` / `reviews` / `triage` / `ahe` / `loop` / `no-repeat-failed-calls` / `prune-baks` / `shell-handoff` / `skill-corpus-audit` / `session-end` / `create-tui` | Assorted maintenance and workflow skills. |
+| `_meta/archive-search` | Bounded search over rotated event archives. |
+| `_meta/create-skill` | Author a new filesystem capability. |
+| `_meta/create-tui` | Scaffold an additional client under `workspace/`; changes to the shipped client stay in `tui/`. |
+| `_meta/distill` | Curate durable lessons from an event archive. |
+| `_meta/env-vars` | Manage catalog provider credentials in macOS Keychain. |
+| `_meta/find-capability` | Find an existing capability before creating one. |
+| `_meta/harness` | Record and load concise ranked lessons. |
+| `_meta/health-check` | Verify installed kernel and runtime surfaces. |
+| `_meta/load-context` | Recover bounded prior context from logs. |
+| `_meta/log-harvest` | Turn rotated logs into a durable work journal. |
+| `_meta/log-rotation` | Enrich kernel-created rotation summaries. |
+| `_meta/project-context` | Load project-local instructions before changing a project. |
+| `_meta/propose-kernel-patch` | Create a complete source proposal with fail-closed verification. |
+| `_meta/self-patch` | Diagnose recurring failures and route kernel work through proposals. |
+| `_meta/shell-handoff` | Expose a skill through an operator-sourced shell alias. |
+| `_meta/subagent` | Delegate through locked `bin/lazar-spawn` and verify declared outcomes. |
 
-## Core behavioral skills
+## User-facing skills
 
 | Skill | Purpose |
 |---|---|
-| `verify` (VERIFY contract) | Grounding: prove claims with `[VERIFY]` blocks. |
-| `guardrails` | Toggle sandbox / trusted zones. |
-| `hooks-system` | Work with the hooks lifecycle. |
-| `model` / `model-identity` / `model-tier` / `models` | Model selection and identity. |
-| `provider-switch` / `provider-router` / `provider-failover` | Backend management (MiniMax, OpenRouter, ...). |
-| `invoke-flags` / `env-vars` | CLI flags and environment reference. |
-| `input-images` | Vision via image blocks. |
+| `guardrails` | Inspect enforcement and give the operator the exact toggle command. |
+| `harness-evals` | Score structured events and exact filesystem outcomes without prose heuristics. |
+| `lazartui` | Use, build, and troubleshoot the shipped Rust ACP client. |
+| `memory` | Read and write durable plain-markdown notes. |
+| `provider-failover` | Retry a cold prompt across catalog providers only before tool execution. |
 
-## Workflow skills (selection)
-
-`agent-dispatch`, `agent-launcher`, `agent-sessions`, `deep-research`,
-`research`, `code-search`, `repo-reviewer`, `architect-codebase-review`,
-`reverse-engineering`, `edge-case-discovery`, `hallucination-risk-reviewer`,
-`prompt-injection-auditor`, `skill-auditor`, `skill-recommender`,
-`eval-and-testing`, `harness-evals`, `gauntlet-loop`, `meta-prompting`,
-`engineering`, `dockerfile-best-practices`, `ffmpeg-workflow`,
-`pandoc-workflow`, `browser-automation`, `desktop-control`,
-`duckduckgo-search`, `obsidian-cli` / `obsidian-markdown` /
-`obsidian-bases`, `json-canvas`, `pageindex`, `mcp` / `mcp-server`,
-`lazar-status`, `lazartui`, `glazar`, `metrics`, `distill`,
-`persistent-agent-memory`, plus vendored third-party packs
-(`affaan-m-everything-claude-code`, `ComposioHQ-agent-orchestrator`,
-`NousResearch-hermes-agent`, and others).
-
-!!! note
-    This catalogue drifts — skills are added constantly. The authoritative
-    list is always `ls ~/lazar/skills/` and `cat ~/lazar/skills/INDEX.md`.
+Use `find "$LAZAR_HOME/skills" -name SKILL.md` for the live inventory and
+`$LAZAR_HOME/skills/INDEX.md` for the bundled descriptions installed at the
+last refresh.

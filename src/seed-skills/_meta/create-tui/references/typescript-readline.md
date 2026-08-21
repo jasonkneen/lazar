@@ -22,7 +22,7 @@ workspace/<name>/
 ## Setup commands
 
 ```bash
-cd $LAZAR_HOME/workspace/<name>
+cd $LAZAR_HOME/user/workspace/<name>
 
 # scoped npm cache (sandbox-safe)
 mkdir -p .npm
@@ -118,7 +118,7 @@ export function runLazar(prompt: string, opts: LazarRunOptions): Promise<{ exitC
 
 ## src/render.ts — display
 
-Three input styles, three tool display styles. Pick the user's choice at startup and pass to the renderer.
+Three input styles, four tool display styles. Pick the user's choice at startup and pass to the renderer.
 
 ```typescript
 const RESET = '\x1b[0m';
@@ -130,7 +130,7 @@ const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
 const RED = '\x1b[31m';
 
-export type ToolDisplay = 'grouped' | 'emoji' | 'minimal' | 'hidden';
+export type ToolDisplay = 'grouped' | 'status' | 'minimal' | 'hidden';
 export type InputStyle = 'block' | 'bordered' | 'plain';
 
 export interface RenderConfig {
@@ -148,8 +148,8 @@ export function onToolUse(cfg: RenderConfig, id: string, name: string, input: Re
     case 'grouped':
       process.stdout.write(`\n  ${BOLD}${name}${RESET}\n  ${GRAY}└─${RESET} ${DIM}${cmd}${RESET}\n`);
       break;
-    case 'emoji':
-      process.stdout.write(`\n  ${YELLOW}⚡${RESET} ${DIM}${name}: ${cmd}${RESET}\n`);
+    case 'status':
+      process.stdout.write(`\n  ${YELLOW}[RUN]${RESET} ${DIM}${name}: ${cmd}${RESET}\n`);
       break;
     case 'minimal':
       process.stdout.write(`\n  ${DIM}↳ ${cmd}${RESET}\n`);
@@ -166,8 +166,8 @@ export function onToolResult(cfg: RenderConfig, id: string, content: string) {
     case 'grouped':
       process.stdout.write(`  ${GRAY}└─${RESET} ${DIM}${preview}${RESET}\n`);
       break;
-    case 'emoji':
-      process.stdout.write(`  ${GREEN}✓${RESET} ${DIM}(${(ms/1000).toFixed(1)}s)${RESET}\n`);
+    case 'status':
+      process.stdout.write(`  ${GREEN}[OK]${RESET} ${DIM}(${(ms/1000).toFixed(1)}s)${RESET}\n`);
       break;
     case 'minimal':
       // already shown via tool_use
@@ -286,7 +286,7 @@ main().catch((err) => {
 ## Build + run
 
 ```bash
-cd $LAZAR_HOME/workspace/<name>
+cd $LAZAR_HOME/user/workspace/<name>
 npx tsc --noEmit       # type-check
 npm start              # runs via tsx
 ```
@@ -295,7 +295,7 @@ For a packaged launcher, add to `aliases.sh` via `_meta/shell-handoff`:
 
 ```bash
 # in workspace/aliases.sh
-alias <name>='cd $LAZAR_HOME/workspace/<name> && npm start'
+alias <name>='cd $LAZAR_HOME/user/workspace/<name> && npm start'
 ```
 
 ## Notes

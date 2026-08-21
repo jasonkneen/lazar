@@ -19,6 +19,21 @@ use crate::{lazar_home, now_millis};
 
 thread_local! {
     static IN_LOG_ROTATION_HOOK: Cell<bool> = const { Cell::new(false) };
+    static SESSION_WRITE_ERROR: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The first session-log failure in this turn, if a mirrored write did not commit.
+pub(crate) fn take_session_write_error() -> Option<String> {
+    SESSION_WRITE_ERROR.with(|slot| slot.borrow_mut().take())
+}
+
+fn note_session_write_error(message: String) {
+    SESSION_WRITE_ERROR.with(|slot| {
+        let mut current = slot.borrow_mut();
+        if current.is_none() {
+            *current = Some(message);
+        }
+    });
 }
 
 fn now_nanos() -> u128 {
@@ -229,8 +244,8 @@ fn log_archive_timestamp(path: &Path) -> Option<u128> {
 /// Load archive basenames recorded by `_meta/log-harvest` in
 /// `memory/.harvested`. Only harvested archives are eligible for prune —
 /// unharvested history is never deleted solely because keep was exceeded.
-fn harvested_archive_names(home: &Path) -> std::collections::HashSet<String> {
-    let path = home.join("memory").join(".harvested");
+fn harvested_archive_names(_home: &Path) -> std::collections::HashSet<String> {
+    let path = crate::user_dir("memory").join(".harvested");
     match fs::read_to_string(path) {
         Ok(s) => s
             .lines()
@@ -313,7 +328,7 @@ fn prune_log_archives(logs: &Path) {
 ///
 /// Auto-rotates when the log exceeds LAZAR_LOG_MAX_BYTES.
 pub(crate) fn append_stream(mut event: Value) {
-    let logs = lazar_home().join("logs");
+    let logs = crate::user_dir("logs");
     let _ = fs::create_dir_all(&logs);
     let path = logs.join("stream.jsonl");
     let lock_path = logs.join(".stream.lock");
@@ -323,7 +338,25 @@ pub(crate) fn append_stream(mut event: Value) {
     // would deadlock because hooks emit hook_start/hook_end events back
     // through this same function.
     let rotation_info = {
-        let lock = open_append_no_follow(&lock_path, "stream lock").ok();
+        let session_id = crate::core::invocation::session_id()
+            .filter(|id| session::validate_session_id(id).is_ok());
+        let kind = event.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let mirror = session_id.is_some()
+            && matches!(
+                kind,
+                "user" | "assistant" | "tool_result" | "invoke_start" | "invoke_end"
+            );
+        let lock = match open_append_no_follow(&lock_path, "stream lock") {
+            Ok(file) => Some(file),
+            Err(err) if mirror => {
+                note_session_write_error(format!("cannot lock stream log: {err}"));
+                return;
+            }
+            Err(err) => {
+                eprintln!("[lazar] WARN: cannot lock stream log: {err}");
+                None
+            }
+        };
         if let Some(lock) = lock.as_ref() {
             lock_file_exclusive(lock);
         }
@@ -343,9 +376,21 @@ pub(crate) fn append_stream(mut event: Value) {
 
         match open_append_no_follow(&path, "stream log") {
             Ok(mut f) => {
-                let _ = writeln!(f, "{}", event);
+                if let Err(err) = writeln!(f, "{event}") {
+                    if mirror {
+                        note_session_write_error(format!("failed to append stream log: {err}"));
+                    } else {
+                        eprintln!("[lazar] WARN: failed to append stream log: {err}");
+                    }
+                }
             }
-            Err(e) => eprintln!("[lazar] WARN: failed to append stream log: {e}"),
+            Err(err) => {
+                if mirror {
+                    note_session_write_error(format!("failed to append stream log: {err}"));
+                } else {
+                    eprintln!("[lazar] WARN: failed to append stream log: {err}");
+                }
+            }
         }
 
         // If a session id is set for this invocation, mirror the event
@@ -353,18 +398,10 @@ pub(crate) fn append_stream(mut event: Value) {
         // next invocation. Skipped for hook_start/hook_end and rotation
         // bookkeeping events — those are kernel-internal and don't need
         // to be in the session-level history.
-        if let Ok(session_id) = env::var("LAZAR_SESSION_ID") {
-            if !session_id.is_empty() && session::validate_session_id(&session_id).is_ok() {
-                let kind = event
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let mirror = matches!(
-                    kind,
-                    "user" | "assistant" | "tool_result" | "invoke_start" | "invoke_end"
-                );
-                if mirror {
-                    session::append_session(&session_id, event.clone());
+        if mirror {
+            if let Some(session_id) = session_id {
+                if let Err(err) = session::append_session(&session_id, event.clone()) {
+                    note_session_write_error(err);
                 }
             }
         }

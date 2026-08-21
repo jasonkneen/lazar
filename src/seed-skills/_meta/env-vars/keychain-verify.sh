@@ -5,10 +5,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "$HERE/keychain-common.sh"
-PASS=0; FAIL=0; SKIP=0; MISS=0
+PASS=0; FAIL=0; MISS=0
 ok(){ echo "  [PASS] $1"; PASS=$((PASS+1)); }
 no(){ echo "  [FAIL] $1 — $2"; FAIL=$((FAIL+1)); }
-sk(){ echo "  [SKIP] $1 — $2"; SKIP=$((SKIP+1)); }
 ms(){ echo "  [MISS] $1"; MISS=$((MISS+1)); }
 # HTTP helper: status code only. Args after URL are curl args (headers etc).
 http_code() {
@@ -16,104 +15,49 @@ http_code() {
   curl -sS -o /tmp/lazar-kc-verify-body.$$ -w '%{http_code}' --max-time 20 "$@" "$url" 2>/dev/null \
     || echo "000"
 }
-# probe_provider NAME URL AUTH_STYLE EXTRA_PASS EXTRA_REJECT (AUTH_STYLE: bearer|xapikey|querykey)
-probe_provider() {
-  local name="$1" url="$2" auth="$3" extra_pass="${4:-NONE}" extra_reject="${5:-NONE}"
-  local val code
+# probe_messages NAME BASE_URL MODEL — one tiny Anthropic-Messages call against
+# the provider that actually owns the key. Never against a proxy or another
+# provider's base: a key is valid only where it was issued.
+probe_messages() {
+  local name="$1" base="$2" model="$3" val code
   if ! val=$(kc_get "$name" 2>/dev/null); then ms "$name"; return; fi
-  case "$auth" in
-    bearer)   code=$(http_code "$url" -H "Authorization: Bearer $val") ;;
-    xapikey)  code=$(http_code "$url" -H "X-API-KEY: $val") ;;
-    querykey) code=$(http_code "${url}?key=${val}") ;;
-  esac
+  code=$(http_code "${base%/}/v1/messages" \
+    -H "x-api-key: $val" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "content-type: application/json" \
+    -d "{\"model\":\"$model\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}")
   case "$code" in
-    200|$extra_pass) ok "$name (HTTP $code)" ;;
-    401|403|$extra_reject) no "$name" "auth rejected HTTP $code" ;;
-    *) no "$name" "HTTP $code" ;;
+    200) ok "$name ($model @ $base, HTTP $code)" ;;
+    401|403) no "$name" "auth rejected HTTP $code at $base" ;;
+    *) no "$name" "HTTP $code at $base" ;;
   esac
 }
+
 echo "Verifying Keychain keys (service=$LAZAR_KC_SERVICE)"
 echo "────────────────────────────────────────"
-# --- MINIMAX (Anthropic-compatible) ---
-if val=$(kc_get MINIMAX_API_KEY 2>/dev/null); then
-  code=$(http_code "https://api.minimax.io/anthropic/v1/messages" \
-    -H "x-api-key: $val" \
-    -H "anthropic-version: 2023-06-01" \
-    -H "content-type: application/json" \
-    -d '{"model":"MiniMax-M2.5-highspeed","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}')
-  case "$code" in
-    200) ok "MINIMAX_API_KEY (HTTP $code)" ;;
-    401|403) no "MINIMAX_API_KEY" "auth rejected HTTP $code" ;;
-    *) no "MINIMAX_API_KEY" "HTTP $code" ;;
-  esac
-else ms MINIMAX_API_KEY; fi
 
-# --- ANTHROPIC (may be MiniMax key pointed at MiniMax base, or real Anthropic) ---
-if val=$(kc_get ANTHROPIC_API_KEY 2>/dev/null); then
-  # Prefer env BASE_URL if set, else try Anthropic then MiniMax
-  BASE="${ANTHROPIC_BASE_URL:-}"
-  if [ -z "$BASE" ] && [ -f "${LAZAR_HOME:-$HOME/lazar}/.env" ]; then
-    BASE=$(grep -E '^ANTHROPIC_BASE_URL=' "${LAZAR_HOME:-$HOME/lazar}/.env" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
-  fi
-  BASE="${BASE:-https://api.anthropic.com}"
-  BASE="${BASE%/}"
-  code=$(http_code "$BASE/v1/messages" \
-    -H "x-api-key: $val" \
-    -H "anthropic-version: 2023-06-01" \
-    -H "content-type: application/json" \
-    -d '{"model":"claude-3-5-haiku-latest","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}')
-  # MiniMax keys on MiniMax base often return 200 with MiniMax model names; wrong model may 400
-  case "$code" in
-    200) ok "ANTHROPIC_API_KEY via $BASE (HTTP $code)" ;;
-    400|404)
-      # retry with MiniMax model if base looks like minimax
-      if printf '%s' "$BASE" | rg -qi minimax; then
-        code2=$(http_code "$BASE/v1/messages" \
-          -H "x-api-key: $val" \
-          -H "anthropic-version: 2023-06-01" \
-          -H "content-type: application/json" \
-          -d '{"model":"MiniMax-M2.5-highspeed","max_tokens":16,"messages":[{"role":"user","content":"ping"}]}')
-        case "$code2" in
-          200) ok "ANTHROPIC_API_KEY via $BASE MiniMax model (HTTP $code2)" ;;
-          *) no "ANTHROPIC_API_KEY" "HTTP $code then $code2 at $BASE" ;;
-        esac
-      else
-        # 400 can mean key works but model invalid — treat as soft pass
-        ok "ANTHROPIC_API_KEY accepted path (HTTP $code at $BASE — model may differ)"
-      fi
-      ;;
-    401|403) no "ANTHROPIC_API_KEY" "auth rejected HTTP $code at $BASE" ;;
-    *) no "ANTHROPIC_API_KEY" "HTTP $code at $BASE" ;;
-  esac
-else ms ANTHROPIC_API_KEY; fi
-probe_provider OPENROUTER_API_KEY "https://openrouter.ai/api/v1/models"              bearer
-probe_provider XAI_API_KEY        "https://api.x.ai/v1/models"                        bearer
-probe_provider FIREWORKS_API_KEY  "https://api.fireworks.ai/inference/v1/models"      bearer
-probe_provider NVIDIA_API_KEY     "https://integrate.api.nvidia.com/v1/models"        bearer
-probe_provider GEMINI_API_KEY     "https://generativelanguage.googleapis.com/v1beta/models" querykey NONE 400
-# --- ZEN (Claude via zenmux / similar — try Anthropic-shaped if key looks like sk-) ---
-if val=$(kc_get ZEN_API_KEY 2>/dev/null); then
-  # Heuristic: try common zenmux endpoint; if unknown, format check only
-  code=$(http_code "https://zenmux.ai/api/v1/models" \
-    -H "Authorization: Bearer $val")
-  case "$code" in
-    200) ok "ZEN_API_KEY (HTTP $code)" ;;
-    401|403) no "ZEN_API_KEY" "auth rejected HTTP $code" ;;
-    000|404)
-      # fallback: key format presence
-      if [ "${#val}" -ge 20 ]; then
-        sk "ZEN_API_KEY" "endpoint unknown/unreachable (HTTP $code); key present ${#val} chars"
-      else
-        no "ZEN_API_KEY" "HTTP $code and key looks short"
-      fi
-      ;;
-    *) sk "ZEN_API_KEY" "unexpected HTTP $code (endpoint may differ)" ;;
-  esac
-else ms ZEN_API_KEY; fi
-probe_provider E2B_API_KEY        "https://api.e2b.dev/sandboxes"                     xapikey 201
-probe_provider OPENAI_API_KEY     "https://api.openai.com/v1/models"                  bearer
+# --- Cross-provider duplicates: the same secret stored under two names means a
+# proxy alias (e.g. ANTHROPIC_API_KEY="$MINIMAX_API_KEY") was persisted. Every
+# request to the provider that did NOT issue the key will 401.
+declare -a _kc_seen_names=() _kc_seen_vals=()
+for _name in "${LAZAR_KEY_NAMES[@]}"; do
+  _val=$(kc_get "$_name" 2>/dev/null) || continue
+  for _i in "${!_kc_seen_vals[@]}"; do
+    if [ "${_kc_seen_vals[$_i]}" = "$_val" ]; then
+      no "$_name" "identical to ${_kc_seen_names[$_i]} — one of them is the wrong provider's key; re-store the real one"
+    fi
+  done
+  _kc_seen_names+=("$_name"); _kc_seen_vals+=("$_val")
+done
+unset _kc_seen_names _kc_seen_vals _name _val _i
+
+probe_messages ANTHROPIC_API_KEY   "https://api.anthropic.com"        "claude-haiku-4-5"
+probe_messages MINIMAX_API_KEY     "https://api.minimax.io/anthropic" "MiniMax-M3"
+probe_messages KIMI_API_KEY        "https://api.moonshot.ai/anthropic" "kimi-k3[1m]"
+probe_messages KIMI_CODING_API_KEY "https://api.kimi.com/coding"      "kimi-k3"
+probe_messages OPENROUTER_API_KEY  "https://openrouter.ai/api"        "anthropic/claude-haiku-4.5"
 rm -f /tmp/lazar-kc-verify-body.$$ 2>/dev/null
 
 echo "────────────────────────────────────────"
-echo "PASS=$PASS  FAIL=$FAIL  SKIP=$SKIP  MISS=$MISS"
+echo "PASS=$PASS  FAIL=$FAIL  MISS=$MISS"
 [ "$FAIL" -eq 0 ]

@@ -7,7 +7,7 @@
 #   layer: behavioral | config | kernel-proposal
 set -uo pipefail
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
-LEDGER="$LAZAR_HOME/memory/distilled/self-patch.md"
+LEDGER="$LAZAR_HOME/user/memory/distilled/self-patch.md"
 mkdir -p "$(dirname "$LEDGER")"
 
 [ $# -eq 5 ] || { echo "usage: ledger.sh <layer> <symptom> <cause> <fix> <verification>" >&2; exit 2; }

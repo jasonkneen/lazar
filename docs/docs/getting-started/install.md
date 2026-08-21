@@ -6,6 +6,10 @@
   `chflags uchg` for the kernel binary lock.
 - **Rust toolchain** (`cargo` + `rustc`) — the kernel is a Rust binary built
   from `src/`.
+- **Python 3** — bounds proposal verification and runs bundled eval tooling.
+- **rsync** — makes proposal application and rollback checksum-safe.
+- **jq** and **ripgrep** (`rg`) — used by the locked spawn/failover helpers and
+  the fail-closed spawn-discipline hook.
 - An API key for an Anthropic-protocol provider (see
   [Configuration](configuration.md)).
 
@@ -23,10 +27,11 @@ lazar -p "what skills do you have?"
 `setup.sh` builds the kernel with an external Cargo target directory
 (`$LAZAR_HOME/workspace/.cargo-target` by default), installs the binary at
 `~/lazar/bin/lazar`, locks it with `chflags uchg`, and seeds `skills/` and
-`hooks/` from the copies embedded in the binary. Re-running setup preserves
+`hooks/` from the source-controlled factory copies. Re-running setup preserves
 existing skills, memory, workspace, logs, and source unless you explicitly opt
-in (`LAZAR_UPDATE_SOURCE=1` to refresh source, `LAZAR_RESET_ALL=1` for a factory
-reset after rebuild).
+in (`LAZAR_UPDATE_SOURCE=1` to refresh source,
+`LAZAR_REFRESH_BUNDLES=1` to archive and reseed skills/hooks, or
+`LAZAR_RESET_ALL=1` for a factory reset after rebuild).
 
 ## Verify the install
 

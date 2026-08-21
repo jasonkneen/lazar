@@ -16,7 +16,7 @@ Do NOT run this on every prompt. Once per archive is plenty.
 
 ## Hard rules
 
-- `logs/` is trusted kernel-owned state. Do not `mv`, `gzip`, `rm`, truncate, or write anything under `$LAZAR_HOME/logs` from a sandboxed skill or hook.
+- `logs/` is trusted kernel-owned state. Do not `mv`, `gzip`, `rm`, truncate, or write anything under `$LAZAR_HOME/user/logs` from a sandboxed skill or hook.
 - Rotation itself is kernel-owned and non-destructive at the moment it happens: the live log moves to `.bak`, and the next append creates a fresh `stream.jsonl`.
 - Full-fidelity archive retention is kernel policy, controlled by `LAZAR_LOG_ARCHIVE_KEEP`. Summaries in `memory/log-summaries/` are the durable navigation layer.
 - Write enriched summaries only under `$LAZAR_MEMORY`, usually `memory/log-summaries/` or `memory/distilled/`.
@@ -26,22 +26,22 @@ Do NOT run this on every prompt. Once per archive is plenty.
 
 ### Check current stream size
 
-    LOG=$LAZAR_HOME/logs/stream.jsonl
+    LOG=$LAZAR_HOME/user/logs/stream.jsonl
     [ -f "$LOG" ] && wc -c "$LOG"
 
 ### Pick the newest rotated archive
 
-    ARCHIVE=$(ls -t $LAZAR_HOME/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
+    ARCHIVE=$(ls -t $LAZAR_HOME/user/logs/stream.jsonl.*.bak 2>/dev/null | head -n 1)
     [ -n "$ARCHIVE" ] || { echo "no raw archive found"; exit 0; }
 
 If an archive has already been pruned by the kernel, use the matching `memory/log-summaries/<ts>.md` summary as the durable record.
 
 ### Enrich the summary for one archive
 
-    ARCHIVE=$LAZAR_HOME/logs/stream.jsonl.<TS>.bak
+    ARCHIVE=$LAZAR_HOME/user/logs/stream.jsonl.<TS>.bak
     TS=$(basename "$ARCHIVE" .bak | sed 's/^stream\.jsonl\.//')
-    SUM=$LAZAR_HOME/memory/log-summaries/${TS}.md
-    mkdir -p "$LAZAR_HOME/memory/log-summaries"
+    SUM=$LAZAR_HOME/user/memory/log-summaries/${TS}.md
+    mkdir -p "$LAZAR_HOME/user/memory/log-summaries"
 
     {
       echo ""
@@ -69,9 +69,9 @@ If an archive has already been pruned by the kernel, use the matching `memory/lo
 
 The three tiers of memory:
 
-- **L1**: `$LAZAR_HOME/logs/stream.jsonl` (current, raw) — bounded `tail`/`rg` via `_meta/load-context`.
-- **L2**: `$LAZAR_HOME/memory/log-summaries/<ts>.md` — minimal entries written by the kernel, optionally enriched by this skill.
-- **L3**: `$LAZAR_HOME/logs/stream.jsonl.*.bak` (recent full-fidelity archives) — searched via `_meta/archive-search` only when L1+L2 don't have what's needed. Kernel retention may prune old L3 archives.
+- **L1**: `$LAZAR_HOME/user/logs/stream.jsonl` (current, raw) — bounded `tail`/`rg` via `_meta/load-context`.
+- **L2**: `$LAZAR_HOME/user/memory/log-summaries/<ts>.md` — minimal entries written by the kernel, optionally enriched by this skill.
+- **L3**: `$LAZAR_HOME/user/logs/stream.jsonl.*.bak` (recent full-fidelity archives) — searched via `_meta/archive-search` only when L1+L2 don't have what's needed. Kernel retention may prune old L3 archives.
 
 Never `cat` an archive. Always use `rg`, `jq`, `head`, or `tail` with explicit bounds.
 

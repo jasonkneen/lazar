@@ -1,0 +1,5 @@
+{"type":"invoke_start","model":"test","ts_ms":1}
+{"type":"tool_use","id":"c1","name":"bash","input":{"command":"echo HARNESS_TOOL_OK_ABC"}}
+{"type":"tool_result","tool_use_id":"c1","content":"HARNESS_TOOL_OK_ABC\n[exit 0]","exit_code":0}
+{"type":"text_delta","text":"Done."}
+{"type":"invoke_end","stop_reason":"end_turn"}

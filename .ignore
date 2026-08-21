@@ -23,8 +23,16 @@ workspace/.gomodcache/
 workspace/gopath/
 workspace/.gopath/
 workspace/kernel-backups/
+workspace/proposals/
 workspace/web-fetch-cache/
+workspace/.npm-cache/
+workspace/.pnpm-cache/
+workspace/.xdg-cache/
+workspace/pageindex-venv/
+workspace/python-deps/
 workspace/.cargo-target*/
 src/target/
+tui/target/
+user/
 logs/*.bak
 logs/*.bak.gz

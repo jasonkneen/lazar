@@ -1,0 +1,11 @@
+{
+  "id": "fixture.artifact",
+  "suite": "outcomes",
+  "title": "filesystem state is authoritative",
+  "prompt": "unused",
+  "checks": [
+    {"type": "fs_exact", "path": "{{workdir}}/artifact.txt", "content": "ARTIFACT_{{token}}\n"},
+    {"type": "stream_min_tool_calls", "min": 1},
+    {"type": "stream_end_ok"}
+  ]
+}

@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+# harness-evals — backend-agnostic harness evaluation runner for coding agents.
+# Measures structured tool evidence, exact filesystem outcomes, recovery, and
+# clean termination. Assistant prose is never evidence.
+#
+# Usage:
+#   harness-evals run                          # default suites, lazar adapter
+#   harness-evals run --suite core,outcomes
+#   harness-evals run --adapter lazar --provider kimi
+#   harness-evals run --adapter command --cmd 'my-agent --jsonl -p {{prompt}}'
+#   harness-evals score --stream run.jsonl --task task.json
+#   harness-evals list
+#   harness-evals report [results-dir]
+#   harness-evals compare a.json b.json
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
+PYTHON="${HARNESS_EVALS_PYTHON:-python3}"
+SCORE_PY="$SKILL_DIR/lib/score_stream.py"
+TIMEOUT_PY="$SKILL_DIR/lib/run_with_timeout.py"
+RESULTS_ROOT="${HARNESS_EVALS_RESULTS:-$LAZAR_HOME/user/workspace/evals/results}"
+MANIFEST="$SKILL_DIR/manifest.json"
+
+die(){ echo "harness-evals: $*" >&2; exit 2; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+safe_slug(){
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$1" != *".."* ]]
+}
+
+need "$PYTHON"
+need jq
+
+ts_utc(){ date -u +%Y%m%dT%H%M%SZ; }
+rand_token(){ "$PYTHON" -c 'import secrets; print(secrets.token_hex(4).upper())'; }
+
+cmd="${1:-}"
+[[ -n "$cmd" ]] || { head -40 "$0" | sed -n '2,20p'; exit 2; }
+shift || true
+
+list_tasks() {
+  local suites="${1:-}"
+  if [[ -z "$suites" ]]; then
+    suites=$(jq -r '.default_suites | join(",")' "$MANIFEST")
+  fi
+  IFS=',' read -r -a arr <<< "$suites"
+  for s in "${arr[@]}"; do
+    s=$(echo "$s" | xargs)
+    safe_slug "$s" || die "unsafe suite name: $s"
+    f="$SKILL_DIR/tasks/$s/tasks.jsonl"
+    [[ -f "$f" ]] || die "unknown suite: $s"
+    echo "# suite=$s"
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      jq -r '"\(.id)\t\(.title)"' <<<"$line"
+    done < "$f"
+  done
+}
+
+load_tasks() {
+  local suites="$1"
+  local out="$2"
+  : > "$out"
+  IFS=',' read -r -a arr <<< "$suites"
+  for s in "${arr[@]}"; do
+    s=$(echo "$s" | xargs)
+    safe_slug "$s" || die "unsafe suite name: $s"
+    f="$SKILL_DIR/tasks/$s/tasks.jsonl"
+    [[ -f "$f" ]] || die "unknown suite: $s"
+    cat "$f" >> "$out"
+  done
+}
+
+# ── adapters ───────────────────────────────────────────────────────────────
+# Each adapter writes NDJSON events to $stream_path and leaves artifacts in workdir.
+
+run_adapter_lazar() {
+  # env: prompt, model, provider, stream_path, workdir, timeout
+  local bin="${LAZAR_BIN:-$LAZAR_HOME/bin/lazar}"
+  [[ -x "$bin" ]] || die "lazar binary not found at $bin"
+  local tmo="${timeout:-120}"
+  [[ "$tmo" =~ ^[0-9]+$ && "$tmo" -gt 0 ]] || die "invalid task timeout: $tmo"
+
+  # Build argv without empty-array expansion (bash 3.2 + set -u safe).
+  set -- --output-format stream-json --cwd "$workdir" --add-dir "$workdir"
+  if [[ -n "${provider:-}" ]]; then
+    set -- "$@" --provider "$provider"
+  fi
+  if [[ -n "${model:-}" ]]; then
+    set -- "$@" --model "$model"
+  fi
+  set -- "$@" -p "$prompt"
+
+  if "$PYTHON" "$TIMEOUT_PY" --timeout "$tmo" --stdout "$stream_path" \
+      --stderr "$workdir/stderr.txt" --cwd "$workdir" -- "$bin" "$@"; then
+    adapter_rc=0
+  else
+    adapter_rc=$?
+  fi
+  printf '%s\n' "$adapter_rc" >"$workdir/adapter-exit-code"
+}
+
+run_adapter_stream_jsonl() {
+  # Replay a pre-recorded stream (for dry runs / CI fixtures)
+  local src="${HARNESS_EVALS_STREAM_FIXTURE:-}"
+  [[ -n "$src" && -f "$src" ]] || die "stream-jsonl adapter needs HARNESS_EVALS_STREAM_FIXTURE=path"
+  cp "$src" "$stream_path"
+  printf '%s\n' 0 >"$workdir/adapter-exit-code"
+}
+
+shell_quote() {
+  "$PYTHON" -c 'import shlex,sys; print(shlex.quote(sys.argv[1]))' "$1"
+}
+
+run_adapter_command() {
+  # Placeholders expand as shell-escaped argv tokens. Do not quote them again
+  # in the command template.
+  local tmpl="${HARNESS_EVALS_CMD:-${cmd_template:-}}"
+  [[ -n "$tmpl" ]] || die "command adapter needs --cmd or HARNESS_EVALS_CMD"
+  local run_cmd="$tmpl"
+  run_cmd="${run_cmd//\{\{prompt\}\}/$(shell_quote "$prompt")}"
+  run_cmd="${run_cmd//\{\{workdir\}\}/$(shell_quote "$workdir")}"
+  run_cmd="${run_cmd//\{\{stream\}\}/$(shell_quote "$stream_path")}"
+  run_cmd="${run_cmd//\{\{token\}\}/$(shell_quote "$token")}"
+  run_cmd="${run_cmd//\{\{lazar_home\}\}/$(shell_quote "$LAZAR_HOME")}"
+  if "$PYTHON" "$TIMEOUT_PY" --timeout "$timeout" \
+      --stdout "$workdir/adapter-stdout.txt" --stderr "$workdir/stderr.txt" \
+      --cwd "$workdir" -- bash -lc "$run_cmd"; then
+    adapter_rc=0
+  else
+    adapter_rc=$?
+  fi
+  printf '%s\n' "$adapter_rc" >"$workdir/adapter-exit-code"
+  # If command didn't write stream, try to treat stdout as stream
+  if [[ ! -s "$stream_path" && -s "$workdir/adapter-stdout.txt" ]]; then
+    cp "$workdir/adapter-stdout.txt" "$stream_path"
+  fi
+}
+
+run_one_task() {
+  local task_json="$1"
+  local run_dir="$2"
+  local adapter="$3"
+  local provider="$4"
+  local model="$5"
+
+  local id suite title timeout
+  id=$(jq -r .id <<<"$task_json")
+  suite=$(jq -r .suite <<<"$task_json")
+  title=$(jq -r .title <<<"$task_json")
+  timeout=$(jq -r '.timeout_s // 120' <<<"$task_json")
+  safe_slug "$id" || die "unsafe task id: $id"
+
+  local rep="${rep:-1}"
+  local task_dir="$run_dir/tasks/$id/r$rep"
+  mkdir -p "$task_dir/workdir"
+  local workdir="$task_dir/workdir"
+  local stream_path="$task_dir/stream.jsonl"
+  local token
+  token=$(rand_token)
+
+  local prompt_tmpl prompt
+  prompt_tmpl=$(jq -r .prompt <<<"$task_json")
+  prompt="${prompt_tmpl//\{\{token\}\}/$token}"
+  prompt="${prompt//\{\{workdir\}\}/$workdir}"
+  prompt="${prompt//\{\{lazar_home\}\}/$LAZAR_HOME}"
+
+  # persist task + ctx
+  printf '%s\n' "$task_json" >"$task_dir/task.json"
+  jq -n --arg token "$token" --arg workdir "$workdir" --arg lazar_home "$LAZAR_HOME" \
+    '{token:$token, workdir:$workdir, lazar_home:$lazar_home}' >"$task_dir/ctx.json"
+  printf '%s\n' "$prompt" >"$task_dir/prompt.txt"
+
+  if [[ "${repeat_total:-1}" -gt 1 ]]; then
+    echo "> $id  ($suite)  rep $rep/${repeat_total}"
+  else
+    echo "> $id  ($suite)  adapter=$adapter provider=${provider:--} model=${model:-default}"
+  fi
+
+  : >"$stream_path"
+  case "$adapter" in
+    lazar) run_adapter_lazar ;;
+    stream-jsonl|fixture) run_adapter_stream_jsonl ;;
+    command|cmd) run_adapter_command ;;
+    *) die "unknown adapter: $adapter" ;;
+  esac
+
+  # score
+  local score_path="$task_dir/score.json"
+  set +e
+  "$PYTHON" "$SCORE_PY" "$stream_path" --task "$task_dir/task.json" \
+    --adapter-exit-code "$(cat "$workdir/adapter-exit-code")" \
+    --ctx "$(cat "$task_dir/ctx.json")" --out "$score_path" >/dev/null 2>"$task_dir/score-stderr.txt"
+  local rc=$?
+  set -e
+
+  # stamp repetition index into the score record
+  if [[ -f "$score_path" ]]; then
+    jq --argjson rep "$rep" '. + {rep:$rep}' "$score_path" >"$score_path.tmp" && mv "$score_path.tmp" "$score_path"
+  fi
+  local status
+  status=$(jq -r .status "$score_path" 2>/dev/null || echo fail)
+  local m
+  m=$(jq -r '"tools=\(.metrics.tool_calls) failed_tools=\(.metrics.failed_tool_results) terminal=\(.metrics.terminal_ok)"' "$score_path" 2>/dev/null || echo "")
+  case "$status" in
+    pass) echo "  PASS  $id - $title   [$m]" ;;
+    error) echo "  ERROR $id - $title (invalid or incomplete stream)   [$m]" ;;
+    skip_optional) echo "  SKIP  $id - $title (optional)   [$m]"
+                   jq -r '.checks[] | select(.ok|not) | "    - \(.type): \(.note)"' "$score_path" 2>/dev/null || true ;;
+    *) echo "  FAIL  $id - $title   [$m]"
+       jq -r '.checks[] | select(.ok|not) | "    - \(.type): \(.note)"' "$score_path" 2>/dev/null || true ;;
+  esac
+  return 0
+}
+
+cmd_run() {
+  local suites adapter provider model label task_filter
+  suites=$(jq -r '.default_suites | join(",")' "$MANIFEST")
+  adapter="lazar"
+  provider="${HARNESS_EVALS_PROVIDER:-${LAZAR_PROVIDER:-}}"
+  model="${EVAL_MODEL:-${LAZAR_MODEL:-}}"
+  label=""
+  task_filter=""
+  cmd_template=""
+  repeat_total="${HARNESS_EVALS_REPEAT:-1}"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --suite|--suites) suites="$2"; shift 2 ;;
+      --adapter) adapter="$2"; shift 2 ;;
+      --provider|--backend) provider="$2"; shift 2 ;;
+      --model) model="$2"; shift 2 ;;
+      --cmd) cmd_template="$2"; adapter="command"; shift 2 ;;
+      --label) label="$2"; shift 2 ;;
+      --task) task_filter="$2"; shift 2 ;;
+      --repeat) repeat_total="$2"; shift 2 ;;
+      --results) RESULTS_ROOT="$2"; shift 2 ;;
+      -h|--help) sed -n '2,20p' "$0"; return 0 ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  [[ "$repeat_total" =~ ^[0-9]+$ && "$repeat_total" -gt 0 ]] || die "--repeat must be a positive integer"
+  if [[ -n "$task_filter" ]] && ! safe_slug "$task_filter"; then
+    die "--task must be a safe task ID"
+  fi
+  if [[ -n "$label" ]] && ! safe_slug "$label"; then
+    die "--label must be a safe slug"
+  fi
+
+  # Provider/model only describe the Lazar adapter; blank them for foreign agents.
+  if [[ "$adapter" != "lazar" ]]; then
+    provider=""
+    model=""
+  fi
+
+  local run_id
+  run_id="$(ts_utc).$$"
+  [[ -n "$label" ]] && run_id="${run_id}_${label}"
+  local run_dir="$RESULTS_ROOT/$run_id"
+  mkdir -p "$run_dir/tasks"
+
+  local tasks_file="$run_dir/tasks.jsonl"
+  load_tasks "$suites" "$tasks_file"
+  if [[ -n "$task_filter" ]]; then
+    jq -c --arg id "$task_filter" 'select(.id == $id)' "$tasks_file" >"$tasks_file.filtered"
+    [[ -s "$tasks_file.filtered" ]] || die "task not found in selected suites: $task_filter"
+    mv "$tasks_file.filtered" "$tasks_file"
+  fi
+
+  # meta
+  jq -n \
+    --arg id "$run_id" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --arg adapter "$adapter" \
+    --arg provider "$provider" \
+    --arg model "$model" \
+    --arg suites "$suites" \
+    --arg host "$(hostname 2>/dev/null || echo unknown)" \
+    --arg lazar_home "$LAZAR_HOME" \
+    '{schema_version:2,id:$id,ts:$ts,adapter:$adapter,provider:$provider,model:$model,suites:$suites,host:$host,lazar_home:$lazar_home,kind:"harness-evals"}' \
+    >"$run_dir/meta.json"
+
+  echo "===================================================="
+  echo " harness-evals  run=$run_id"
+  echo " adapter=$adapter  provider=${provider:--}  model=${model:-default}"
+  echo " suites=$suites"
+  echo " results=$run_dir"
+  echo "===================================================="
+
+  local total=0 pass=0 fail=0 fail_opt=0 errored=0
+  export repeat_total
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local tid tpass=0
+    tid=$(jq -r .id <<<"$line")
+    export prompt workdir stream_path token timeout provider model cmd_template rep
+    timeout=$(jq -r '.timeout_s // 120' <<<"$line")
+
+    for (( rep=1; rep<=repeat_total; rep++ )); do
+      total=$((total+1))
+      run_one_task "$line" "$run_dir" "$adapter" "$provider" "$model"
+      local st
+      st=$(jq -r .status "$run_dir/tasks/$tid/r$rep/score.json" 2>/dev/null || echo fail)
+      case "$st" in
+        pass) pass=$((pass+1)); tpass=$((tpass+1)) ;;
+        error) errored=$((errored+1)) ;;
+        skip_optional) fail_opt=$((fail_opt+1)) ;;
+        *) fail=$((fail+1)) ;;
+      esac
+    done
+
+    if [[ "$repeat_total" -gt 1 ]]; then
+      echo "  $tid consistency: $tpass/$repeat_total"
+    fi
+  done < "$tasks_file"
+
+  # summary
+  local summary
+  summary=$(jq -n \
+    --argjson total "$total" --argjson pass "$pass" --argjson fail "$fail" --argjson fail_opt "$fail_opt" \
+    --argjson errored "$errored" \
+    --arg rate "$( "$PYTHON" -c "print(round(100.0*$pass/max($total,1),1))" )" \
+    --arg vrate "$( "$PYTHON" -c "d=$total-$errored; print(round(100.0*$pass/max(d,1),1))" )" \
+    --argjson repeat "${repeat_total:-1}" \
+    '{total:$total, pass:$pass, fail:$fail, error:$errored, skipped_optional:$fail_opt, pass_rate:$rate, pass_rate_valid:$vrate, repeat:$repeat}')
+  echo "$summary" | tee "$run_dir/summary.json"
+  # also flatten scores
+  jq -s '.' "$run_dir"/tasks/*/r*/score.json >"$run_dir/scores.json" 2>/dev/null || echo '[]' >"$run_dir/scores.json"
+
+  echo
+  echo "DONE  pass=$pass  fail=$fail  error=$errored  optional_fail=$fail_opt  total=$total"
+  echo "      pass_rate=$(jq -r .pass_rate "$run_dir/summary.json")%  (excluding infra errors: $(jq -r .pass_rate_valid "$run_dir/summary.json")%)"
+  echo "results: $run_dir"
+  # Required infrastructure errors are gate failures too. A timeout-only run
+  # must never look green.
+  [[ "$fail" -eq 0 && "$errored" -eq 0 ]]
+}
+
+cmd_score() {
+  local stream="" task="" ctx="{}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stream) stream="$2"; shift 2 ;;
+      --task) task="$2"; shift 2 ;;
+      --ctx) ctx="$2"; shift 2 ;;
+      *) [[ -z "$stream" && -f "$1" ]] && { stream="$1"; shift; continue; }
+         die "score: unknown $1" ;;
+    esac
+  done
+  [[ -n "$stream" && -n "$task" ]] || die "score needs --stream and --task"
+  "$PYTHON" "$SCORE_PY" "$stream" --task "$task" --ctx "$ctx"
+}
+
+cmd_report() {
+  local dir="${1:-$RESULTS_ROOT}"
+  [[ -d "$dir" ]] || die "no results dir: $dir"
+  echo "Harness-eval runs in $dir"
+  echo
+  printf '%-28s %-10s %-12s %-8s %-8s %-8s %s\n' RUN ADAPTER PROVIDER PASS FAIL RATE MODEL
+  for d in "$dir"/*/; do
+    [[ -f "$d/summary.json" && -f "$d/meta.json" ]] || continue
+    jq -r --arg base "$(basename "$d")" \
+      '[ $base,
+         (.meta.adapter // "?"),
+         (.meta.provider // .meta.backend // "-"),
+         (.summary.pass|tostring),
+         (.summary.fail|tostring),
+         ((.summary.pass_rate|tostring)+"%"),
+         (.meta.model // "-")
+       ] | @tsv' \
+      <(jq -n --slurpfile s "$d/summary.json" --slurpfile m "$d/meta.json" '{summary:$s[0], meta:$m[0]}') \
+      | awk -F'\t' '{printf "%-28s %-10s %-12s %-8s %-8s %-8s %s\n", $1,$2,$3,$4,$5,$6,$7}'
+  done
+}
+
+cmd_compare() {
+  local a="${1:-}" b="${2:-}"
+  [[ -n "$a" && -n "$b" ]] || die "usage: harness-evals compare <runA|scores.json> <runB|scores.json>"
+  # Accept either a run directory or a scores.json path.
+  [[ -d "$a" ]] && a="$a/scores.json"
+  [[ -d "$b" ]] && b="$b/scores.json"
+  [[ -f "$a" ]] || die "not found: $a"
+  [[ -f "$b" ]] || die "not found: $b"
+  "$PYTHON" - "$a" "$b" <<'PY'
+import json
+import sys
+from collections import defaultdict
+
+def agg(path):
+    rows = json.load(open(path))
+    d = defaultdict(lambda: {"pass": 0, "n": 0, "optional": False})
+    for r in rows:
+        k = r.get("id")
+        d[k]["n"] += 1
+        d[k]["optional"] = bool(r.get("optional"))
+        if r.get("passed"):
+            d[k]["pass"] += 1
+    return d
+
+A = agg(sys.argv[1])
+B = agg(sys.argv[2])
+ids = sorted(set(A) | set(B))
+
+def cell(x):
+    if x is None:
+        return "-"
+    return f'{x["pass"]}/{x["n"]}'
+
+def rate(x):
+    if x is None or x["n"] == 0:
+        return None
+    return x["pass"] / x["n"]
+
+print(f"{'ID':<40} {'A':<8} {'B':<8} DELTA")
+regress = improve = 0
+for i in ids:
+    a, b = A.get(i), B.get(i)
+    ra, rb = rate(a), rate(b)
+    delta = ""
+    if ra is not None and rb is not None:
+        if rb < ra:
+            delta = "REGRESS"
+            regress += 1
+        elif rb > ra:
+            delta = "IMPROVE"
+            improve += 1
+    print(f"{i:<40} {cell(a):<8} {cell(b):<8} {delta}")
+
+print()
+print(f"improved={improve} regressed={regress}")
+PY
+}
+
+case "$cmd" in
+  run) cmd_run "$@" ;;
+  list) list_tasks "${1:-}" ;;
+  score) cmd_score "$@" ;;
+  report) cmd_report "$@" ;;
+  compare) cmd_compare "$@" ;;
+  selftest)
+    HARNESS_EVALS_SKILL_DIR="$SKILL_DIR" bash "$SKILL_DIR/selftest.sh"
+    ;;
+  *) die "unknown command: $cmd (run|list|score|report|compare|selftest)" ;;
+esac

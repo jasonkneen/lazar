@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Load non-secret config from .env + all secrets from Keychain.
-# Usage: source skills/env-vars/load-all.sh
+# Usage: source skills/_meta/env-vars/load-all.sh
 # Works when sourced from bash OR zsh.
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
 
@@ -12,7 +12,7 @@ elif [ -n "${ZSH_VERSION:-}" ]; then
   _ENV_VARS_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)" 2>/dev/null || true
 fi
 if [ -z "$_ENV_VARS_DIR" ] || [ ! -f "$_ENV_VARS_DIR/keychain-export.sh" ]; then
-  _ENV_VARS_DIR="$LAZAR_HOME/skills/env-vars"
+  _ENV_VARS_DIR="$LAZAR_HOME/user/skills/_meta/env-vars"
 fi
 
 if [ -f "$LAZAR_HOME/.env" ]; then

@@ -1,0 +1,12 @@
+{
+  "id": "fixture.tool",
+  "suite": "core",
+  "title": "real tool fixture",
+  "prompt": "unused",
+  "checks": [
+    {"type": "stream_tool_ran", "token": "HARNESS_TOOL_OK_{{token}}"},
+    {"type": "stream_tool_result_contains", "needle": "HARNESS_TOOL_OK_{{token}}"},
+    {"type": "stream_successful_tool_result"},
+    {"type": "stream_end_ok"}
+  ]
+}

@@ -161,7 +161,7 @@ Then: `launchctl load ~/Library/LaunchAgents/com.lazar.tick.plist`
 **Linux** — add to user crontab (`crontab -e`):
 
 ```
-*/5 * * * * /usr/local/bin/lazar --tick >> ~/lazar/logs/tick.log 2>&1
+*/5 * * * * /usr/local/bin/lazar --tick >> ~/lazar/user/logs/tick.log 2>&1
 ```
 
 Each `tick.d/` hook owns its own scheduling via touch files in
@@ -174,8 +174,8 @@ The seed includes one disabled example per use case. To activate one,
 remove `.disabled`:
 
 ```bash
-mv ~/lazar/hooks/pre-tool.d/00-example-deny-rm-rf.sh.disabled \
-   ~/lazar/hooks/pre-tool.d/00-deny-rm-rf.sh
+mv ~/lazar/user/hooks/pre-tool.d/00-example-deny-rm-rf.sh.disabled \
+   ~/lazar/user/hooks/pre-tool.d/00-deny-rm-rf.sh
 ```
 
 ## Hard rules

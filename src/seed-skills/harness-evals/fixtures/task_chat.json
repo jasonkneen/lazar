@@ -1,0 +1,11 @@
+{
+  "id": "fixture.chat",
+  "suite": "core",
+  "title": "clean chat fixture",
+  "prompt": "unused",
+  "checks": [
+    {"type": "text_contains", "needle": "CHAT_OK_ABC"},
+    {"type": "stream_max_tool_calls", "max": 0},
+    {"type": "stream_end_ok"}
+  ]
+}

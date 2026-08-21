@@ -8,7 +8,7 @@
 #     [--claim "exists=/abs"]... [--success "one line"] [--no-run]
 #
 # Layout:
-#   $LAZAR_HOME/workspace/tasks/<task-id>/
+#   $LAZAR_HOME/user/workspace/tasks/<task-id>/
 #     BRIEF.md    full context pack for the child
 #     prompt.txt  thin lazar-spawn prompt
 #     RESULT.md   child should write this (unless --out overrides)
@@ -80,7 +80,7 @@ for p in "${PATHS[@]+"${PATHS[@]}"}"; do
   esac
 done
 
-TASK_DIR="$LAZAR_HOME/workspace/tasks/$TASK_ID"
+TASK_DIR="$LAZAR_HOME/user/workspace/tasks/$TASK_ID"
 mkdir -p "$TASK_DIR"
 BRIEF="$TASK_DIR/BRIEF.md"
 PROMPT_FILE="$TASK_DIR/prompt.txt"
@@ -115,7 +115,7 @@ DEFAULT_CLAIMS=(
   fi
   printf '\n## Skills to consider\n'
   if [ ${#SKILLS[@]} -eq 0 ]; then
-    printf -- '- (read $LAZAR_HOME/skills/INDEX.md only if needed)\n'
+    printf -- '- (read $LAZAR_HOME/user/skills/INDEX.md only if needed)\n'
   else
     for s in "${SKILLS[@]}"; do printf -- '- %s\n' "$s"; done
   fi
@@ -133,7 +133,6 @@ DEFAULT_CLAIMS=(
   printf '1. Do the work with bash tools.\n'
   printf '2. Write the primary deliverable to the absolute path above.\n'
   printf '3. Write %s starting with DONE or BLOCKED.\n' "$RESULT_DEFAULT"
-  printf '4. End with a [VERIFY] block proving the EXPECT-VERIFY claims.\n'
 } >"$BRIEF"
 
 {

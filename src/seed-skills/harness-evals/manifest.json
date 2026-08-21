@@ -1,0 +1,28 @@
+{
+  "name": "lazar-harness-evals",
+  "version": "2.0.0",
+  "description": "Outcome-based harness evals for Lazar. Scores strict stream events and filesystem state, never assistant claims.",
+  "suites": {
+    "core": {
+      "file": "tasks/core/tasks.jsonl",
+      "required": true
+    },
+    "outcomes": {
+      "file": "tasks/outcomes/tasks.jsonl",
+      "required": true
+    },
+    "spawn": {
+      "file": "tasks/spawn/tasks.jsonl",
+      "required": false
+    }
+  },
+  "default_suites": [
+    "core",
+    "outcomes"
+  ],
+  "adapters": [
+    "lazar",
+    "stream-jsonl",
+    "command"
+  ]
+}

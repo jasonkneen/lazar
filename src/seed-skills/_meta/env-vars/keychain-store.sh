@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Store API keys into macOS Keychain from current env / lazar files.
+# Store API keys into macOS Keychain from the current environment or .env.
 # Never prints secret values.
 #
 # Usage:
-#   bash keychain-store.sh              # load .env + provider-env, store all set keys
+#   bash keychain-store.sh              # load .env, store all set keys
 #   bash keychain-store.sh --from-env   # only already-exported env vars
 #   NAME=... VALUE=... bash keychain-store.sh --one MINIMAX_API_KEY
 set -uo pipefail
@@ -29,18 +29,37 @@ done
 if [ "$MODE" = "files" ]; then
   # shellcheck disable=SC1090
   [ -f "$LAZAR_HOME/.env" ] && set -a && source "$LAZAR_HOME/.env" && set +a
-  # shellcheck disable=SC1090
-  [ -f "$LAZAR_HOME/workspace/provider-switch/provider-env.sh" ] && \
-    set -a && source "$LAZAR_HOME/workspace/provider-switch/provider-env.sh" && set +a
 fi
+
+# Print the name of another provider key (env or Keychain) that holds the same
+# value, if any. A secret can only belong to one provider; storing it under a
+# second name means an alias like ANTHROPIC_API_KEY="$MINIMAX_API_KEY" leaked
+# into the store and every request to the first provider will 401.
+duplicate_of() {
+  local name="$1" val="$2" other other_val
+  for other in "${LAZAR_KEY_NAMES[@]}"; do
+    [ "$other" = "$name" ] && continue
+    other_val=$(printenv "$other" 2>/dev/null || true)
+    [ -z "$other_val" ] && other_val=$(kc_get "$other" 2>/dev/null || true)
+    if [ -n "$other_val" ] && [ "$other_val" = "$val" ]; then
+      printf '%s' "$other"
+      return 0
+    fi
+  done
+  return 1
+}
 
 store_one() {
   local name="$1"
-  local val
+  local val dup
   val=$(printenv "$name" 2>/dev/null || true)
   if [ -z "${val:-}" ]; then
     echo "  skip  $name (not set)"
     return 2
+  fi
+  if dup=$(duplicate_of "$name" "$val"); then
+    echo "  FAIL  $name (value is identical to $dup — refusing to store one provider's key under another provider's name)"
+    return 1
   fi
   if kc_set "$name" "$val"; then
     echo "  store $name (${#val} chars)"

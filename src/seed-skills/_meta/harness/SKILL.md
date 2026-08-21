@@ -10,10 +10,10 @@ always injected by `hooks/session-start.d/00-harness-overview.sh`.
 
 ## Paths
 
-- Global state: `$LAZAR_HOME/memory/harness/state.json`
-- History: `$LAZAR_HOME/memory/harness/history.jsonl`
-- Local (session): `$LAZAR_HOME/memory/sessions/<id>/harness.json`
-- CLI: `python3 $LAZAR_HOME/skills/_meta/harness/harness.py`
+- Global state: `$LAZAR_HOME/user/memory/harness/state.json`
+- History: `$LAZAR_HOME/user/memory/harness/history.jsonl`
+- Local (session): `$LAZAR_HOME/user/memory/sessions/<id>/harness.json`
+- CLI: `python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py`
 
 ## Kinds
 
@@ -33,25 +33,25 @@ always injected by `hooks/session-start.d/00-harness-overview.sh`.
 
 ```bash
 # Compact overview (what session-start injects)
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py overview
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py overview
 
 # Record a lesson after success/failure
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py add \
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py add \
   --kind memory \
   --title "short-slug" \
   --content "Specific actionable lesson" \
   --evidence "what happened"
 
 # Load full entry; optional upvote
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py load M-never-cat-stream-log --helpful
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py load M-never-cat-stream-log --helpful
 
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py helpful <id>
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py unhelpful <id>
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py delete <id>
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py helpful <id>
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py unhelpful <id>
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py delete <id>
 
 # First-time / refresh seed (+ import playbook + learnings)
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py seed
-python3 $LAZAR_HOME/skills/_meta/harness/harness.py stats
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py seed
+python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py stats
 ```
 
 ## Rules

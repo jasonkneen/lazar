@@ -20,7 +20,7 @@ via bounded recipes.
 `matched: true`.
 
 **grounding** — the discipline of proving file-state claims with real
-commands, enforced by the kernel's `[VERIFY]` contract.
+commands (run the tool, read the output) rather than narrating an outcome.
 
 **guardrails** — the on/off switch for sandbox + trusted-zone protections,
 toggled by `scripts/lazar-guardrails.sh` (the `guardrails` skill).
@@ -59,16 +59,11 @@ guardrails are on. See Concepts → Sandbox.
 **skill** — a folder under `skills/` with a `SKILL.md`; the only extension
 mechanism. See [Skills](../integration/skills.md).
 
-**stall nudge** — the kernel's bounded recovery when a turn narrates
-unfinished intent without acting (`LAZAR_STALL_NUDGES`, default 2). Never
-fires on questions, never unbounded.
+**TUI** — the native Rust terminal client in `tui/`, installed as
+`bin/lazartui`. It drives one long-lived `lazar acp` child and contains no agent
+loop. The former Go client is archived under the local ignored `.archive/`
+directory, not under the active runtime workspace.
 
-**TUI** — the Go terminal client in `workspace/tui/` (owner-managed). Drives
-`lazar`; contains no agent loop.
-
-**VERIFY contract** — the `[VERIFY]...[/VERIFY]` block declaring testable
-filesystem claims (`exists=`, `contains=`, `size_at_least=`, ...). The kernel
-checks them and rejects ungrounded completions.
 
 **work journal** — `memory/work-journal.md`, the durable record of completed
 work, harvested from the event stream.

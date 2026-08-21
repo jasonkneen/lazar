@@ -15,48 +15,31 @@ Do NOT use this for things that should be skills. The kernel does ONE thing — 
 
 1. Pick a short kebab-case slug for the proposal (e.g. `http-error-emit`, `add-resume-flag`).
 
-2. Create the proposal directory:
+2. Stage the proposal with the canonical helper. It copies the FULL current
+   source, excludes generated `target/`, and creates review/verification templates:
 
-       mkdir -p $LAZAR_HOME/workspace/proposals/<slug>/src/src
-       mkdir -p $LAZAR_HOME/workspace/proposals/<slug>/src/seed-skills
+       staged=$(bash "$LAZAR_HOME/scripts/new-proposal.sh" <slug>)
 
-3. Copy the FULL current kernel as the starting point:
-
-       cp -R $LAZAR_HOME/src/. $LAZAR_HOME/workspace/proposals/<slug>/src/
-
-4. Apply your changes inside `$LAZAR_HOME/workspace/proposals/<slug>/src/`:
+3. Apply your changes inside `$LAZAR_HOME/user/workspace/proposals/<slug>/src/`:
 
        # edit src/src/main.rs, src/sandbox.sb, src/seed-skills/<...> as needed
 
-5. Write a README explaining what changed and why:
+4. Complete the staged `README.md`. Replace the fail-closed `verify.sh`
+   placeholder with focused checks that run against the newly installed kernel.
+   Dry-build the staged tree with `cargo build --locked --release`.
 
-       cat > $LAZAR_HOME/workspace/proposals/<slug>/README.md <<'EOF'
-       # <slug>
+5. Tell the user:
 
-       ## Summary
-       <one paragraph: what the change does>
-
-       ## Why
-       <observed problem or new capability needed>
-
-       ## Files changed
-       - src/src/main.rs (lines ~X-Y): <what>
-       - src/seed-skills/...: <what>
-
-       ## Risk
-       <what could break, what to test after applying>
-       EOF
-
-6. Tell the user:
-
-       I've staged a kernel patch at $LAZAR_HOME/workspace/proposals/<slug>/.
-       Review with: diff -u --recursive $LAZAR_HOME/src $LAZAR_HOME/workspace/proposals/<slug>/src
+       I've staged a kernel patch at $LAZAR_HOME/user/workspace/proposals/<slug>/.
+       Review with: diff -u --recursive $LAZAR_HOME/src $LAZAR_HOME/user/workspace/proposals/<slug>/src
        Apply with:  bash $LAZAR_HOME/scripts/kernel-apply.sh <slug>
 
 ## Principles
 
 - **Never partial.** Always stage the FULL src/ tree. `kernel-apply.sh` does a directory copy; if you only stage main.rs, the rebuild gets your main.rs but loses any other changes you didn't realize were paired.
 - **Always include a README.** A patch you can't explain isn't a patch worth applying.
+- **Verification is mandatory.** `kernel-apply.sh` rejects proposals without `verify.sh`,
+  and the generated template fails until replaced with proposal-specific checks.
 - **Keep proposals small.** Big rewrites should be split. The user has to read every line of the diff.
 - **Prefer skills over kernel changes.** If you can express the fix as a skill, do that instead — no upgrade ceremony required.
 - **Record the proposal in memory** after the user applies it, so future-you knows what kernel features exist.

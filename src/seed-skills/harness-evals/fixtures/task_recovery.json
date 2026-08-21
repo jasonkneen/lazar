@@ -1,0 +1,13 @@
+{
+  "id": "fixture.recovery",
+  "suite": "outcomes",
+  "title": "tool failure recovery fixture",
+  "prompt": "unused",
+  "checks": [
+    {"type": "stream_failed_tool_result"},
+    {"type": "stream_successful_tool_result"},
+    {"type": "stream_min_tool_calls", "min": 2},
+    {"type": "stream_tool_result_contains", "needle": "RECOVERED_{{token}}"},
+    {"type": "stream_end_ok"}
+  ]
+}

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """lazar continual harness — ranked, scoped, always-on memory/skill/prompt/subagent store.
 
-Store: $LAZAR_HOME/memory/harness/state.json
-History: $LAZAR_HOME/memory/harness/history.jsonl
+Store: $LAZAR_HOME/user/memory/harness/state.json
+History: $LAZAR_HOME/user/memory/harness/history.jsonl
 
 Kinds: prompt | memory | skill | subagent
 Scopes: global (default store) | local (session-scoped file)
@@ -183,7 +183,7 @@ def format_overview(
     ]
     if not items:
         lines.append(
-            "(empty) Seed with: python3 $LAZAR_HOME/skills/_meta/harness/harness.py seed"
+            "(empty) Seed with: python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py seed"
         )
         lines.append(
             "Write lessons: harness.py add --kind memory --title '...' --content '...'"
@@ -239,7 +239,7 @@ def format_overview(
     if remaining > 0:
         lines.append(f"... +{remaining} more; harness.py overview --limit 40 or load <id>")
     lines.append(
-        "API: python3 $LAZAR_HOME/skills/_meta/harness/harness.py "
+        "API: python3 $LAZAR_HOME/user/skills/_meta/harness/harness.py "
         "overview|load|add|helpful|unhelpful|delete|seed"
     )
     lines.append(
@@ -512,13 +512,8 @@ SEED_BULLETS: list[tuple[str, str, str]] = [
     ),
     (
         "memory",
-        "verify-contract",
-        "Outcome claims require [VERIFY]...[/VERIFY] with exists/contains/size_* claims. Kernel checks the filesystem; truncated [/VERIFY close is accepted.",
-    ),
-    (
-        "memory",
         "nested-api-key",
-        "Nested lazar children need API key inheritance only when intentional (LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1). Default isolation is deliberate.",
+        "Nested lazar children need API key inheritance only when intentional (LAZAR_TOOL_INHERIT_PROVIDER_KEY=1 on the parent invocation). Default isolation is deliberate.",
     ),
     (
         "subagent",

@@ -1,7 +1,7 @@
 # memory
 
 Durable notes that survive across `lazar -p` invocations. Memory lives in
-`$LAZAR_HOME/memory/` and is plain markdown — no JSON, no encoded blobs.
+`$LAZAR_HOME/user/memory/` and is plain markdown — no JSON, no encoded blobs.
 You and the user should be able to `cat` it and understand instantly.
 
 ## When to use
@@ -15,12 +15,12 @@ You and the user should be able to `cat` it and understand instantly.
 
 ### Read all memory at the start of a task
 
-    cat $LAZAR_HOME/memory/*.md 2>/dev/null || echo "(no memory yet)"
+    cat $LAZAR_HOME/user/memory/*.md 2>/dev/null || echo "(no memory yet)"
 
 ### Append a timestamped note
 
-    mkdir -p $LAZAR_HOME/memory
-    cat >> $LAZAR_HOME/memory/notes.md <<EOF
+    mkdir -p $LAZAR_HOME/user/memory
+    cat >> $LAZAR_HOME/user/memory/notes.md <<EOF
 
     ## $(date -u +%Y-%m-%dT%H:%M:%SZ)
     <the note in one or two sentences>
@@ -30,7 +30,7 @@ You and the user should be able to `cat` it and understand instantly.
 
 For a topic you'll revisit, give it its own file:
 
-    cat > $LAZAR_HOME/memory/<topic>.md <<EOF
+    cat > $LAZAR_HOME/user/memory/<topic>.md <<EOF
     # <topic>
 
     <facts and context>
@@ -38,7 +38,7 @@ For a topic you'll revisit, give it its own file:
 
 ### Update an existing topic file
 
-    cat >> $LAZAR_HOME/memory/<topic>.md <<EOF
+    cat >> $LAZAR_HOME/user/memory/<topic>.md <<EOF
 
     ## update $(date -u +%Y-%m-%dT%H:%M:%SZ)
     <new info>

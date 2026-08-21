@@ -2,11 +2,6 @@
 
 The smallest self-evolving agent harness.
 
-This is the TUI it built for me -- yours will not be the same as this
-
-<img width="1069" height="772" alt="Screenshot 2026-04-29 at 21 45 31" src="https://github.com/user-attachments/assets/c5ef3807-4601-457f-a92c-116b45425a26" />
-
-
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 One tool: `bash(command)` — bash, sandboxed.
@@ -17,13 +12,12 @@ Everything else is emergent.
 
 ```
 ~/lazar/
-├── bin/lazar              the immutable kernel (chflags uchg after build)
-├── src/                   kernel source (read-only after build)
-├── scripts/               kernel ceremony helpers + lazar-chat.sh wrapper
-├── skills/                the agent's "being" — capabilities as folders
-├── memory/                durable notes
-├── workspace/             scratchpad, the agent's cwd, projects you build
-└── logs/stream.jsonl      append-only event stream (kernel auto-rotates at ~10MB)
+├── bin/lazar              kernel binary
+├── bin/lazartui           native Rust ACP client
+├── src/                   kernel crate
+├── tui/                   Rust TUI crate (ratatui + crossterm)
+├── scripts/               operator, build, and helper scripts
+└── user/                  not in git: skills, memory, workspace, logs, hooks
 ```
 
 The kernel is a small Rust runner, not an autopilot or self-modifier. It does three things:
@@ -34,8 +28,10 @@ The kernel is a small Rust runner, not an autopilot or self-modifier. It does th
 
 That's it. State (memory, skills) lives on disk. Capabilities are markdown files
 the agent reads and writes. Nested `lazar -p` recursion is intentionally API-key
-isolated by default; set `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1` only when you
-want tool subprocesses to be able to launch child lazar API calls.
+isolated by default; set `LAZAR_TOOL_INHERIT_PROVIDER_KEY=1` on the parent Lazar
+process only when tool subprocesses should be able to launch child API calls.
+Only the active catalog provider's key is exposed. The older
+`LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY` name remains a compatibility alias.
 
 The kernel also speaks structured `--output-format stream-json` for
 programmatic consumers (TUIs, log analyzers), records every event to
@@ -43,6 +39,18 @@ an append-only `logs/stream.jsonl`, and ships a few helper scripts
 (`scripts/kernel-*.sh`, `scripts/lazar-chat.sh`). Everything beyond
 that lives as skills. Kernel changes are intentionally outside the agent's runtime
 write path and must be staged and applied through the proposal ceremony.
+
+For infrastructure failover, `bin/lazar-failover <prompt-file> [provider ...]`
+tries catalog providers in order. It retries only before a failed attempt emits
+a hook or tool event; after either dispatch, replaying the prompt could duplicate
+side effects. Each attempt starts with cleared session and model overrides.
+
+The bundled `lazartui` keeps one `lazar acp` child alive for streaming chat,
+sessions, cancellation, provider/model switching, scoped write access, markdown,
+tool output, hook traces, and the raw kernel
+event feed. Run `lazartui`, press F1 for the keymap, or use `/provider`, `/model`,
+`/session`, and `/add-dir`. Provider secrets stay in environment variables or the
+macOS Keychain; the TUI never reads or stores them.
 
 ## Kernel guardrails
 
@@ -53,11 +61,19 @@ rebuilds the kernel on its own.
 
 Kernel changes follow the proposal flow:
 
-1. Stage a full proposed source tree under `workspace/proposals/<name>/src/`.
-2. Review the diff produced by `scripts/kernel-apply.sh <name>`.
+1. Run `scripts/new-proposal.sh <name>`, then edit the complete staged source,
+   README, and fail-closed verification template under `workspace/proposals/`.
+2. Run `scripts/kernel-apply.sh <name>`. It first moves the proposal into
+   `.archive/kernel-proposals/`, outside the agent-writable sandbox, then prints
+   the README, verification script, and exact frozen-source diff.
 3. Confirm from an interactive operator terminal.
-4. Let the script back up current source, apply with delete semantics, rebuild,
-   and re-lock the installed binary.
+4. Let the script store a trusted backup under `.archive/kernel-backups/`,
+   apply with checksum/delete semantics, rebuild with `Cargo.lock`, verify, and
+   re-lock. Build or verification failure restores and rebuilds the backup.
+
+The apply command prints a backup ID. A later regression can be reverted with
+`scripts/kernel-rollback.sh <backup-id>`; rollback itself takes a safety backup
+and requires interactive confirmation.
 
 This keeps the core kernel operator-reviewed even though normal Lazar work can
 continue in writable areas such as `skills/`, `memory/`, and `workspace/`.
@@ -77,22 +93,24 @@ scripts/lazar-guardrails.sh on       # restore enforcement
 | 1 | bash sandbox | `sandbox-exec` (`LAZAR_NO_SANDBOX`) |
 | 2 | kernel binary lock | `chflags uchg bin/lazar` |
 | 3 | source lock | `chmod a-w src/` |
-| 4 | pre-tool vetoes | `hooks/pre-tool.d/*.sh` (renamed `.disabled`, not deleted) |
+| 4 | pre-tool vetoes | `hooks/pre-tool.d/*.sh` (renamed `.guardrails-disabled`, not deleted) |
 | 5 | **agent instructions** | `src/system-prompt.txt` + `access.rs` prompt context |
 
 Layer 5 is the one people miss. With layers 1–4 off, the agent will *still*
 refuse writes if its prompt says a path is forbidden — it self-censors while the
 filesystem is wide open. The mode is therefore injected into every session by
 `hooks/session-start.d/03-guardrails-mode.sh`, and the agent has a `guardrails`
-skill so it can check and flip the switch itself.
+skill so it can inspect the switch and give the operator the exact command.
 
-State lives in `workspace/.guardrails`; `aliases.sh` and `lazartui.sh` read it at
-call time. An explicit `LAZAR_NO_SANDBOX` always wins.
+State lives in the operator-owned `$LAZAR_HOME/.guardrails`, outside the
+agent-writable sandbox. The CLI and ACP kernel read it when a process starts;
+an explicit `LAZAR_NO_SANDBOX` or `--no-sandbox` also disables the sandbox.
+Run the toggle from an operator terminal, then start a fresh invocation.
 
 Guardrails OFF removes *enforcement*, not *discipline*: the proposal → review →
-apply → verify → rollback flow above still works, and VERIFY grounding is
-unaffected. Note that `scripts/kernel-build.sh` re-locks by default — pass
-`LAZAR_GUARDRAILS=off` to keep the kernel writable across rebuilds.
+apply → verify → rollback flow above still works. `scripts/kernel-build.sh`
+follows the persisted mode; `LAZAR_GUARDRAILS=on|off` overrides it for one
+build without changing the persisted switch.
 
 **Known tradeoff.** Sub-agent state (`bin/lazar-spawn`) lives under
 `workspace/subagent/`, which is agent-writable. That includes the session spawn
@@ -105,7 +123,8 @@ directory to the sandbox write allowlist rather than moving it back to `logs/`.
 
 ## Setup
 
-Requires macOS (for `sandbox-exec` and `chflags uchg`) and the Rust toolchain.
+Requires macOS (for `sandbox-exec` and `chflags uchg`), the Rust toolchain,
+Python 3, `rsync`, `jq`, and `rg`.
 
 ### From a git clone (recommended)
 
@@ -118,11 +137,27 @@ export ANTHROPIC_API_KEY=sk-...
 lazar -p "what skills do you have?"
 ```
 
-Setup builds with an external Cargo target directory (`$LAZAR_HOME/workspace/.cargo-target` by default), installs the binary at `~/lazar/bin/lazar`, locks it with `chflags uchg`, and seeds `skills/` only when the skills directory has no `INDEX.md`. Re-running setup preserves existing skills, memory, workspace, logs, and source unless you opt into source update or reset.
+Setup builds the kernel and TUI with external Cargo target directories
+(`workspace/.cargo-target` and `workspace/.cargo-target-tui`), installs them as
+`bin/lazar` and `bin/lazartui`, locks the kernel with `chflags uchg`, and seeds
+`skills/` only when the skills directory has no `INDEX.md`. Re-running setup
+preserves existing skills, memory, workspace, logs, and source unless you opt
+into source update or reset.
+
+To replace existing evolved skills and hooks with the current bundled minimal
+set without deleting any other runtime state, run
+`LAZAR_REFRESH_BUNDLES=1 bash setup.sh`. The old trees are retained read-only
+under `.archive/runtime-bundles/`.
 
 ### What's in vs out of git
 
-The repo ships only the core: `src/` (kernel source + seed skills), `scripts/` (kernel ceremony), `setup.sh`, `README.md`, `.gitignore`. Everything generated at runtime — root `skills/` (user-evolved), root `memory/`, root `workspace/`, root `logs/`, `bin/lazar`, `src/target/` — is ignored by git. Seed skills under `src/seed-skills/` are source and must remain tracked, including `src/seed-skills/memory/SKILL.md`. Cloning gives you a clean install; running gives you your own personal evolution.
+The repo ships the core plus the native client: `src/` (kernel source + seed
+skills), `tui/`, `scripts/`, `setup.sh`, `README.md`, `.gitignore`, and the mkdocs
+sources under `docs/docs/`. Everything generated at runtime or install time —
+root `skills/`, `memory/`, most of `workspace/`, `logs/`, installed `bin/`
+artifacts, Cargo targets, and `docs/site/` — is ignored by git. The former Go TUI
+and its launch/watchdog artifacts are preserved locally under
+`.archive/legacy-go-tui-2026-09-04/`; the only active TUI source is `tui/`.
 
 To publish your own fork:
 
@@ -230,24 +265,64 @@ bash ~/lazar/scripts/kernel-unlock.sh
 bash ~/lazar/scripts/kernel-build.sh
 ```
 
-If you are installing from a separate checkout and want to update an existing `~/lazar/src`, setup preserves the existing source unless you opt in. Use:
+If you are installing from a separate checkout and want to update an existing Lazar installation, setup preserves the installed `src/`, `tui/`, and `scripts/` trees unless you opt in. Use:
 
 ```bash
 LAZAR_UPDATE_SOURCE=1 bash setup.sh
 ```
 
-That creates a timestamped `src.backup.*` first. Runtime state is still preserved unless you also set `LAZAR_RESET_ALL=1`.
+That creates a timestamped read-only backup under `.archive/source-updates/`
+first. Runtime state is still preserved unless you also set
+`LAZAR_RESET_ALL=1`.
+
+If a source update includes fixes to bundled operational skills, opt into a
+skill refresh separately:
+
+```bash
+LAZAR_UPDATE_SOURCE=1 LAZAR_REFRESH_BUNDLES=1 bash setup.sh
+```
+
+The previous skill and hook trees are archived under
+`.archive/runtime-bundles/`; memory, workspace, logs, access approvals, and
+provider configuration remain.
 
 ## Environment
 
-- `ANTHROPIC_API_KEY` — required by the top-level lazar process.
-- `LAZAR_HOME` — install/runtime root; defaults to `~/lazar`.
+Provider (catalog):
+
+- `~/lazar/providers.toml` — the operator's provider catalog (id, endpoint, which env var / Keychain item holds the key, default model, model list). Seeded from `src/providers.toml` by setup; the kernel uses the built-in copy when the file is absent. `lazar providers` lists it, `lazar providers --json` feeds front ends. Neither prints secrets.
+- `--provider <id>` / `LAZAR_PROVIDER` — select a catalog entry. It is authoritative for endpoint and key (stale `ANTHROPIC_*` residue is ignored); the key comes from the entry's env var, else from the macOS Keychain (`service=lazar`, `account=<env var>`, the `_meta/env-vars` convention) at depth 0 only. `--model` / `LAZAR_MODEL` still override the model. Propagates to tool subprocesses.
+
+Provider (legacy env contract, unchanged when no provider is selected):
+
+- `ANTHROPIC_API_KEY` — required by the top-level lazar process (sent as `x-api-key`). If unset, `MINIMAX_API_KEY` is used as a fallback together with the MiniMax Anthropic-compatible endpoint and model.
+- `ANTHROPIC_BASE_URL` — override the API base URL (any Anthropic-compatible `/v1/messages` endpoint); default `https://api.anthropic.com`.
 - `LAZAR_MODEL` — override the default model (`claude-sonnet-4-6`).
+
+Paths and recursion:
+
+- `LAZAR_HOME` — install/runtime root; defaults to `~/lazar`.
 - `LAZAR_DEPTH` — recursion depth (set automatically for tool subprocesses; capped at 5).
-- `LAZAR_TOOL_TIMEOUT_SECS` — wall-clock timeout for each `execute(command)` tool call; default 120.
-- `LAZAR_TOOL_OUTPUT_MAX_BYTES` — max stdout/stderr bytes kept from a tool call before truncation; default 200000.
+- `LAZAR_TOOL_INHERIT_PROVIDER_KEY` — operator opt-in (`1`, `true`, `yes`, `on`) on the parent Lazar process. Exposes only the active provider's named key to tool subprocesses so a nested Lazar can authenticate. Off by default. `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY` is a compatibility alias.
+
+Agent-loop limits:
+
+- `LAZAR_MAX_TURNS` — max model turns per invocation; default 50.
+- `LAZAR_MAX_TOOL_CALLS` — max bash tool calls per invocation; default 200.
+- `LAZAR_MAX_TOKENS` — `max_tokens` sent on every API call; default and compiled ceiling 8192.
+
+Tools and hooks:
+
+- `LAZAR_TOOL_TIMEOUT_SECS` — wall-clock timeout for each `bash(command)` tool call; default 120.
+- `LAZAR_TOOL_OUTPUT_MAX_BYTES` — max stdout/stderr bytes kept from a tool call before truncation; default and compiled ceiling 8872.
+- `LAZAR_HOOK_TIMEOUT_SECS` — per-hook wall-clock timeout; default 5.
+- `LAZAR_STRICT_PRE_TOOL_HOOKS` — treat every pre-tool hook as fail-closed (a crash, timeout, or bad JSON becomes a veto).
+
+Logs and sessions:
+
 - `LAZAR_LOG_MAX_BYTES` — size at which `logs/stream.jsonl` auto-rotates; default 10485760.
-- `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY` — opt-in (`1`, `true`, `yes`, `on`) to expose the API key to tool subprocesses so nested `lazar -p` calls can make API requests. Off by default for secret isolation.
+- `LAZAR_LOG_ARCHIVE_KEEP` — rotated archives to keep once harvested; default 5, `0` disables pruning.
+- `LAZAR_SESSION_HISTORY_MAX_BYTES` — cap on prior-turn history loaded by `--session` / `--resume`; default and compiled ceiling 32000. Oldest operator turns are dropped whole; tool calls and results are replayed as real blocks, never summarised.
 
 Project access can be scoped per invocation:
 
@@ -270,7 +345,7 @@ Every bash command runs through `sandbox-exec` with this policy:
 - **Reads:** open. The agent can read its own kernel and source.
 - **Writes:** only `skills/`, `memory/`, `workspace/`, `/tmp`, selected session/auth subdirectories, and any operator-approved `--add-dir` roots. `logs/` is trusted kernel-owned state: tools/skills may read it, not mutate it.
 - **Network:** open (for API calls and skills like web-search).
-- **Process spawn:** open (for CLI tools and optional `lazar -p` recursion; nested API recursion requires `LAZAR_TOOL_INHERIT_ANTHROPIC_API_KEY=1`).
+- **Process spawn:** open (for CLI tools and optional `lazar -p` recursion; nested API recursion requires the parent to start with `LAZAR_TOOL_INHERIT_PROVIDER_KEY=1`).
 
 Writes outside the allowed zones return `Operation not permitted`. The agent sees this in tool output and learns the boundary is real.
 
@@ -280,21 +355,22 @@ restrictions at all. Check with `scripts/lazar-guardrails.sh status`.
 
 ## Evaluating the harness
 
-Model benchmarks answer *"how smart is the model?"*. `harness-evals` answers a
-different question: **does this harness make any model behave honestly?**
+Model benchmarks answer *"how capable is the model?"*. `harness-evals` asks a
+different question: **did this harness produce a complete, observable outcome?**
 
 ```bash
 skills/harness-evals/bin/harness-evals selftest              # offline, free
-skills/harness-evals/bin/harness-evals run --backend kimi    # live
+skills/harness-evals/bin/harness-evals run --provider kimi   # live
 skills/harness-evals/bin/harness-evals run --repeat 3        # consistency
 skills/harness-evals/bin/harness-evals report                # trend
 skills/harness-evals/bin/harness-evals compare <runA> <runB> # IMPROVE / REGRESS
-skills/harness-evals/ci.sh --live --backend kimi             # CI gate
+skills/harness-evals/ci.sh --live --provider kimi            # CI gate
 ```
 
-Suites: `core` (tool actually executes, write+VERIFY, chat hygiene, multi-step),
-`grounding` (false claim caught, no narrated success, recovery), plus optional
-`self-learning` and `spawn`.
+Required suites are `core` (real tool/result evidence, exact file state and
+readback, tool-free chat) and `outcomes` (recovery after an observed tool
+failure and state carried across separate edits). `spawn` is optional and
+checks the installed delegation surface without launching a child.
 
 Checks are **filesystem + event** based, never prose, so a model cannot talk its
 way to a pass. Each run injects a random token to defeat memorisation.
@@ -303,12 +379,13 @@ It is backend-agnostic by design — same task packs, swappable adapter:
 
 ```bash
 # any non-lazar agent that emits NDJSON
-harness-evals run --cmd "my-agent -p '{{prompt}}' > {{stream}}"
+harness-evals run --cmd 'my-agent -p {{prompt}} > {{stream}}'
 ```
 
 Two runs of the same model can differ, so use `--repeat` before trusting a
-comparison. Timeouts are reported as `error`, separately from behavioural
-`fail`, so a slow provider is never mislabelled as dishonest. Results land in
+comparison. Timeouts, malformed JSONL, and missing terminal events are reported
+as `error`, separately from behavioural `fail`; either blocks a required CI
+gate because the run produced insufficient evidence. Results land in
 `workspace/evals/results/<timestamp>/` with full transcripts. See
 `skills/harness-evals/references/external-benchmarks.md` for how this layers
 with Terminal-Bench / SWE-bench / Inspect AI.

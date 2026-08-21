@@ -1,0 +1,2 @@
+{"type":"invoke_start","model":"test"}
+{"type":"text_delta","text":"CHAT_OK_ABC"}

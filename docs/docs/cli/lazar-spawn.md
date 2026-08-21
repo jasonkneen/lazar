@@ -27,6 +27,7 @@ lazar-spawn --status|--await <job-id>
 The child is **context-blind** — a stranger with a filesystem. The prompt file
 must be self-contained:
 
+- no more than 9000 bytes
 - at least one absolute path
 - a `SUCCESS:` line
 - an `EXPECT-VERIFY:` block with indented claims:
@@ -62,11 +63,11 @@ child's out-log and finalizes the job itself.
 
 ## Bounds
 
-1. Kernel stall-nudges (in-child recovery, bounded)
-2. Per-task ceiling `LAZAR_SPAWN_CEILING` (default 2)
-3. Session budget `LAZAR_SPAWN_BUDGET` (default 10)
-4. Wall-clock `LAZAR_SPAWN_TIMEOUT` (default 300s)
-5. Kernel recursion depth cap (`MAX_DEPTH` = 5)
+1. Per-task ceiling `LAZAR_SPAWN_CEILING` (default 2)
+2. Session budget `LAZAR_SPAWN_BUDGET` (default 10)
+3. Wall-clock `LAZAR_SPAWN_TIMEOUT` (default 300s)
+4. Kernel recursion depth cap (`MAX_DEPTH` = 5)
+5. Prompt context cap (9000 bytes)
 
 Budget/job state lives under `workspace/subagent/` — see the
 [known tradeoff](../concepts/sandbox.md#the-guardrails-switch) about why it

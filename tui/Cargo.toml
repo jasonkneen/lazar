@@ -1,0 +1,24 @@
+[package]
+name = "lazartui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal UI for the lazar kernel (an Agent Client Protocol client)"
+
+[[bin]]
+name = "lazartui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { version = "0.30", features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+unicode-width = "0.2"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = 2

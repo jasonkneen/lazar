@@ -64,17 +64,20 @@ scripts/lazar-guardrails.sh on       # restore enforcement
 | 1 | bash sandbox | `sandbox-exec` (`LAZAR_NO_SANDBOX`) |
 | 2 | kernel binary lock | `chflags uchg bin/lazar` |
 | 3 | source lock | `chmod a-w src/` |
-| 4 | pre-tool vetoes | `hooks/pre-tool.d/*.sh` (renamed `.disabled`, not deleted) |
+| 4 | pre-tool vetoes | `hooks/pre-tool.d/*.sh` (renamed `.guardrails-disabled`, not deleted) |
 | 5 | agent instructions | `src/system-prompt.txt` + `access.rs` prompt context |
 
 Layer 5 is the one people miss: with layers 1–4 off, the agent can *still*
 self-censor if its prompt says a path is forbidden. The current mode is
 therefore injected into every session by
-`hooks/session-start.d/03-guardrails-mode.sh`, and the `guardrails` skill lets
-the agent check and flip the switch itself.
+`hooks/session-start.d/03-guardrails-mode.sh`. The `guardrails` skill lets the
+agent inspect the switch and give the operator the exact toggle command.
 
-State lives in `workspace/.guardrails`. An explicit `LAZAR_NO_SANDBOX` always
-wins.
+State lives in the operator-owned `$LAZAR_HOME/.guardrails`, outside the
+agent-writable sandbox. The kernel reads it when a new CLI or ACP process
+starts. Run the toggle from an operator terminal; a sandboxed model process
+cannot disable its own sandbox. An explicit `LAZAR_NO_SANDBOX` or
+`--no-sandbox` also disables it for that invocation.
 
 !!! note "Known tradeoff"
     Sub-agent state (`bin/lazar-spawn` budget counters) lives under

@@ -9,7 +9,7 @@
 cat > /dev/null  # drain payload
 
 LAZAR_HOME="${LAZAR_HOME:-$HOME/lazar}"
-LOG="$LAZAR_HOME/logs/stream.jsonl"
+LOG="$LAZAR_HOME/user/logs/stream.jsonl"
 [ -f "$LOG" ] || { echo '{"action":"continue"}'; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo '{"action":"continue"}'; exit 0; }
 

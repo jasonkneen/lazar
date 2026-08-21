@@ -10,7 +10,7 @@ Everything else is emergent.
 ~/lazar/
 ├── bin/lazar              the immutable kernel (chflags uchg after build)
 ├── src/                   kernel source (read-only after build)
-├── scripts/               kernel ceremony helpers + lazar-chat.sh wrapper
+├── scripts/               operator, build, migration, and chat helpers
 ├── skills/                the agent's "being" — capabilities as folders
 ├── memory/                durable notes
 ├── workspace/             scratchpad, the agent's cwd, projects you build
@@ -19,13 +19,13 @@ Everything else is emergent.
 
 ## Tent-pole features
 
-**1. The agent can't lie about what it did — [VERIFY contract](concepts/verify-contract.md)**
-When the agent claims it created, rotated, or fixed a file, the kernel parses
-its `[VERIFY]` block and re-checks every claim against the real filesystem
-(`stat`, `exists`, `contains`) before accepting the answer. Failed claims force
-a correction turn; a second failure ends the run with `grounding_failed`.
-"Done" is verified, not trusted — and the check is compiled into the kernel,
-so the agent can never patch it away.
+**1. A plain agent loop that trusts the protocol — [Architecture](concepts/architecture.md)**
+The kernel calls the Messages API with one `bash` tool, executes every
+`tool_use` block, feeds the `tool_result` back, and repeats until the provider
+returns a terminal `stop_reason`. It does not inspect the model's prose to
+decide whether the model "really" finished, and it never re-prompts on the
+operator's behalf. What the model did is in the tool trace; what it said is in
+the transcript; the kernel keeps the two apart and lets you judge.
 
 **2. Sealed kernel, evolving agent — [Architecture](concepts/architecture.md)**
 The runner is locked with `chflags uchg` after build. The agent can read its
@@ -34,8 +34,8 @@ files the agent reads and writes itself. New capability needed? The agent
 authors a new skill. The kernel stays small and permanent; the *being* grows.
 
 **3. Every event, on disk, forever — [Sessions & memory](integration/sessions.md)**
-The kernel appends everything — prompts, responses, tool calls, results,
-verify reports — to an append-only JSONL stream, and deliberately does **not**
+The kernel appends invocation lifecycle, prompts, responses, tool calls,
+results, and hooks to an append-only JSONL stream, and deliberately does **not**
 auto-load it into the next conversation. Memory management, context loading,
 summarization, recency heuristics: all of it lives in skills, where it can
 evolve. Nothing is hidden in a black-box database.
@@ -76,7 +76,6 @@ The kernel does three things:
 - [Install](getting-started/install.md) — clone, `setup.sh`, first prompt
 - [Configuration](getting-started/configuration.md) — API keys, model selection, backends
 - [Architecture](concepts/architecture.md) — kernel vs skills vs memory vs workspace
-- [VERIFY contract](concepts/verify-contract.md) — kernel-enforced honesty: the agent can't lie about file state
 - [`lazar` CLI reference](cli/lazar.md) — every flag, verified from `--help`
 - [Environment variables](api/env-vars.md) — the complete `LAZAR_*` table
 - [Hooks protocol](integration/hooks.md) — lifecycle scripts in `hooks/<event>.d/`

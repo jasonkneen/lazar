@@ -1,0 +1,3 @@
+{"type":"invoke_start","model":"test","ts_ms":1}
+{"type":"text_delta","text":"I ran echo HARNESS_TOOL_OK_ABC and it printed fine."}
+{"type":"invoke_end","stop_reason":"end_turn"}

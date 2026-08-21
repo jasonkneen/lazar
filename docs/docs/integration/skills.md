@@ -48,12 +48,15 @@ motivated the skill.
 conflict:
 
 - **memory** — persistence across sessions (`memory/` notes, work journal).
-- **verify** — the `[VERIFY]` grounding contract.
 - **subagent** — delegation via `bin/lazar-spawn` / `pack-and-spawn.sh`.
 - **load-context** — bounded recipes for reading `logs/stream.jsonl`.
 - **harness** — durable ranked lessons (`harness.py add`).
 - **self-patch** — fix your own recurring failures; draft kernel proposals,
   never self-apply.
+
+## Invoking a skill deliberately
+
+A prompt that starts with `[skill:name] …` (what lazartui sends for `/name …`) or `/name …` (an ACP slash command) is resolved by the kernel before the model sees it: `skills/name/SKILL.md` is inlined into the user message, followed by the operator's request. The model gets the instructions, not a convention to decode and a file to fetch. An explicit `[skill:name]` for a skill that does not exist is an error returned to the client, never a prompt to the model. The kernel logs a `skill_inject` event with the name, path, and byte count.
 
 ## Rules
 
