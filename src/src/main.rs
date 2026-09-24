@@ -22,6 +22,7 @@ use std::{
 use std::io::BufRead;
 
 mod access;
+mod firstrun;
 mod acp;
 mod core;
 mod hooks;
@@ -522,6 +523,18 @@ fn remove_access_policy(home: &Path) -> std::io::Result<()> {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+/// A bare binary (release zip) seeds everything else setup.sh would — only
+/// what is missing; existing data is never touched. See `firstrun`.
+pub(crate) fn seed_first_run() {
+    match firstrun::ensure(&lazar_home(), &SEED_SKILLS, providers::DEFAULT_CATALOG) {
+        Ok(seeded) if !seeded.created.is_empty() => {
+            eprintln!("[lazar] first run: created {}", seeded.created.join(", "));
+        }
+        Ok(_) => {}
+        Err(err) => eprintln!("[lazar] WARN: first-run seeding incomplete: {err}"),
     }
 }
 
@@ -3179,6 +3192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure hooks/ exists for any path that fires hooks. First-run
     // installs that predate this kernel won't have the directory yet.
     ensure_hooks_seeded();
+    seed_first_run();
 
     // Operator-controlled sandbox bypass. Either the CLI flag or env var
     // sets the env var that run_bash/run_hook read on every spawn. The

@@ -985,6 +985,7 @@ pub fn run(args: AcpArgs) -> Result<(), Box<dyn std::error::Error>> {
         access::AccessPolicy::new(unsandboxed, requested_cwd, requested_dirs, &lazar_home())?;
     access::init(access_policy)?;
     ensure_hooks_seeded();
+    crate::seed_first_run();
     if let Some(provider) = args.provider.as_deref() {
         env::set_var("LAZAR_PROVIDER", provider);
     }

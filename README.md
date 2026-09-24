@@ -137,6 +137,12 @@ export ANTHROPIC_API_KEY=sk-...
 lazar -p "what skills do you have?"
 ```
 
+`bin/lazar` also works on its own: on first start it seeds anything missing under
+`$LAZAR_HOME` (default `~/lazar`) from copies compiled into it — skills, hooks,
+`user/providers.toml`, guardrails `off`, and the `bin/` helpers. It only ever
+creates what is absent; existing skills, memory, sessions, logs and settings are
+never overwritten.
+
 Setup builds the kernel and TUI with external Cargo target directories
 (`workspace/.cargo-target` and `workspace/.cargo-target-tui`), installs them as
 `bin/lazar` and `bin/lazartui`, locks the kernel with `chflags uchg`, and seeds
