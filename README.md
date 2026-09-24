@@ -192,7 +192,7 @@ If you have a previous install at `~/clawd/lazar`, run:
 bash ~/clawd/lazar/scripts/migrate-from-clawd.sh
 ```
 
-This moves the directory to `~/lazar`, optionally updates the `/usr/local/bin/lazar` symlink, and shows diffs before patching any `clawd/lazar` references in your shell rc files (with backups). Use `--yes` for non-interactive migration. Skills, memory, workspace, and logs are preserved. You'll need to rebuild the kernel after the move — see the steps printed by the script.
+This moves the directory to `~/lazar`, optionally removes a stale `/usr/local/bin/lazar` symlink (lazar is found through `PATH=~/lazar/bin:$PATH`), and shows diffs before patching any `clawd/lazar` references in your shell rc files (with backups). Use `--yes` for non-interactive migration. Skills, memory, workspace, and logs are preserved. You'll need to rebuild the kernel after the move — see the steps printed by the script.
 
 If the script isn't present in your old install, copy it from the repo first:
 

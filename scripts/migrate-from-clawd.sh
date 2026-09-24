@@ -5,8 +5,8 @@
 # Run from anywhere:
 #   bash scripts/migrate-from-clawd.sh [--yes]
 #
-# Without --yes this script prompts before moving, before updating the global
-# symlink, and before patching shell rc files.
+# Without --yes this script prompts before moving, before removing a stale
+# global symlink, and before patching shell rc files.
 set -euo pipefail
 
 OLD="$HOME/clawd/lazar"
@@ -66,27 +66,27 @@ if [ -d "$HOME/clawd" ] && [ -z "$(ls -A "$HOME/clawd" 2>/dev/null)" ]; then
     echo "[migrate] removed empty $HOME/clawd"
 fi
 
-# 4. update /usr/local/bin/lazar symlink if it pointed at the old path
+# 4. drop a stale /usr/local/bin/lazar symlink into the old path. lazar is
+# found through PATH ($NEW/bin), never through links.
 LINK="/usr/local/bin/lazar"
 if [ -L "$LINK" ]; then
     TARGET=$(readlink "$LINK" 2>/dev/null || true)
     case "$TARGET" in
         *clawd/lazar*)
-            if confirm "Update $LINK symlink to $NEW/bin/lazar?"; then
-                echo "[migrate] updating $LINK symlink"
+            if confirm "Remove stale $LINK symlink (lazar is found via PATH now)?"; then
+                echo "[migrate] removing $LINK"
                 if [ -w "$(dirname "$LINK")" ]; then
                     rm -f "$LINK"
-                    ln -s "$NEW/bin/lazar" "$LINK"
                 else
                     sudo rm -f "$LINK"
-                    sudo ln -s "$NEW/bin/lazar" "$LINK"
                 fi
             else
-                echo "[migrate] skipped symlink update. Manual command: ln -sf '$NEW/bin/lazar' '$LINK'"
+                echo "[migrate] kept $LINK. Remove it with: sudo rm '$LINK'"
             fi
             ;;
     esac
 fi
+echo "[migrate] put lazar on PATH:  export PATH=\"$NEW/bin:\$PATH\""
 
 patch_rc() {
     local rc="$1"

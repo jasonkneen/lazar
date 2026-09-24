@@ -18,16 +18,15 @@ def write_record(path, record):
     temporary.replace(path)
 
 
-def check_claim(claim):
-    kind, value = claim.split('=', 1)
-    if kind == 'exists':
-        return Path(value).exists()
-    path, required = value.split(':', 1)
-    if kind == 'contains':
-        return required in Path(path).read_text(errors='replace')
-    if kind == 'size_at_least':
-        return Path(path).stat().st_size >= int(required)
-    return False
+def check_claims(verifier, claims):
+    """Failed claims, checked by the kernel's `lazar verify` (one checker)."""
+    try:
+        done = subprocess.run([verifier, 'verify'], input='\n'.join(claims) + '\n',
+                              capture_output=True, text=True, timeout=60)
+        report = json.loads(done.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        return [f'lazar verify unavailable: {error}']
+    return [f"{c['claim']} — {c['detail']}" for c in report.get('claims', []) if not c.get('ok')]
 
 
 def bump_failure(filename):
@@ -81,14 +80,7 @@ def main():
                 bounded.stop_group(process)
                 bounded.finish_watch(watch)
         claims = [line.strip() for line in Path(spec['claims']).read_text().splitlines() if line.strip()]
-        failed = []
-        for claim in claims:
-            try:
-                ok = check_claim(claim)
-            except (ValueError, OSError):
-                ok = False
-            if not ok:
-                failed.append(claim)
+        failed = check_claims(spec['verifier'], claims) if claims else []
         matched = bool(claims) and not failed and rc == 0
         record.update(status='ok' if matched else 'fail', matched=matched,
                       child_rc=rc, failed_claims=failed)

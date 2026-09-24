@@ -12,7 +12,7 @@ use crate::render::theme::{Theme, ThemeKind};
 use crate::render::transcript::RenderCache;
 use crate::skills::{expand_skill_prompt, load_index, SkillEntry};
 use crate::state::{state_path, PersistedState};
-use crate::transcript::{BannerKind, Transcript};
+use crate::transcript::{BannerKind, Transcript, VerifyClaim, VerifyStatus};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
@@ -1028,7 +1028,11 @@ impl App {
                 self.persist();
             }
             KernelEvent::HistoryUser(text) => {
-                if !text.is_empty() {
+                // The kernel injects operator-role nudges (e.g. "[kernel
+                // verification] ..." after a failed VERIFY block) that
+                // aren't something the user actually typed; don't replay
+                // them into the transcript.
+                if !text.is_empty() && !text.starts_with("[kernel") {
                     self.transcript.push_user(text);
                 }
             }
@@ -1129,6 +1133,30 @@ impl App {
                     self.transcript
                         .push_marker(format!("continuation ({reason})"));
                 }
+            }
+            "verify" => {
+                let status = match event.get("status").and_then(Value::as_str) {
+                    Some("passed") => VerifyStatus::Passed,
+                    _ => VerifyStatus::Failed,
+                };
+                let attempt = event.get("attempt").and_then(Value::as_u64).unwrap_or(1) as u32;
+                let final_ = event.get("final").and_then(Value::as_bool).unwrap_or(true);
+                let tools_run = event.get("tools_run").and_then(Value::as_u64).unwrap_or(0);
+                let claims = event
+                    .get("claims")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|c| VerifyClaim {
+                                claim: c.get("claim").and_then(Value::as_str).unwrap_or("").to_string(),
+                                ok: c.get("ok").and_then(Value::as_bool).unwrap_or(false),
+                                detail: c.get("detail").and_then(Value::as_str).unwrap_or("").to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.transcript
+                    .push_verify(status, attempt, final_, tools_run, claims);
             }
             "invoke_start" => {
                 if let Some(model) = event.get("model").and_then(Value::as_str) {

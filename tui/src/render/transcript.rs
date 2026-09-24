@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use super::block_frame::BlockFrame;
 use super::markdown::{render_markdown, Highlighter};
 use super::theme::Theme;
-use crate::transcript::{BannerKind, Block, Transcript};
+use crate::transcript::{BannerKind, Block, Transcript, VerifyStatus};
 
 /// Wrap one line to `width` columns, breaking at spaces where possible and
 /// hard-breaking otherwise. Styles are preserved per span.
@@ -90,6 +90,7 @@ struct CacheEntry {
     key: u64,
     width: u16,
     theme_key: u64,
+    debug: bool,
     lines: Vec<Line<'static>>,
 }
 
@@ -117,17 +118,21 @@ impl RenderCache {
             // decide whether it changed.
             let key = transcript.revision(i);
             let theme_key = theme.cache_key();
+            let debug = transcript.debug;
             let fresh = self
                 .entries
                 .get(i)
-                .map(|e| e.key != key || e.width != width || e.theme_key != theme_key)
+                .map(|e| {
+                    e.key != key || e.width != width || e.theme_key != theme_key || e.debug != debug
+                })
                 .unwrap_or(true);
             if fresh {
-                let rendered = render_block(block, width, theme, hl);
+                let rendered = render_block(block, width, theme, hl, debug);
                 let entry = CacheEntry {
                     key,
                     width,
                     theme_key,
+                    debug,
                     lines: rendered,
                 };
                 if i < self.entries.len() {
@@ -176,7 +181,49 @@ fn wrap_overlong(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 #[cfg(test)]
 pub static RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-fn render_block(block: &Block, width: u16, theme: &Theme, hl: &Highlighter) -> Vec<Line<'static>> {
+/// Strip `[VERIFY]...[/VERIFY]` blocks the kernel's grounding check consumes
+/// (tag case-insensitive; the closing tag may be missing its `]`, e.g. an
+/// unclosed `[/VERIFY` at the end of a still-streaming reply). The kernel
+/// reports the outcome separately as a `Block::Verify`, so the raw block is
+/// just noise in the rendered transcript.
+fn strip_verify_blocks(markdown: &str) -> String {
+    let lower = markdown.to_ascii_lowercase();
+    let mut out = String::with_capacity(markdown.len());
+    let mut pos = 0usize;
+    loop {
+        match lower[pos..].find("[verify]") {
+            Some(rel) => {
+                let start = pos + rel;
+                out.push_str(&markdown[pos..start]);
+                let after_open = start + "[verify]".len();
+                pos = match lower[after_open..].find("[/verify") {
+                    Some(rel_close) => {
+                        let close_start = after_open + rel_close;
+                        match lower[close_start..].find(']') {
+                            Some(rel_bracket) => close_start + rel_bracket + 1,
+                            None => markdown.len(),
+                        }
+                    }
+                    // No closing tag yet (still streaming): drop the rest.
+                    None => markdown.len(),
+                };
+            }
+            None => {
+                out.push_str(&markdown[pos..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn render_block(
+    block: &Block,
+    width: u16,
+    theme: &Theme,
+    hl: &Highlighter,
+    debug: bool,
+) -> Vec<Line<'static>> {
     #[cfg(test)]
     RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut out: Vec<Line<'static>> = Vec::new();
@@ -218,7 +265,18 @@ fn render_block(block: &Block, width: u16, theme: &Theme, hl: &Highlighter) -> V
             markdown,
             streaming,
         } => {
-            let mut body = render_markdown(markdown, theme, hl);
+            let shown = if debug {
+                markdown.clone()
+            } else {
+                strip_verify_blocks(markdown)
+            };
+            // Whitespace-only text (models emit "\n\n" between tool calls, or
+            // a reply that was only a now-stripped [VERIFY] block) would add
+            // blank rows; render nothing so tool rows stay one line apart.
+            if !*streaming && shown.trim().is_empty() {
+                return out;
+            }
+            let mut body = render_markdown(&shown, theme, hl);
             if *streaming {
                 let cursor = Span::styled(theme.glyph("▍", "_"), theme.accent);
                 match body.last_mut() {
@@ -251,16 +309,23 @@ fn render_block(block: &Block, width: u16, theme: &Theme, hl: &Highlighter) -> V
                 (Some(_), Some(c)) => Span::styled(format!(" x exit {c}"), theme.fail),
                 (Some(_), None) => Span::styled(" done".to_string(), theme.dim),
             };
-            let cmd_display = if command.is_empty() {
-                "(command)".to_string()
+            // The program name keeps the tool colour; its arguments are quieter.
+            let (program, args) = if command.is_empty() {
+                ("(command)", "")
             } else {
-                command.clone()
+                let trimmed = command.trim_start();
+                let split = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+                trimmed.split_at(split)
             };
-            out.push(Line::from(vec![
+            let mut header = vec![
                 Span::styled(theme.icon("󰞷 ", "◆ ", "$ "), theme.accent),
-                Span::styled(cmd_display, theme.tool_cmd),
-                status,
-            ]));
+                Span::styled(program.to_string(), theme.tool_cmd),
+            ];
+            if !args.is_empty() {
+                header.push(Span::styled(args.to_string(), theme.tool_args));
+            }
+            header.push(status);
+            out.push(Line::from(header));
             if let Some(text) = output {
                 let total = text.lines().count();
                 if *folded {
@@ -341,6 +406,61 @@ fn render_block(block: &Block, width: u16, theme: &Theme, hl: &Highlighter) -> V
                 ),
                 theme.marker,
             )));
+            wrap_all(out, width)
+        }
+        Block::Verify {
+            status,
+            final_,
+            claims,
+            ..
+        } => {
+            let failed = claims.iter().filter(|c| !c.ok).count();
+            let total = claims.len();
+            out.push(Line::default());
+            let headline = match status {
+                VerifyStatus::Passed => Line::from(Span::styled(
+                    format!(
+                        "{} verified {} {total} {}",
+                        theme.glyph("✓", "ok"),
+                        theme.glyph("·", "-"),
+                        if total == 1 { "claim" } else { "claims" }
+                    ),
+                    theme.ok,
+                )),
+                VerifyStatus::Failed if !*final_ => Line::from(Span::styled(
+                    format!(
+                        "{} verification failed {} {failed} of {total} {} correcting",
+                        theme.glyph("✗", "x"),
+                        theme.glyph("·", "-"),
+                        theme.glyph("—", "-"),
+                    ),
+                    theme.warn,
+                )),
+                VerifyStatus::Failed => Line::from(Span::styled(
+                    format!(
+                        "{} verification failed {} {failed} of {total}",
+                        theme.glyph("✗", "x"),
+                        theme.glyph("·", "-"),
+                    ),
+                    theme.fail,
+                )),
+            };
+            out.push(headline);
+            if debug {
+                for claim in claims {
+                    let (mark, style) = if claim.ok {
+                        (theme.glyph("✓", "ok"), theme.ok)
+                    } else {
+                        (theme.glyph("✗", "x"), theme.fail)
+                    };
+                    out.push(Line::from(vec![
+                        Span::styled(format!("  {mark} "), style),
+                        Span::styled(claim.claim.clone(), style),
+                        Span::styled(format!(" {} ", theme.glyph("—", "-")), theme.dim),
+                        Span::styled(claim.detail.clone(), theme.dim),
+                    ]));
+                }
+            }
             wrap_all(out, width)
         }
     }
@@ -459,24 +579,51 @@ mod tests {
     fn user_messages_have_half_block_padding_and_assistant_messages_are_transparent() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
-        let user = render_block(&Block::User { text: "Hello".into() }, 24, &theme, &hl);
+        let user = render_block(&Block::User { text: "Hello".into() }, 24, &theme, &hl, false);
         let rendered = text(&user);
         assert_eq!(rendered[1], "▄".repeat(24));
         assert_eq!(rendered.last().unwrap(), &"▀".repeat(24));
         assert_eq!(user[2].style.bg, theme.user_surface.bg);
         let assistant = render_block(&Block::Assistant {
             markdown: "Hello from Lazar.".into(), streaming: false,
-        }, 24, &theme, &hl);
+        }, 24, &theme, &hl, false);
         assert!(text(&assistant).iter().any(|line| line.contains("Hello from Lazar.")));
         assert!(assistant.iter().all(|line| line.style.bg.is_none()
             && line.spans.iter().all(|span| span.style.bg.is_none())));
     }
 
     #[test]
+    fn folded_tool_rows_are_one_line_apart_with_quiet_arguments() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let tool = |command: &str| Block::Tool {
+            id: String::new(),
+            command: command.into(),
+            output: Some("a\nb\n".into()),
+            exit_code: Some(0),
+            folded: true,
+        };
+        let empty = Block::Assistant { markdown: "\n\n\n".into(), streaming: false };
+        let mut lines = Vec::new();
+        for block in [tool("tail -n 30 journal.md"), empty, tool("git log")] {
+            lines.extend(render_block(&block, 80, &theme, &hl, false));
+        }
+        let rendered = text(&lines);
+        assert_eq!(rendered.len(), 6, "{rendered:?}");
+        assert_eq!(rendered[3], "", "exactly one blank row between tools: {rendered:?}");
+        let header = &lines[1];
+        let program = header.spans.iter().find(|s| s.content == "tail").unwrap();
+        assert_eq!(program.style, theme.tool_cmd);
+        let args = header.spans.iter().find(|s| s.content == "-n").unwrap();
+        assert_eq!(args.style, theme.tool_args);
+        assert_ne!(theme.tool_args, theme.tool_cmd);
+    }
+
+    #[test]
     fn long_assistant_paragraphs_wrap_instead_of_clipping() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let md = "Want me to look at the scroll/viewport logic in `app.rs` to see if there's a clamp bug? Or rebuild the TUI from source so you're running current code?\n\n- a list item that is long enough to need wrapping onto a second line";
-        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new());
+        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new(), false);
         let rendered = text(&lines);
         let joined = rendered.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
         assert!(joined.contains("running current code?"), "{rendered:?}");
@@ -495,7 +642,7 @@ mod tests {
             markdown: "Run this:\n\n```sh\nls -la\n```\n".into(),
             streaming: false,
         };
-        let lines = render_block(&block, 40, &theme, &Highlighter::new());
+        let lines = render_block(&block, 40, &theme, &Highlighter::new(), false);
         // The highlighter may split the command into several spans; find the
         // line whose concatenated text carries it.
         let code_line = lines
@@ -511,6 +658,116 @@ mod tests {
         assert_ne!(theme.code.bg, theme.assistant_surface.bg);
         // …while the padding around it is the box surface.
         assert_eq!(code_line.spans.first().unwrap().style.bg, theme.assistant_surface.bg);
+    }
+
+    #[test]
+    fn strips_a_verify_block_in_the_middle_of_a_reply() {
+        let stripped = strip_verify_blocks(
+            "Done.\n\n[VERIFY]\nexists=/tmp/x\n[/VERIFY]\n\nLet me know if that works.",
+        );
+        assert!(!stripped.to_ascii_lowercase().contains("verify"));
+        assert!(stripped.contains("Done."));
+        assert!(stripped.contains("Let me know if that works."));
+    }
+
+    #[test]
+    fn strips_multiple_verify_blocks() {
+        let stripped = strip_verify_blocks(
+            "a\n[VERIFY]\nexists=/x\n[/VERIFY]\nb\n[verify]\ncontains=/y:z\n[/verify]\nc",
+        );
+        assert_eq!(stripped, "a\n\nb\n\nc");
+    }
+
+    #[test]
+    fn strips_an_unclosed_verify_tag_variant() {
+        // The kernel's closing tag may be missing its `]`, and a still
+        // streaming reply may not have the closing tag at all yet.
+        let stripped = strip_verify_blocks("before\n[VERIFY]\nexists=/x\n[/VERIFY");
+        assert_eq!(stripped, "before\n");
+
+        let mid_stream = strip_verify_blocks("before\n[VERIFY]\nexists=/x");
+        assert_eq!(mid_stream, "before\n");
+    }
+
+    #[test]
+    fn debug_mode_keeps_the_raw_verify_block() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Assistant {
+            markdown: "Done.\n\n[VERIFY]\nexists=/tmp/x\n[/VERIFY]".into(),
+            streaming: false,
+        };
+        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true));
+        assert!(debug_lines.iter().any(|l| l.contains("[VERIFY]")));
+        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false));
+        assert!(!plain_lines.iter().any(|l| l.to_ascii_lowercase().contains("verify")));
+    }
+
+    #[test]
+    fn a_reply_that_is_only_a_verify_block_renders_nothing() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Assistant {
+            markdown: "[VERIFY]\nexists=/tmp/x\n[/VERIFY]\n".into(),
+            streaming: false,
+        };
+        let lines = render_block(&block, 40, &theme, &hl, false);
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    fn claim(claim: &str, ok: bool, detail: &str) -> crate::transcript::VerifyClaim {
+        crate::transcript::VerifyClaim {
+            claim: claim.into(),
+            ok,
+            detail: detail.into(),
+        }
+    }
+
+    #[test]
+    fn renders_a_passed_verify_event() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Verify {
+            status: VerifyStatus::Passed,
+            attempt: 1,
+            final_: true,
+            tools_run: 2,
+            claims: vec![claim("exists=/tmp/x", true, "exists")],
+        };
+        let lines = text(&render_block(&block, 80, &theme, &hl, false));
+        assert!(lines.iter().any(|l| l.contains("verified") && l.contains("1 claim")), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.contains("exists")), "claim detail is debug-only: {lines:?}");
+    }
+
+    #[test]
+    fn renders_a_failed_retry_verify_event_with_debug_claim_detail() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Verify {
+            status: VerifyStatus::Failed,
+            attempt: 1,
+            final_: false,
+            tools_run: 2,
+            claims: vec![claim("exists=/tmp/x", true, "exists"), claim("contains=/tmp/y:z", false, "not found")],
+        };
+        let lines = text(&render_block(&block, 80, &theme, &hl, true));
+        assert!(lines.iter().any(|l| l.contains("1 of 2") && l.contains("correcting")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("contains=/tmp/y:z") && l.contains("not found")), "{lines:?}");
+    }
+
+    #[test]
+    fn renders_a_final_failed_verify_event_without_correcting_suffix() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Verify {
+            status: VerifyStatus::Failed,
+            attempt: 2,
+            final_: true,
+            tools_run: 2,
+            claims: vec![claim("exists=/tmp/x", false, "missing")],
+        };
+        let lines = text(&render_block(&block, 80, &theme, &hl, false));
+        assert!(lines.iter().any(|l| l.contains("1 of 1") && !l.contains("correcting")), "{lines:?}");
     }
 }
 

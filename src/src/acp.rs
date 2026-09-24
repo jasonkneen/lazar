@@ -614,8 +614,8 @@ fn replay_history(session_id: &SessionId) -> Vec<SessionUpdate> {
     for message in messages {
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
         match message.get("content") {
-            // Kernel continuation nudges are not something the operator typed.
-            Some(Value::String(text)) if text == crate::core::compact::CONTINUE_PROMPT => {}
+            // Kernel nudges (continuation, verification) are not operator text.
+            Some(Value::String(text)) if role == "user" && text.starts_with("[kernel") => {}
             Some(Value::String(text)) if !text.is_empty() => {
                 let chunk = ContentChunk::new(text.clone().into());
                 match role {

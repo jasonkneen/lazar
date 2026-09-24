@@ -297,6 +297,8 @@ pub struct Theme {
     pub assistant_surface: Style,
     pub user_cap: Style,
     pub tool_cmd: Style,
+    /// Arguments after the program name in a tool row: quieter than the name.
+    pub tool_args: Style,
     pub tool_out: Style,
     pub ok: Style,
     pub fail: Style,
@@ -381,6 +383,7 @@ impl Theme {
             assistant_surface: Style::default(),
             user_cap: Style::default().fg(p.bg_elevated).bg(p.bg_base),
             tool_cmd: Style::default().fg(p.tool),
+            tool_args: Style::default().fg(p.text_muted),
             tool_out: Style::default().fg(p.text_muted),
             ok: Style::default().fg(p.success),
             fail: emphasis(Style::default().fg(p.error)),
@@ -452,6 +455,18 @@ impl Theme {
         }
         self.thin = thin;
         self
+    }
+    /// Markdown strong text. A thin face has no bold to lean on, so strong
+    /// text takes the accent colour instead of vanishing into the body.
+    pub fn strong(&self, style: Style) -> Style {
+        if self.thin {
+            match self.accent.fg {
+                Some(fg) => style.fg(fg),
+                None => style,
+            }
+        } else {
+            style.add_modifier(Modifier::BOLD)
+        }
     }
     pub fn emphasize(&self, style: Style) -> Style {
         if self.thin {

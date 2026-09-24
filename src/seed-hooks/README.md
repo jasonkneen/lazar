@@ -146,7 +146,7 @@ The kernel does not run a daemon. To get scheduled background work, wire
   <key>Label</key><string>com.lazar.tick</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/local/bin/lazar</string>
+    <string>/Users/YOU/lazar/bin/lazar</string>
     <string>--tick</string>
   </array>
   <key>StartInterval</key><integer>300</integer>
@@ -161,7 +161,7 @@ Then: `launchctl load ~/Library/LaunchAgents/com.lazar.tick.plist`
 **Linux** — add to user crontab (`crontab -e`):
 
 ```
-*/5 * * * * /usr/local/bin/lazar --tick >> ~/lazar/user/logs/tick.log 2>&1
+*/5 * * * * $HOME/lazar/bin/lazar --tick >> ~/lazar/user/logs/tick.log 2>&1
 ```
 
 Each `tick.d/` hook owns its own scheduling via touch files in

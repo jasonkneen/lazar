@@ -12,7 +12,8 @@
 #   - at least one absolute path
 #   - a SUCCESS: line
 #   - an EXPECT-VERIFY: block with indented claims:
-#       exists=/abs | contains=/abs:needle | size_at_least=/abs:bytes
+#       any `lazar verify` claim: exists=, not_exists=, size=, size_at_least=,
+#       size_at_most=, contains=, mtime_within= (absolute paths recommended)
 #
 # Emits a JSON envelope on stdout. The wrapper re-checks EXPECT-VERIFY
 # against the filesystem — the child's self-report is not trusted.
@@ -22,30 +23,25 @@ HELPER_DIR=$(cd "$(dirname "$0")" && pwd)
 
 emit_err(){ printf '{"status":"error","reason":%s}\n' "$(printf '%s' "$1" | jq -R .)"; exit 1; }
 
-# --- Claim checking: ONE implementation shared by the foreground, detached
-# and sweeper paths. `check_claims` reads one claim per line on stdin and
-# sets CLAIMS_MATCHED (true|false), CLAIMS_COUNT and the FAILED_CLAIMS array.
-# The child's self-report is never consulted: every claim is re-checked
-# against the real filesystem.
-check_one(){
-  local c="$1" p n min pn
-  case "$c" in
-    exists=*)        [ -e "${c#exists=}" ] ;;
-    contains=*)      pn="${c#contains=}"; p="${pn%%:*}"; n="${pn#*:}"; [ -f "$p" ] && rg -qF -- "$n" "$p" ;;
-    size_at_least=*) pn="${c#size_at_least=}"; p="${pn%%:*}"; min="${pn#*:}"; [ -f "$p" ] && [ "$(wc -c <"$p")" -ge "$min" ] ;;
-    *) return 1 ;;
-  esac
-}
+# --- Claim checking: the kernel's checker (`lazar verify`), the same one that
+# checks [VERIFY] blocks in every turn, so there is one claim language and one
+# implementation. `check_claims` reads one claim per line on stdin and sets
+# CLAIMS_MATCHED (true|false), CLAIMS_COUNT and the FAILED_CLAIMS array. The
+# child's self-report is never consulted: every claim is re-checked against
+# the real filesystem.
+# LAZAR_BIN is the child runner (tests stub it); the checker is always a real
+# kernel binary.
+VERIFY_BIN="${LAZAR_VERIFY_BIN:-$LAZAR_HOME/bin/lazar}"
 check_claims(){
-  local claim
-  CLAIMS_MATCHED=true; CLAIMS_COUNT=0; FAILED_CLAIMS=()
-  while IFS= read -r claim; do
-    claim="$(printf '%s' "$claim" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    [ -z "$claim" ] && continue
-    CLAIMS_COUNT=$((CLAIMS_COUNT+1))
-    check_one "$claim" || { CLAIMS_MATCHED=false; FAILED_CLAIMS+=("$claim"); }
-  done
-  [ "$CLAIMS_COUNT" -gt 0 ] || CLAIMS_MATCHED=false
+  local report
+  CLAIMS_MATCHED=false; CLAIMS_COUNT=0; FAILED_CLAIMS=()
+  report=$("$VERIFY_BIN" verify 2>/dev/null) || true
+  [ -n "$report" ] || { FAILED_CLAIMS+=("lazar verify produced no report"); return; }
+  CLAIMS_COUNT=$(printf '%s' "$report" | jq '.claims | length')
+  [ "$(printf '%s' "$report" | jq -r '.passed')" = "true" ] && CLAIMS_MATCHED=true
+  while IFS= read -r failed; do
+    [ -n "$failed" ] && FAILED_CLAIMS+=("$failed")
+  done < <(printf '%s' "$report" | jq -r '.claims[] | select(.ok | not) | "\(.claim) — \(.detail)"')
 }
 failed_claims_json(){
   printf '%s\n' "${FAILED_CLAIMS[@]:-}" | jq -R . | jq -s 'map(select(length>0))'
@@ -122,11 +118,8 @@ printf '%s' "$PROMPT" | rg -q '^EXPECT-VERIFY:' \
 
 CLAIMS=$(printf '%s\n' "$PROMPT" | awk '/^EXPECT-VERIFY:/{f=1;next} f{ if($0 ~ /^[[:space:]]/) print; else f=0 }')
 [ -n "$(printf '%s' "$CLAIMS" | tr -d '[:space:]')" ] || emit_err "EXPECT-VERIFY block parsed to zero claims"
-while IFS= read -r claim; do
-  claim=$(printf '%s' "$claim" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-  [ -z "$claim" ] && continue
-  case "$claim" in exists=/*|contains=/*:*|size_at_least=/*:*) ;; *) emit_err "invalid verification claim: $claim" ;; esac
-done <<< "$CLAIMS"
+LINT=$(printf '%s\n' "$CLAIMS" | "$VERIFY_BIN" verify --lint 2>/dev/null) \
+  || emit_err "invalid verification claim(s): $(printf '%s' "$LINT" | jq -r '[.claims[]? | select(.ok | not) | "\(.claim) (\(.detail))"] | join("; ")' 2>/dev/null)"
 
 if [ "$LINT_ONLY" = "1" ]; then printf '{"status":"ok","lint":"passed"}\n'; exit 0; fi
 
@@ -224,9 +217,9 @@ parse_claims >"$CLAIMS_FILE"
 if [ "$DETACH" = "1" ]; then
   [ -f "$SUPERVISOR" ] || emit_err "missing job supervisor: $SUPERVISOR"
   jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg output "$OUTFILE" \
-    --arg failure_file "$CFILE" --arg claims "$CLAIMS_FILE" --arg runner "$TIMEOUT_RUNNER" --arg binary "$LAZAR_BIN" \
+    --arg failure_file "$CFILE" --arg claims "$CLAIMS_FILE" --arg runner "$TIMEOUT_RUNNER" --arg binary "$LAZAR_BIN" --arg verifier "$VERIFY_BIN" \
     --arg prompt "$PROMPT" --arg depth "$CHILD_DEPTH" --argjson timeout "$KILL_AFTER" \
-    '{id:$id,task:$task,output:$output,claims:$claims,runner:$runner,timeout:$timeout,failure_file:$failure_file,
+    '{id:$id,task:$task,output:$output,claims:$claims,runner:$runner,verifier:$verifier,timeout:$timeout,failure_file:$failure_file,
       argv:["env",("LAZAR_DEPTH="+$depth),$binary,"-p",$prompt,"--output-format","stream-json"]}' >"${JOB_FILE%.json}.spec.json"
   jq -n --arg id "$JOB_ID" '{status:"starting",job_id:$id}' >"$JOB_FILE"
   BG_PID=$(python3 "$SUPERVISOR" --detach "$JOB_FILE") || emit_err "cannot start job supervisor"

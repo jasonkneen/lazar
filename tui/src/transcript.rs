@@ -40,6 +40,29 @@ pub enum Block {
     Marker {
         text: String,
     },
+    /// Result of the kernel's post-turn grounding check on a `[VERIFY]`
+    /// block the model emitted (see `App::handle_lazar_event`'s `"verify"`
+    /// case).
+    Verify {
+        status: VerifyStatus,
+        attempt: u32,
+        final_: bool,
+        tools_run: u64,
+        claims: Vec<VerifyClaim>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyClaim {
+    pub claim: String,
+    pub ok: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Default)]
@@ -105,6 +128,24 @@ impl Transcript {
 
     pub fn push_marker(&mut self, text: impl Into<String>) {
         self.push_block(Block::Marker { text: text.into() });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_verify(
+        &mut self,
+        status: VerifyStatus,
+        attempt: u32,
+        final_: bool,
+        tools_run: u64,
+        claims: Vec<VerifyClaim>,
+    ) {
+        self.push_block(Block::Verify {
+            status,
+            attempt,
+            final_,
+            tools_run,
+            claims,
+        });
     }
 
     pub fn push_banner(&mut self, kind: BannerKind, text: impl Into<String>) {
@@ -285,6 +326,25 @@ impl Transcript {
                     action.as_deref().unwrap_or("-")
                 )),
                 Block::Marker { text } => out.push_str(&format!("\n── {text} ──\n")),
+                Block::Verify {
+                    status,
+                    attempt,
+                    final_,
+                    tools_run,
+                    claims,
+                } => {
+                    out.push_str(&format!(
+                        "\n[verify {status:?} attempt={attempt} final={final_} tools_run={tools_run}]\n"
+                    ));
+                    for claim in claims {
+                        out.push_str(&format!(
+                            "  {} {} — {}\n",
+                            if claim.ok { "✓" } else { "✗" },
+                            claim.claim,
+                            claim.detail
+                        ));
+                    }
+                }
             }
         }
         out

@@ -126,7 +126,7 @@ impl<'t> Builder<'t> {
         // their own bg and keep it inside a frame.
         let mut s = Style::default().fg(self.theme.canvas.fg.unwrap_or_default());
         if self.inline.bold {
-            s = self.theme.emphasize(s);
+            s = self.theme.strong(s);
         }
         if self.inline.italic {
             s = s.add_modifier(Modifier::ITALIC);
@@ -428,7 +428,7 @@ pub fn render_markdown(md: &str, theme: &Theme, hl: &Highlighter) -> Vec<Line<'s
                         b.push_text("");
                     }
                     b.current
-                        .push(Span::styled(format!("`{code}`"), theme.code));
+                        .push(Span::styled(code.to_string(), theme.code));
                 }
             }
             Event::SoftBreak => b.push_text(" "),
@@ -466,6 +466,24 @@ pub fn render_markdown(md: &str, theme: &Theme, hl: &Highlighter) -> Vec<Line<'s
 mod tests {
     use super::*;
 
+    #[test]
+    fn strong_text_stands_out_in_thin_mode_and_code_has_no_backticks() {
+        let hl = Highlighter::new();
+        let md = "**Bug:** see `wrap_overlong()` now";
+        let thin = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode).with_thin(true);
+        let lines = render_markdown(md, &thin, &hl);
+        let bug = lines[0].spans.iter().find(|s| s.content.contains("Bug:")).unwrap();
+        assert_eq!(bug.style.fg, thin.accent.fg, "thin strong uses the accent colour");
+        assert!(!plain(&lines)[0].contains('`'), "{:?}", plain(&lines));
+        let code = lines[0].spans.iter().find(|s| s.content == "wrap_overlong()").unwrap();
+        assert_eq!(code.style.bg, thin.code.bg);
+
+        let regular = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode).with_thin(false);
+        let lines = render_markdown(md, &regular, &hl);
+        let bug = lines[0].spans.iter().find(|s| s.content.contains("Bug:")).unwrap();
+        assert!(bug.style.add_modifier.contains(Modifier::BOLD));
+    }
+
     fn plain(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
@@ -486,7 +504,7 @@ mod tests {
         let lines = plain(&render_markdown(md, &theme, &hl));
         assert_eq!(lines[0], "# Title");
         assert!(
-            lines.iter().any(|l| l == "Some em and strong and `code`."),
+            lines.iter().any(|l| l == "Some em and strong and code."),
             "{lines:?}"
         );
         assert!(lines.iter().any(|l| l == "• one"));

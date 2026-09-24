@@ -346,6 +346,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check verification claims (one per line on stdin, or a [VERIFY] block)
+    /// against the filesystem. Prints JSON; exits 0 only when every claim holds.
+    Verify {
+        /// Only parse the claims; do not touch the filesystem.
+        #[arg(long)]
+        lint: bool,
+    },
 }
 
 /// Which session-lifecycle hooks `run_agent` should fire.
@@ -2155,6 +2162,7 @@ pub(crate) fn run_agent(
     // One forced compaction per overflow the provider reports; reset by the
     // next successful request.
     let mut overflow_retried = false;
+    let mut verify_attempts: u32 = 0;
     let summary_tokens = limits.max_tokens.min(4_096);
     let mut summarise = |transcript: &str| -> Option<String> {
         let body = json!({
@@ -2259,6 +2267,50 @@ pub(crate) fn run_agent(
         session_write_failed(format, &session_guard)?;
 
         let stop_reason = stop_reason_str.as_str();
+
+        if is_terminal_stop_reason(stop_reason) && verify_enabled() {
+            // Grounded verification: claims in the answer are checked against
+            // the real filesystem before the turn is allowed to end.
+            if let Some(parsed) = core::verify::extract_block(&final_answer_text(&messages)) {
+                let outcomes = match parsed {
+                    Ok(lines) => core::verify::check_all(&lines, access::current().tool_cwd()),
+                    Err(detail) => vec![core::verify::Outcome {
+                        claim: "[VERIFY]".into(),
+                        ok: false,
+                        detail,
+                    }],
+                };
+                let passed = outcomes.iter().all(|o| o.ok);
+                verify_attempts += 1;
+                let retry = !passed && verify_attempts <= core::verify::MAX_CORRECTIONS;
+                let event = json!({
+                    "status": if passed { "passed" } else { "failed" },
+                    "attempt": verify_attempts,
+                    "final": !retry,
+                    "tools_run": tool_calls,
+                    "claims": outcomes.iter().map(core::verify::Outcome::to_json).collect::<Vec<_>>(),
+                });
+                let mut logged = event.clone();
+                logged["kind"] = json!("verify");
+                append_stream(logged);
+                if format == OutputFormat::StreamJson {
+                    let mut emitted = event;
+                    emitted["type"] = json!("verify");
+                    emit_event(emitted);
+                }
+                if retry {
+                    let correction = core::verify::correction_prompt(&outcomes);
+                    append_stream(json!({"kind": "verify_correction", "content": &correction}));
+                    session_write_failed(format, &session_guard)?;
+                    messages.push(json!({"role": "user", "content": correction}));
+                    continue;
+                }
+                if !passed {
+                    let msg = core::verify::failure_message(&outcomes);
+                    return Err(abort_invoke(format, &session_guard, "grounding_failed", msg));
+                }
+            }
+        }
 
         if is_terminal_stop_reason(stop_reason) {
             let final_text = text::extract_text(&content);
@@ -2442,6 +2494,76 @@ fn compact_messages(
     }
 }
 
+/// `lazar verify`: the kernel's claim checker for scripts and sub-agent
+/// wrappers, so every caller shares one claim language.
+fn run_verify(lint: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
+    let lines: Vec<String> = match core::verify::extract_block(&input) {
+        Some(Ok(lines)) => lines,
+        Some(Err(detail)) => {
+            println!("{}", json!({"passed": false, "error": detail, "claims": []}));
+            std::process::exit(1);
+        }
+        None => input
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    };
+    let cwd = env::current_dir()?;
+    let outcomes: Vec<core::verify::Outcome> = if lint {
+        lines
+            .iter()
+            .map(|line| match core::verify::parse(line, &cwd) {
+                Ok(_) => core::verify::Outcome { claim: line.clone(), ok: true, detail: "valid".into() },
+                Err(detail) => core::verify::Outcome { claim: line.clone(), ok: false, detail },
+            })
+            .collect()
+    } else {
+        core::verify::check_all(&lines, &cwd)
+    };
+    let passed = !outcomes.is_empty() && outcomes.iter().all(|o| o.ok);
+    let claims: Vec<Value> = outcomes.iter().map(core::verify::Outcome::to_json).collect();
+    println!("{}", json!({"passed": passed, "claims": claims}));
+    if passed {
+        Ok(())
+    } else {
+        std::process::exit(1)
+    }
+}
+
+/// Verification is on unless the operator turns it off (`LAZAR_VERIFY=0`).
+fn verify_enabled() -> bool {
+    !matches!(
+        env::var("LAZAR_VERIFY").ok().as_deref().map(str::trim),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
+/// The text of the answer that just ended: the last assistant message plus
+/// any earlier parts it continued after an output-limit cut.
+fn final_answer_text(messages: &[Value]) -> String {
+    let mut parts = Vec::new();
+    let mut index = messages.len();
+    while index > 0 {
+        index -= 1;
+        if messages[index]["role"] != "assistant" {
+            break;
+        }
+        parts.push(text::extract_text(&messages[index]["content"]));
+        let continued = index > 0
+            && messages[index - 1]["content"].as_str() == Some(core::compact::CONTINUE_PROMPT);
+        if !continued {
+            break;
+        }
+        index -= 1;
+    }
+    parts.reverse();
+    parts.join("")
+}
+
 /// True when a provider error means the request was too large for the model.
 fn is_context_overflow(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
@@ -2511,6 +2633,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         Some(Command::Acp(acp_args)) => return acp::run(acp_args),
         Some(Command::Providers { json }) => return print_providers(json),
+        Some(Command::Verify { lint }) => return run_verify(lint),
         None => {}
     }
     if let Some(provider) = args.provider.as_deref() {
@@ -2911,10 +3034,10 @@ mod tests {
         let requests = api.requests();
         assert_eq!(requests.len(), 1, "exactly one model call; nothing re-prompted");
         assert!(requests[0].get("tool_choice").is_none());
-        assert!(!requests[0]["system"]
+        assert!(requests[0]["system"]
             .as_str()
             .unwrap()
-            .contains("[VERIFY]"), "system prompt carries no VERIFY contract");
+            .contains("[VERIFY]"), "system prompt carries the VERIFY contract");
 
         let events = test_env.log_events();
         let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
@@ -2925,6 +3048,8 @@ mod tests {
             "grounding_failure",
             "fabrication_check",
             "verify_report",
+            // No [VERIFY] block means nothing was asserted: no check runs.
+            "verify",
         ] {
             assert!(!kinds.contains(&forbidden), "{forbidden} must not exist: {kinds:?}");
         }
@@ -3048,6 +3173,63 @@ mod tests {
             json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":3}}),
             json!({"type":"message_stop"}),
         ])
+    }
+
+    #[test]
+    fn verified_claims_pass_in_one_request() {
+        let api = FakeApi::serve(vec![
+            sse_tool_use("printf hello > \"$LAZAR_WORKSPACE/proof.txt\""),
+            sse_end_turn("Wrote it.\n[VERIFY]\nexists=$LAZAR_HOME/user/workspace/proof.txt\ncontains=$LAZAR_HOME/user/workspace/proof.txt:hello\n[/VERIFY]"),
+        ]);
+        let test_env = AgentTestEnv::new("verify-pass", &api);
+        let outcome = run_agent("write proof", OutputFormat::Json, false, None, AgentLifecycle::default())
+            .expect("true claims pass");
+        assert_eq!(outcome.stop_reason, "end_turn");
+        assert_eq!(api.requests().len(), 2, "no correction turn");
+        let verify = test_env.log_events().into_iter().find(|e| e["kind"] == "verify").unwrap();
+        assert_eq!(verify["status"], "passed");
+        assert_eq!(verify["claims"].as_array().unwrap().len(), 2);
+        assert_eq!(verify["tools_run"], 1);
+    }
+
+    #[test]
+    fn a_false_claim_gets_one_correction_turn() {
+        let api = FakeApi::serve(vec![
+            sse_end_turn("Done.\n[VERIFY]\nexists=$LAZAR_HOME/user/workspace/made.txt\n[/VERIFY]"),
+            sse_tool_use("touch \"$LAZAR_WORKSPACE/made.txt\""),
+            sse_end_turn("Now it exists.\n[VERIFY]\nexists=$LAZAR_HOME/user/workspace/made.txt\n[/VERIFY]"),
+        ]);
+        let test_env = AgentTestEnv::new("verify-correct", &api);
+        let outcome = run_agent("make it", OutputFormat::Json, false, None, AgentLifecycle::default())
+            .expect("the corrected answer passes");
+        assert_eq!(outcome.stop_reason, "end_turn");
+        let requests = api.requests();
+        assert_eq!(requests.len(), 3);
+        let correction = requests[1]["messages"][2]["content"].as_str().unwrap();
+        assert!(correction.starts_with("[kernel verification]"), "{correction}");
+        assert!(correction.contains("made.txt") && correction.contains("does not exist"), "{correction}");
+        let statuses: Vec<Value> = test_env
+            .log_events()
+            .into_iter()
+            .filter(|e| e["kind"] == "verify")
+            .map(|e| e["status"].clone())
+            .collect();
+        assert_eq!(statuses, vec![json!("failed"), json!("passed")]);
+    }
+
+    #[test]
+    fn a_claim_that_fails_twice_ends_as_grounding_failed() {
+        let lie = "Deleted.\n[VERIFY]\nnot_exists=/\n[/VERIFY]";
+        let api = FakeApi::serve(vec![sse_end_turn(lie), sse_end_turn(lie)]);
+        let test_env = AgentTestEnv::new("verify-fail", &api);
+        let err = run_agent("delete root", OutputFormat::Json, false, None, AgentLifecycle::default())
+            .expect_err("a repeated false claim fails the turn");
+        assert!(err.to_string().contains("grounding failed"), "{err}");
+        assert_eq!(api.requests().len(), 2, "exactly one correction turn");
+        assert!(test_env
+            .log_events()
+            .iter()
+            .any(|e| e["kind"] == "invoke_end" && e["stop_reason"] == "grounding_failed"));
     }
 
     #[test]
@@ -3508,7 +3690,8 @@ mod tests {
 
     /// Regression guard: the compiled system prompt must render every
     /// placeholder and preserve state-based follow-through without reviving
-    /// the deleted VERIFY/prose-classification machinery.
+    /// prose-classification machinery. VERIFY is a structured contract the
+    /// kernel checks against the filesystem, not a reading of the prose.
     #[test]
     fn system_prompt_template_renders_fully() {
         let rendered = SYSTEM_PROMPT_TEMPLATE
@@ -3532,7 +3715,8 @@ mod tests {
 
         // The kernel still trusts stop_reason and does not demand a verifier
         // DSL or classify assistant prose with lexical heuristics.
-        assert!(!rendered.contains("VERIFY"));
+        assert!(rendered.contains("[VERIFY]"));
+        assert!(rendered.contains("grounding_failed"));
         assert!(!rendered.contains("ACTION FOLLOW-THROUGH"));
     }
 

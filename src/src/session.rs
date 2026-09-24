@@ -324,6 +324,11 @@ fn load_history(path: &Path, cap: usize) -> (Vec<Value>, Vec<Value>) {
             "assistant" => history.assistant(event.get("content")),
             "tool_result" => history.tool_result(&event),
             "continuation" => history.user_text(crate::core::compact::CONTINUE_PROMPT),
+            "verify_correction" => {
+                if let Some(text) = event.get("content").and_then(Value::as_str) {
+                    history.user_text(text);
+                }
+            }
             _ => {}
         }
     }
