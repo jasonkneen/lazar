@@ -45,6 +45,11 @@ pub struct Job {
     /// Agents screen's right-aligned age column.
     #[serde(default)]
     pub age_s: u64,
+    /// The kernel's session id for this job, present only when it can take
+    /// a follow-up message (`jobs --send`) — absent/null for older jobs
+    /// with no session left to continue.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 impl Job {
@@ -244,6 +249,78 @@ pub fn fetch_job_show(
             let _ = tx.send(outcome);
         })
         .expect("spawn job-show thread");
+    rx
+}
+
+/// The kernel's `jobs --send` result: which delivery path it took.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendOutcome {
+    pub job_id: String,
+    /// "steer" (queued into the running job, ahead of its next model
+    /// request) or "turn" (a finished job's session got a fresh follow-up
+    /// turn).
+    pub delivered: String,
+}
+
+/// One-shot `lazar jobs --start "<task>"` off the UI thread: the new job's
+/// initial record, so the Agents screen can show or select it right away
+/// instead of waiting for the next 2s poll.
+pub fn start_job(kernel: PathBuf, lazar_home: PathBuf, task: String) -> Receiver<Result<Job, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("lazartui-job-start".into())
+        .spawn(move || {
+            let outcome = match Command::new(&kernel)
+                .arg("jobs")
+                .arg("--start")
+                .arg(&task)
+                .env("LAZAR_HOME", &lazar_home)
+                .output()
+            {
+                Ok(output) if output.status.success() => {
+                    serde_json::from_slice::<Job>(&output.stdout).map_err(|e| format!("bad job JSON: {e}"))
+                }
+                Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                Err(e) => Err(format!("cannot run {}: {e}", kernel.display())),
+            };
+            let _ = tx.send(outcome);
+        })
+        .expect("spawn job-start thread");
+    rx
+}
+
+/// One-shot `lazar jobs --send <id> "<text>"` off the UI thread: steers a
+/// running job, or starts a follow-up turn on a finished one.
+pub fn send_job(
+    kernel: PathBuf,
+    lazar_home: PathBuf,
+    job_id: String,
+    text: String,
+) -> Receiver<Result<SendOutcome, String>> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("lazartui-job-send".into())
+        .spawn(move || {
+            let outcome = match Command::new(&kernel)
+                .arg("jobs")
+                .arg("--send")
+                .arg(&job_id)
+                .arg(&text)
+                .env("LAZAR_HOME", &lazar_home)
+                .output()
+            {
+                Ok(output) if output.status.success() => serde_json::from_slice::<Value>(&output.stdout)
+                    .map_err(|e| format!("bad send JSON: {e}"))
+                    .map(|v| SendOutcome {
+                        job_id: v.get("job_id").and_then(Value::as_str).unwrap_or(&job_id).to_string(),
+                        delivered: v.get("delivered").and_then(Value::as_str).unwrap_or("").to_string(),
+                    }),
+                Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+                Err(e) => Err(format!("cannot run {}: {e}", kernel.display())),
+            };
+            let _ = tx.send(outcome);
+        })
+        .expect("spawn job-send thread");
     rx
 }
 

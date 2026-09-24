@@ -9,7 +9,9 @@
 
 use serde_json::{json, Value};
 use std::fs;
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 
 /// Finished jobs stay listed this long, so a status line can show the result.
@@ -120,6 +122,173 @@ fn summarise(steps: &[Value]) -> String {
     String::new()
 }
 
+// ─── Operator jobs and steering ──────────────────────────────────────────
+//
+// `jobs --start` runs a task as a detached agent with its own session;
+// `jobs --send` steers a running job through its inbox (the child's loop
+// drains `LAZAR_INBOX` before every model request) or, once it has finished,
+// continues it with a new turn in the same session. `jobs --run` is the
+// detached runner that owns the child and records how it ended.
+
+/// Inbox a running job's child drains before each model request.
+pub(crate) fn inbox_path(jobs_dir: &Path, job_id: &str) -> PathBuf {
+    jobs_dir.join(format!("{job_id}.inbox"))
+}
+
+fn record_path(jobs_dir: &Path, job_id: &str) -> PathBuf {
+    jobs_dir.join(format!("{job_id}.json"))
+}
+
+fn read_record(jobs_dir: &Path, job_id: &str) -> Result<Value, String> {
+    crate::session::validate_session_id(job_id).map_err(|e| format!("bad job id: {e}"))?;
+    let text = fs::read_to_string(record_path(jobs_dir, job_id))
+        .map_err(|_| format!("no job with id {job_id}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("job {job_id} record is unreadable: {e}"))
+}
+
+fn write_record(jobs_dir: &Path, job_id: &str, record: &Value) -> Result<(), String> {
+    fs::create_dir_all(jobs_dir).map_err(|e| e.to_string())?;
+    let path = record_path(jobs_dir, job_id);
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    fs::write(&tmp, format!("{record}\n")).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &path).map_err(|e| e.to_string())
+}
+
+/// `<slug of the task>-<ms>-<pid>`: a valid session id, at most 64 chars.
+pub(crate) fn new_job_id(task: &str, now_ms: u128) -> String {
+    let slug: String = task
+        .split_whitespace()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    let slug = slug.trim_matches('-').chars().take(30).collect::<String>();
+    let slug = if slug.is_empty() { "task".to_string() } else { slug };
+    format!("{slug}-{now_ms}-{}", std::process::id())
+}
+
+fn title(task: &str) -> String {
+    let line = task.lines().find(|l| !l.trim().is_empty()).unwrap_or("task").trim();
+    if line.chars().count() > 80 {
+        format!("{}…", line.chars().take(79).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
+/// Start `exe jobs --run <id>` in its own session, detached from the caller.
+fn spawn_runner(exe: &Path, job_id: &str) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(exe);
+    command
+        .args(["jobs", "--run", job_id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: setsid only detaches the runner from the caller's terminal and
+    // process group; it touches no memory shared with the parent.
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.spawn().map(|_| ()).map_err(|e| format!("cannot start job runner: {e}"))
+}
+
+/// Create an operator job for `task` and start it. Returns the new record.
+pub(crate) fn start(jobs_dir: &Path, task: &str, exe: &Path, now_ms: u128) -> Result<Value, String> {
+    if task.trim().is_empty() {
+        return Err("empty task".into());
+    }
+    let job_id = new_job_id(task, now_ms);
+    let output = jobs_dir
+        .parent()
+        .unwrap_or(jobs_dir)
+        .join(format!("out-{job_id}.log"));
+    let record = json!({
+        "status": "starting",
+        "job_id": job_id,
+        "task": title(task),
+        "kind": "operator",
+        "prompt": task,
+        "session": job_id,
+        "output": output,
+        "started_ms": now_ms as u64,
+    });
+    write_record(jobs_dir, &job_id, &record)?;
+    spawn_runner(exe, &job_id)?;
+    Ok(record)
+}
+
+/// Runner body: run the job's pending prompt as one turn of its session,
+/// then record the outcome. Output is appended, so follow-up turns extend
+/// the same timeline.
+pub(crate) fn run(jobs_dir: &Path, job_id: &str, exe: &Path) -> Result<(), String> {
+    let mut record = read_record(jobs_dir, job_id)?;
+    let prompt = record["prompt"].as_str().unwrap_or("").to_string();
+    let session = record["session"].as_str().unwrap_or(job_id).to_string();
+    let output = PathBuf::from(record["output"].as_str().ok_or("job has no output log")?);
+    record["status"] = json!("running");
+    record["pid"] = json!(std::process::id());
+    write_record(jobs_dir, job_id, &record)?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&output)
+        .map_err(|e| format!("cannot open {}: {e}", output.display()))?;
+    let status = Command::new(exe)
+        .args(["-p", &prompt, "--session", &session, "--output-format", "stream-json"])
+        .env("LAZAR_INBOX", inbox_path(jobs_dir, job_id))
+        .env_remove("LAZAR_TOOL_ENV")
+        .stdin(Stdio::null())
+        .stdout(log.try_clone().map_err(|e| e.to_string())?)
+        .stderr(log)
+        .status();
+    let rc = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(1);
+    let mut record = read_record(jobs_dir, job_id).unwrap_or(record);
+    record["status"] = json!(if rc == 0 { "ok" } else { "fail" });
+    record["child_rc"] = json!(rc);
+    write_record(jobs_dir, job_id, &record)
+}
+
+/// Steer a running job (queued in its inbox for the next model request) or
+/// continue a finished one with a new turn in its session.
+pub(crate) fn send(jobs_dir: &Path, job_id: &str, text: &str, exe: &Path, now_ms: u128) -> Result<Value, String> {
+    if text.trim().is_empty() {
+        return Err("empty message".into());
+    }
+    let mut record = read_record(jobs_dir, job_id)?;
+    let running = matches!(record["status"].as_str(), Some("running" | "starting"))
+        && record["pid"].as_i64().is_none_or(alive);
+    if running {
+        let mut inbox = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(inbox_path(jobs_dir, job_id))
+            .map_err(|e| e.to_string())?;
+        writeln!(inbox, "{}", json!({"text": text})).map_err(|e| e.to_string())?;
+        return Ok(json!({"job_id": job_id, "delivered": "steer"}));
+    }
+    if record.get("session").is_none() {
+        return Err(format!("job {job_id} has no session to continue"));
+    }
+    record["prompt"] = json!(text);
+    record["status"] = json!("starting");
+    record["started_ms"] = json!(now_ms as u64);
+    record.as_object_mut().map(|o| {
+        o.remove("pid");
+        o.remove("child_rc");
+        o.remove("matched");
+        o.remove("failed_claims");
+    });
+    write_record(jobs_dir, job_id, &record)?;
+    spawn_runner(exe, job_id)?;
+    Ok(json!({"job_id": job_id, "delivered": "turn"}))
+}
+
 /// Longest tool output kept per step in a job timeline.
 const TIMELINE_OUTPUT_CHARS: usize = 4_000;
 
@@ -167,8 +336,16 @@ fn timeline(log: &Path) -> Vec<Value> {
         match event["type"].as_str() {
             Some("invoke_start") => {
                 if let Some(prompt) = event["prompt"].as_str() {
-                    steps.push(json!({"kind": "prompt", "text": prompt}));
+                    flush(&mut buffer, &mut steps);
+                    // The first prompt is the task; later ones are the
+                    // operator continuing the job.
+                    let kind = if steps.iter().any(|s| s["kind"] == "prompt") { "operator" } else { "prompt" };
+                    steps.push(json!({"kind": kind, "text": prompt}));
                 }
+            }
+            Some("steer") => {
+                flush(&mut buffer, &mut steps);
+                steps.push(json!({"kind": "operator", "text": event["text"], "steer": true}));
             }
             Some("text_delta") => buffer.push_str(event["text"].as_str().unwrap_or("")),
             Some("text_done") => flush(&mut buffer, &mut steps),
@@ -233,17 +410,59 @@ mod tests {
             json!({"type":"text_done","index":1}),
             json!({"type":"verify","status":"passed","claims":[{"claim":"exists=/tmp/x","ok":true}]}),
             json!({"type":"invoke_end","stop_reason":"end_turn","duration_ms":6220}),
+            json!({"type":"invoke_start","prompt":"now add tests"}),
+            json!({"type":"steer","text":"only unit tests"}),
         ];
         fs::write(&log, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
         let steps = timeline(&log);
         let kinds: Vec<&str> = steps.iter().map(|s| s["kind"].as_str().unwrap()).collect();
-        assert_eq!(kinds, ["prompt", "tool", "text", "verify", "end"], "whitespace-only text is dropped");
+        assert_eq!(
+            kinds,
+            ["prompt", "tool", "text", "verify", "end", "operator", "operator"],
+            "whitespace-only text is dropped; later prompts and steering are the operator's"
+        );
         assert_eq!(steps[1]["command"], "echo DONE > /tmp/x");
         assert_eq!(steps[1]["exit_code"], 0);
         assert_eq!(steps[2]["text"], "All done.");
-        assert_eq!(summarise(&steps), "verify passed");
+        assert_eq!(summarise(&steps[..5]), "verify passed");
         assert_eq!(summarise(&steps[..3]), "All done.");
         assert_eq!(summarise(&steps[..2]), "$ echo DONE > /tmp/x");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn job_ids_are_valid_session_ids() {
+        for task in ["Refactor the TUI footer!", "", "   ", "ünïcödé task with a very long description indeed"] {
+            let id = new_job_id(task, 1_790_000_000_000);
+            crate::session::validate_session_id(&id).unwrap();
+            assert!(id.len() <= 64, "{id}");
+        }
+        assert!(new_job_id("Refactor the TUI footer!", 1).starts_with("refactor-the-tui-footer"));
+    }
+
+    #[test]
+    fn send_steers_a_running_job_and_continues_a_finished_one() {
+        let dir = std::env::temp_dir().join(format!("lazar-send-{}-{}", std::process::id(), crate::now_millis()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = Path::new("/usr/bin/true");
+        let me = std::process::id();
+        write_record(&dir, "live", &json!({"status":"running","job_id":"live","pid":me,"session":"live","output":dir.join("o.log")})).unwrap();
+        let steered = send(&dir, "live", "focus on the footer", exe, 1).unwrap();
+        assert_eq!(steered["delivered"], "steer");
+        let inbox = fs::read_to_string(inbox_path(&dir, "live")).unwrap();
+        assert!(inbox.contains("focus on the footer"), "{inbox}");
+
+        write_record(&dir, "done", &json!({"status":"ok","job_id":"done","pid":999_999_999i64,"session":"done","output":dir.join("o.log"),"child_rc":0})).unwrap();
+        let continued = send(&dir, "done", "now add tests", exe, 5).unwrap();
+        assert_eq!(continued["delivered"], "turn");
+        let record = read_record(&dir, "done").unwrap();
+        assert_eq!(record["prompt"], "now add tests");
+        assert_eq!(record["status"], "starting");
+        assert!(record.get("child_rc").is_none());
+
+        write_record(&dir, "spawned", &json!({"status":"fail","job_id":"spawned"})).unwrap();
+        assert!(send(&dir, "spawned", "retry", exe, 5).unwrap_err().contains("no session"));
+        assert!(send(&dir, "../etc", "x", exe, 5).is_err(), "ids are validated");
         let _ = fs::remove_dir_all(&dir);
     }
 

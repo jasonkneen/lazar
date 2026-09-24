@@ -34,6 +34,16 @@ pub fn timeline_blocks(timeline: &Value) -> Vec<Block> {
                 markdown: text_field(step, "text"),
                 streaming: false,
             }),
+            "operator" => {
+                // A follow-up message from the operator: a steer (queued
+                // into a running turn) or a reply that started a new turn
+                // on a finished job. Same bubble as a live chat turn; a
+                // steer additionally gets a small dim tag underneath.
+                blocks.push(Block::User { text: text_field(step, "text") });
+                if step.get("steer").and_then(Value::as_bool).unwrap_or(false) {
+                    blocks.push(Block::Marker { text: "steered mid-task".into() });
+                }
+            }
             "tool" => blocks.push(Block::Tool {
                 id: text_field(step, "id"),
                 command: text_field(step, "command"),
@@ -94,6 +104,13 @@ pub fn timeline_blocks(timeline: &Value) -> Vec<Block> {
     blocks
 }
 
+/// True when `blocks` already contains a user bubble with exactly this
+/// text — used to drop the job-detail composer's optimistic "sending…"
+/// bubble once a fresh `jobs --show` timeline catches up to it.
+pub fn timeline_contains_user_text(blocks: &[Block], text: &str) -> bool {
+    blocks.iter().any(|block| matches!(block, Block::User { text: t } if t == text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +167,26 @@ mod tests {
         assert!(timeline_blocks(&json!(null)).is_empty());
         assert!(timeline_blocks(&json!({"error": "unknown job"})).is_empty());
         assert!(timeline_blocks(&json!([{"kind": "future_kind", "x": 1}])).is_empty());
+    }
+
+    #[test]
+    fn operator_steps_map_to_user_blocks_and_a_steer_gets_a_dim_tag() {
+        let blocks = timeline_blocks(&json!([
+            {"kind": "operator", "text": "also check the tests"},
+            {"kind": "operator", "text": "stop and rerun", "steer": true},
+        ]));
+        assert_eq!(blocks.len(), 3, "{blocks:?}");
+        assert!(matches!(&blocks[0], Block::User { text } if text == "also check the tests"));
+        assert!(matches!(&blocks[1], Block::User { text } if text == "stop and rerun"));
+        assert!(matches!(&blocks[2], Block::Marker { text } if text == "steered mid-task"));
+    }
+
+    #[test]
+    fn timeline_contains_user_text_matches_exact_bubbles_only() {
+        let blocks = timeline_blocks(&json!([{"kind": "operator", "text": "go faster"}]));
+        assert!(timeline_contains_user_text(&blocks, "go faster"));
+        assert!(!timeline_contains_user_text(&blocks, "go faster please"));
+        assert!(!timeline_contains_user_text(&[], "go faster"));
     }
 
     #[test]

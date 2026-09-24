@@ -18,7 +18,7 @@ use crate::render::transcript::RenderCache;
 use crate::skills::{self, expand_skill_prompt, SkillEntry};
 use crate::state::{state_path, PersistedState};
 use crate::status::{self, ContextInfo, Line1Input, Line2Input};
-use crate::timeline::timeline_blocks;
+use crate::timeline::{timeline_blocks, timeline_contains_user_text};
 use crate::transcript::{BannerKind, SourceEntry, SourceKind, Transcript, VerifyClaim, VerifyStatus};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Flex, Layout, Margin, Rect};
@@ -333,21 +333,59 @@ impl App {
     }
 
     /// While the Agents screen is open: drain its own (24h-window) jobs
-    /// poll, and — while a job detail is open — drain its `jobs --show`
-    /// fetch and, if the job is still running/starting, kick off a refresh
-    /// every 2s (never while one is already in flight).
+    /// poll; drain a `jobs --start` in flight from the new-task composer;
+    /// and — while a job detail is open — drain its `jobs --show` fetch and
+    /// `jobs --send` in flight, and kick off a refresh every 2s while the
+    /// job is still running/starting (never while one is already in flight).
     fn tick_agents_screen(&mut self) {
+        if self.agents_screen.is_none() {
+            return;
+        }
+        let kernel = self.kernel_binary.clone();
+        let home = self.options.lazar_home.clone();
+
+        if let Some(screen) = self.agents_screen.as_mut() {
+            if let Some(jobs) = screen.jobs_handle.try_recv_latest() {
+                screen.jobs = jobs;
+                let total = jobs::selectable_jobs(&screen.jobs).len();
+                screen.selected = if total == 0 { 0 } else { screen.selected.min(total - 1) };
+            }
+        }
+
+        let start_err = if let Some(screen) = self.agents_screen.as_mut() {
+            match screen.starting.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                Some(Ok(job)) => {
+                    screen.starting = None;
+                    let id = job.job_id.clone();
+                    match screen.jobs.iter_mut().find(|j| j.job_id == id) {
+                        Some(existing) => *existing = job,
+                        None => screen.jobs.insert(0, job),
+                    }
+                    if let Some(idx) = jobs::selectable_jobs(&screen.jobs).iter().position(|j| j.job_id == id) {
+                        screen.selected = idx;
+                    }
+                    None
+                }
+                Some(Err(err)) => {
+                    screen.starting = None;
+                    Some(err)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        if let Some(err) = start_err {
+            self.notice = err;
+        }
+
         let Some(screen) = self.agents_screen.as_mut() else {
             return;
         };
-        if let Some(jobs) = screen.jobs_handle.try_recv_latest() {
-            screen.jobs = jobs;
-            let total = jobs::selectable_jobs(&screen.jobs).len();
-            screen.selected = if total == 0 { 0 } else { screen.selected.min(total - 1) };
-        }
         let Some(detail) = screen.detail.as_mut() else {
             return;
         };
+
         if let Ok(result) = detail.fetch.try_recv() {
             detail.loading = false;
             match result {
@@ -362,19 +400,48 @@ impl App {
                         if let Some(task) = job.get("task").and_then(Value::as_str) {
                             detail.task = task.to_string();
                         }
+                        if let Some(session) = job.get("session") {
+                            detail.can_continue = !session.is_null();
+                        }
                     }
                     detail.blocks = timeline_blocks(value.get("timeline").unwrap_or(&Value::Null));
+                    if let Some(pending) = detail.pending_send.clone() {
+                        if timeline_contains_user_text(&detail.blocks, &pending) {
+                            detail.pending_send = None;
+                        }
+                    }
                     detail.error = None;
                 }
                 Err(err) => detail.error = Some(err),
             }
         }
+
+        if let Some(result) = detail.sending.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            detail.sending = None;
+            match result {
+                Ok(_outcome) => {
+                    // Don't wait for the next scheduled refresh — go fetch
+                    // now so the optimistic bubble resolves quickly.
+                    detail.loading = true;
+                    detail.last_poll = Instant::now();
+                    detail.fetch = jobs::fetch_job_show(kernel.clone(), home.clone(), detail.job_id.clone());
+                }
+                Err(err) => {
+                    detail.pending_send = None;
+                    self.notice = err;
+                    return;
+                }
+            }
+        }
+
+        let Some(detail) = self.agents_screen.as_mut().and_then(|s| s.detail.as_mut()) else {
+            return;
+        };
         let running = matches!(detail.status.as_str(), "running" | "starting");
-        if running && !detail.loading && detail.last_poll.elapsed() >= Duration::from_secs(2) {
+        if running && !detail.loading && detail.sending.is_none() && detail.last_poll.elapsed() >= Duration::from_secs(2) {
             detail.loading = true;
             detail.last_poll = Instant::now();
-            detail.fetch =
-                jobs::fetch_job_show(self.kernel_binary.clone(), self.options.lazar_home.clone(), detail.job_id.clone());
+            detail.fetch = jobs::fetch_job_show(kernel, home, detail.job_id.clone());
         }
     }
 
@@ -766,34 +833,47 @@ impl App {
     }
 
     /// Key handling for the full-screen Agents view and its job-detail
-    /// sub-screen (see `agents_state::AgentsScreenState`).
+    /// sub-screen (see `agents_state::AgentsScreenState`). Each screen has
+    /// its own composer (new-task at the list, steer/reply in detail):
+    /// while it has text, Enter submits and plain Up/Down edit it instead
+    /// of navigating; Esc clears it before backing out a screen.
     fn agents_key(&mut self, key: KeyEvent) -> bool {
+        if matches!(action_for(&key, self.turn_running), Action::Quit) {
+            return true;
+        }
         let in_detail = matches!(&self.agents_screen, Some(s) if s.detail.is_some());
+        let composer_empty = self.agents_composer_is_empty(in_detail);
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if in_detail && matches!(key.code, KeyCode::Char('t')) {
+                self.toggle_detail_tools();
+            }
+            return false;
+        }
         match key.code {
-            KeyCode::Esc if in_detail => {
-                if let Some(screen) = self.agents_screen.as_mut() {
-                    screen.detail = None;
+            KeyCode::Esc => {
+                if !composer_empty {
+                    self.agents_clear_composer(in_detail);
+                } else if in_detail {
+                    if let Some(screen) = self.agents_screen.as_mut() {
+                        screen.detail = None;
+                    }
+                } else {
+                    self.agents_screen = None;
                 }
             }
-            KeyCode::Esc | KeyCode::Right if !in_detail => {
+            KeyCode::Right if !in_detail && composer_empty => {
                 self.agents_screen = None;
             }
-            KeyCode::Up if in_detail => self.detail_scroll(|s| s.saturating_sub(1)),
-            KeyCode::Down if in_detail => self.detail_scroll(|s| s.saturating_add(1)),
-            KeyCode::PageUp if in_detail => self.detail_scroll(|s| s.saturating_sub(10)),
-            KeyCode::PageDown if in_detail => self.detail_scroll(|s| s.saturating_add(10)),
-            KeyCode::Enter if in_detail => self.toggle_detail_tools(),
-            KeyCode::Char('t')
-                if in_detail && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                self.toggle_detail_tools()
-            }
-            KeyCode::Up if !in_detail => {
+            KeyCode::Up if composer_empty && in_detail => self.detail_scroll(|s| s.saturating_add(1)),
+            KeyCode::Down if composer_empty && in_detail => self.detail_scroll(|s| s.saturating_sub(1)),
+            KeyCode::PageUp if composer_empty && in_detail => self.detail_scroll(|s| s.saturating_add(12)),
+            KeyCode::PageDown if composer_empty && in_detail => self.detail_scroll(|s| s.saturating_sub(12)),
+            KeyCode::Up if composer_empty && !in_detail => {
                 if let Some(screen) = self.agents_screen.as_mut() {
                     screen.selected = screen.selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down if !in_detail => {
+            KeyCode::Down if composer_empty && !in_detail => {
                 if let Some(screen) = self.agents_screen.as_mut() {
                     let total = jobs::selectable_jobs(&screen.jobs).len();
                     if total > 0 {
@@ -801,24 +881,131 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter if !in_detail => {
-                let job_id = self.agents_screen.as_ref().and_then(|screen| {
-                    jobs::selectable_jobs(&screen.jobs)
-                        .get(screen.selected)
-                        .map(|job| job.job_id.clone())
-                });
-                if let Some(job_id) = job_id {
-                    self.open_job_detail(job_id);
+            KeyCode::Enter => {
+                if !composer_empty {
+                    self.agents_submit(in_detail);
+                } else if in_detail {
+                    self.toggle_detail_tools();
+                } else {
+                    self.agents_open_selected();
                 }
             }
-            _ => {}
+            _ => self.agents_composer_key(in_detail, key),
         }
         false
     }
 
-    fn detail_scroll(&mut self, f: impl FnOnce(u16) -> u16) {
+    fn agents_composer_is_empty(&self, in_detail: bool) -> bool {
+        if in_detail {
+            self.agents_screen
+                .as_ref()
+                .and_then(|s| s.detail.as_ref())
+                .map(|d| d.composer.is_empty())
+                .unwrap_or(true)
+        } else {
+            self.agents_screen
+                .as_ref()
+                .map(|s| s.composer.is_empty())
+                .unwrap_or(true)
+        }
+    }
+
+    fn agents_composer_mut(&mut self, in_detail: bool) -> Option<&mut Composer> {
+        if in_detail {
+            self.agents_screen.as_mut().and_then(|s| s.detail.as_mut()).map(|d| &mut d.composer)
+        } else {
+            self.agents_screen.as_mut().map(|s| &mut s.composer)
+        }
+    }
+
+    fn agents_clear_composer(&mut self, in_detail: bool) {
+        if let Some(composer) = self.agents_composer_mut(in_detail) {
+            composer.clear();
+        }
+    }
+
+    /// Ordinary text-editing keys for whichever composer (list new-task, or
+    /// detail steer/reply) is active — the same handling as the main
+    /// chat's `composer_key`, minus slash/@/newline, which neither box uses.
+    fn agents_composer_key(&mut self, in_detail: bool, key: KeyEvent) {
+        let Some(composer) = self.agents_composer_mut(in_detail) else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char(c) => composer.insert_char(c),
+            KeyCode::Backspace => composer.backspace(),
+            KeyCode::Delete => composer.delete(),
+            KeyCode::Left => composer.left(),
+            KeyCode::Right => composer.right(),
+            KeyCode::Up => composer.up(),
+            KeyCode::Down => composer.down(),
+            KeyCode::Home => composer.home(),
+            KeyCode::End => composer.end(),
+            _ => {}
+        }
+    }
+
+    fn agents_submit(&mut self, in_detail: bool) {
+        if in_detail {
+            self.submit_job_message();
+        } else {
+            self.submit_new_task();
+        }
+    }
+
+    fn agents_open_selected(&mut self) {
+        let job_id = self.agents_screen.as_ref().and_then(|screen| {
+            jobs::selectable_jobs(&screen.jobs)
+                .get(screen.selected)
+                .map(|job| job.job_id.clone())
+        });
+        if let Some(job_id) = job_id {
+            self.open_job_detail(job_id);
+        }
+    }
+
+    /// Enter with text in the Agents list's new-task composer: `jobs
+    /// --start` off the UI thread. `tick_agents_screen` picks up the result
+    /// and either merges it into the next poll or inserts a provisional row.
+    fn submit_new_task(&mut self) {
+        let kernel = self.kernel_binary.clone();
+        let home = self.options.lazar_home.clone();
+        let Some(screen) = self.agents_screen.as_mut() else {
+            return;
+        };
+        let text = screen.composer.take();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        screen.starting = Some(jobs::start_job(kernel, home, text));
+    }
+
+    /// Enter with text in a job detail's steer/reply composer: `jobs --send`
+    /// off the UI thread, with an optimistic bubble until the next
+    /// `jobs --show` timeline contains it.
+    fn submit_job_message(&mut self) {
+        let kernel = self.kernel_binary.clone();
+        let home = self.options.lazar_home.clone();
+        let Some(detail) = self.agents_screen.as_mut().and_then(|s| s.detail.as_mut()) else {
+            return;
+        };
+        if !detail.can_continue || detail.sending.is_some() {
+            return;
+        }
+        let text = detail.composer.take();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        detail.pending_send = Some(text.clone());
+        detail.scroll_from_bottom = 0;
+        detail.sending = Some(jobs::send_job(kernel, home, detail.job_id.clone(), text));
+    }
+
+    fn detail_scroll(&mut self, f: impl FnOnce(usize) -> usize) {
         if let Some(detail) = self.agents_screen.as_mut().and_then(|s| s.detail.as_mut()) {
-            detail.scroll = f(detail.scroll);
+            detail.scroll_from_bottom = f(detail.scroll_from_bottom);
         }
     }
 
@@ -846,6 +1033,8 @@ impl App {
             jobs: self.jobs.clone(),
             selected: 0,
             detail: None,
+            composer: Composer::new(Vec::new()),
+            starting: None,
         });
     }
 
@@ -853,6 +1042,8 @@ impl App {
     /// thread and opens the job-detail sub-screen. A no-op if the job isn't
     /// known to the (already open) Agents screen.
     fn open_job_detail(&mut self, job_id: String) {
+        let kernel = self.kernel_binary.clone();
+        let home = self.options.lazar_home.clone();
         let Some(screen) = self.agents_screen.as_mut() else {
             return;
         };
@@ -863,11 +1054,7 @@ impl App {
         else {
             return;
         };
-        let fetch = jobs::fetch_job_show(
-            self.kernel_binary.clone(),
-            self.options.lazar_home.clone(),
-            job_id.clone(),
-        );
+        let fetch = jobs::fetch_job_show(kernel, home, job_id.clone());
         screen.detail = Some(JobDetailState {
             job_id,
             task: job.task,
@@ -878,8 +1065,13 @@ impl App {
             loading: true,
             error: None,
             tools_unfolded: false,
-            scroll: 0,
+            scroll_from_bottom: 0,
+            previous_visual_lines: 0,
             last_poll: Instant::now(),
+            composer: Composer::new(Vec::new()),
+            can_continue: job.session.is_some(),
+            pending_send: None,
+            sending: None,
         });
     }
 
@@ -2036,24 +2228,28 @@ impl App {
     /// selected — its detail sub-screen. Replaces the whole chat layout
     /// while open (see `draw`).
     fn draw_agents_screen(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(screen) = &self.agents_screen else {
+        let spinner = self.spinner_glyph();
+        let cwd = compact_path(&self.options.cwd);
+        let model = self.model.clone();
+        let theme = self.theme.clone();
+        let highlighter = &self.highlighter;
+        let Some(screen) = self.agents_screen.as_mut() else {
             return;
         };
-        if let Some(detail) = &screen.detail {
-            render_job_detail(frame, area, &self.theme, &self.highlighter, detail, self.spinner_glyph());
+        if let Some(detail) = screen.detail.as_mut() {
+            render_job_detail(frame, area, &theme, highlighter, detail, spinner);
         } else {
-            let cwd = compact_path(&self.options.cwd);
-            let spinner = self.spinner_glyph();
             render_agents_list(
                 frame,
                 area,
-                &self.theme,
+                &theme,
                 &AgentsListInfo {
-                    model: self.model.as_deref().unwrap_or("kernel default"),
+                    model: model.as_deref().unwrap_or("kernel default"),
                     cwd: &cwd,
                     jobs: &screen.jobs,
                     selected: screen.selected,
                     spinner,
+                    composer: &screen.composer,
                 },
             );
         }
@@ -2244,7 +2440,9 @@ fn composer_ghost(text: &str) -> Option<&'static str> {
     }
 }
 
-fn preserve_parked_scroll(
+/// `pub(crate)`: also used by `render::agents::render_job_detail`, whose
+/// job-detail chat view auto-scrolls the same way the main transcript does.
+pub(crate) fn preserve_parked_scroll(
     scroll_from_bottom: &mut usize,
     previous_visual_lines: &mut usize,
     current_visual_lines: usize,
@@ -2377,6 +2575,79 @@ mod tests {
         // Esc from the list: back to chat.
         assert!(!app.key(plain_key(KeyCode::Esc)));
         assert!(app.agents_screen.is_none());
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_task_submit_starts_the_job_and_clears_the_composer() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-agents-new-task-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = new_test_app(&root);
+
+        app.open_agents_screen();
+        // Enter with an empty composer opens the (nonexistent) selected
+        // row instead of starting anything.
+        assert!(!app.key(plain_key(KeyCode::Enter)));
+        assert!(app.agents_screen.as_ref().unwrap().starting.is_none());
+
+        for c in "fix the flaky test".chars() {
+            assert!(!app.key(char_key(c)));
+        }
+        assert_eq!(app.agents_screen.as_ref().unwrap().composer.text(), "fix the flaky test");
+        assert!(!app.key(plain_key(KeyCode::Enter)));
+
+        let screen = app.agents_screen.as_ref().unwrap();
+        assert!(screen.composer.is_empty(), "the composer clears on submit");
+        assert!(screen.starting.is_some(), "jobs --start is in flight");
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_session_less_job_opens_with_its_composer_disabled() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-agents-no-session-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = new_test_app(&root);
+
+        app.open_agents_screen();
+        {
+            let screen = app.agents_screen.as_mut().unwrap();
+            screen.jobs = vec![
+                Job { job_id: "old".into(), task: "a".into(), status: "ok".into(), session: None, ..Job::default() },
+                Job {
+                    job_id: "live".into(),
+                    task: "b".into(),
+                    status: "ok".into(),
+                    session: Some("sess-1".into()),
+                    ..Job::default()
+                },
+            ];
+        }
+
+        app.open_job_detail("old".into());
+        assert!(
+            !app.agents_screen.as_ref().unwrap().detail.as_ref().unwrap().can_continue,
+            "no session: composer stays disabled"
+        );
+
+        app.open_job_detail("live".into());
+        assert!(
+            app.agents_screen.as_ref().unwrap().detail.as_ref().unwrap().can_continue,
+            "a session id: composer is enabled"
+        );
 
         drop(app);
         fs::remove_dir_all(root).unwrap();

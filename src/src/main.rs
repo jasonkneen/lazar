@@ -360,6 +360,15 @@ enum Command {
         /// Include jobs finished within this many seconds (default 600).
         #[arg(long, value_name = "SECS")]
         since: Option<u64>,
+        /// Start TASK as a detached agent job with its own session.
+        #[arg(long, value_name = "TASK")]
+        start: Option<String>,
+        /// Steer a running job, or continue a finished one: --send JOB_ID TEXT.
+        #[arg(long, num_args = 2, value_names = ["JOB_ID", "TEXT"])]
+        send: Option<Vec<String>>,
+        /// Internal: the detached runner for a job.
+        #[arg(long, value_name = "JOB_ID", hide = true)]
+        run: Option<String>,
     },
     /// List installed skills ($LAZAR_HOME/user/skills) for pickers.
     Skills {
@@ -2259,6 +2268,15 @@ pub(crate) fn run_agent(
             return Err(abort_invoke(format, &session_guard, "aborted", msg));
         }
 
+        // Operator steering queued for this job since the last request.
+        for text in drain_inbox() {
+            let note = format!("[operator message, sent while you were working]\n{text}");
+            append_stream(json!({"kind": "steer", "content": &note}));
+            if format == OutputFormat::StreamJson {
+                emit_event(json!({"type": "steer", "text": text}));
+            }
+            push_user_text(&mut messages, &note);
+        }
         let mut body = request_body(&model, limits.max_tokens, &system, &tool, &messages);
         let body_len = body.to_string().len();
         if body_len > window.compact_at {
@@ -2642,6 +2660,45 @@ fn emit_phase(format: OutputFormat, phase: &str) {
     }
 }
 
+/// Messages queued in `LAZAR_INBOX` (one JSON `{"text"}` or plain line
+/// each), taken atomically so a concurrent `jobs --send` is never half-read.
+fn drain_inbox() -> Vec<String> {
+    let Some(path) = env::var_os("LAZAR_INBOX").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    let taken = path.with_extension(format!("inbox.{}.taking", std::process::id()));
+    if fs::rename(&path, &taken).is_err() {
+        return Vec::new();
+    }
+    let text = fs::read_to_string(&taken).unwrap_or_default();
+    let _ = fs::remove_file(&taken);
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| v["text"].as_str().map(str::to_string))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect()
+}
+
+/// Add operator text to the conversation without breaking alternation: it
+/// joins a trailing user message (a prompt or tool results) or starts one.
+fn push_user_text(messages: &mut Vec<Value>, text: &str) {
+    match messages.last_mut() {
+        Some(last) if last["role"] == "user" => {
+            if let Some(existing) = last["content"].as_str().map(str::to_string) {
+                last["content"] = json!([{"type": "text", "text": existing}]);
+            }
+            if let Some(blocks) = last["content"].as_array_mut() {
+                blocks.push(json!({"type": "text", "text": text}));
+            }
+        }
+        _ => messages.push(json!({"role": "user", "content": text})),
+    }
+}
+
 /// Verification is on unless the operator turns it off (`LAZAR_VERIFY=0`).
 fn verify_enabled() -> bool {
     !matches!(
@@ -2742,9 +2799,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Acp(acp_args)) => return acp::run(acp_args),
         Some(Command::Providers { json }) => return print_providers(json),
         Some(Command::Verify { lint }) => return run_verify(lint),
-        Some(Command::Jobs { show, since }) => {
+        Some(Command::Jobs { show, since, start, send, run }) => {
             let recent = since.map_or(jobs::RECENT_MS, |secs| u128::from(secs) * 1000);
             let dir = user_dir("workspace").join("subagent").join("jobs");
+            let exe = env::current_exe()?;
+            // Starting and steering jobs is the operator's: a model inside a
+            // tool call delegates through lazar-spawn, with its claims.
+            if (start.is_some() || send.is_some()) && env_flag_enabled("LAZAR_TOOL_ENV") {
+                return Err("`lazar jobs --start/--send` is operator-only; delegate with bin/lazar-spawn".into());
+            }
+            if let Some(task) = start {
+                println!("{}", jobs::start(&dir, &task, &exe, now_millis())?);
+                return Ok(());
+            }
+            if let Some(args) = send {
+                println!("{}", jobs::send(&dir, &args[0], &args[1], &exe, now_millis())?);
+                return Ok(());
+            }
+            if let Some(id) = run {
+                jobs::run(&dir, &id, &exe)?;
+                return Ok(());
+            }
             match show {
                 Some(id) => match jobs::detail(&dir, &id, now_millis()) {
                     Some(detail) => println!("{detail}"),
@@ -3395,6 +3470,28 @@ mod tests {
         run_agent("hi", OutputFormat::Json, false, None, AgentLifecycle::default()).unwrap();
         assert!(!raw.requests()[0]["system"].as_str().unwrap().contains("ANSWER FORMAT"));
         assert_eq!(test_env.log_events().iter().filter(|e| e["kind"] == "answer").count(), 1);
+    }
+
+    #[test]
+    fn operator_steering_in_the_inbox_reaches_the_next_request() {
+        let api = FakeApi::serve(vec![
+            sse_tool_use("true"),
+            sse_end_turn("steered"),
+        ]);
+        let test_env = AgentTestEnv::new("steer", &api);
+        let _inbox_env = crate::test_support::EnvSnapshot::capture(&["LAZAR_INBOX"]);
+        let inbox = test_env.home.join("job.inbox");
+        fs::write(&inbox, format!("{}\n", json!({"text": "use the footer, not the header"}))).unwrap();
+        env::set_var("LAZAR_INBOX", &inbox);
+        run_agent("do the thing", OutputFormat::Json, false, None, AgentLifecycle::default())
+            .expect("steered turn");
+        let requests = api.requests();
+        let first = requests[0]["messages"][0]["content"].to_string();
+        assert!(first.contains("do the thing") && first.contains("use the footer, not the header"), "{first}");
+        assert!(!inbox.exists(), "the inbox is drained");
+        assert!(test_env.log_events().iter().any(|e| e["kind"] == "steer"));
+        // Nothing new queued: the second request carries no extra note.
+        assert_eq!(requests[1]["messages"].to_string().matches("operator message").count(), 1);
     }
 
     #[test]

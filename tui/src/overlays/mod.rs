@@ -146,11 +146,11 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         ),
         (
             "Agents screen",
-            "↑↓ select · Enter open job · Esc / → back to chat",
+            "↑↓ select (empty composer) · type to describe a new task, Enter starts it · Esc / → back to chat",
         ),
         (
             "Job detail",
-            "↑↓ PgUp/PgDn scroll · Enter / Ctrl+T unfold tools · Esc back to list",
+            "a small chat: ↑↓/PgUp/PgDn scroll (empty composer) · type to steer/reply, Enter sends · Ctrl+T unfold tools · Esc back to list",
         ),
         ("Ctrl+C", "cancel the running turn, or quit when idle"),
         ("Ctrl+Q", "quit"),
