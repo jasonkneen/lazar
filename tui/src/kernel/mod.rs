@@ -392,7 +392,12 @@ fn worker(
                             let _ = events.send(KernelEvent::Error(err));
                         }
                     } else {
-                        state.queued_prompt = Some(text);
+                        // Several messages typed before the kernel is ready
+                        // all go, joined — none overwrites another.
+                        state.queued_prompt = Some(match state.queued_prompt.take() {
+                            Some(earlier) => format!("{earlier}\n\n{text}"),
+                            None => text,
+                        });
                     }
                 }
                 KernelCommand::DropQueued => {

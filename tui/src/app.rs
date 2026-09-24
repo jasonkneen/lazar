@@ -6,7 +6,7 @@ use crate::kernel::{KernelConfig, KernelEvent, KernelHandle, SessionRow};
 use crate::keys::{action_for, Action};
 use crate::overlays::picker::{PickItem, Picker, PickerOutcome};
 use crate::overlays::{help_lines, render_text_panel, Overlay, PickerKind};
-use crate::providers::{kernel_binary, load_catalog, ProviderInfo};
+use crate::providers::{kernel_binary, live_models, load_catalog, ProviderInfo};
 use crate::render::agents::{render_agents_list, render_job_detail, AgentsListInfo};
 use crate::render::chrome::{
     render_activity, render_header, render_status, HeaderInfo, StatusInfo, SPINNER, SPINNER_ASCII,
@@ -346,7 +346,18 @@ impl App {
 
         if let Some(screen) = self.agents_screen.as_mut() {
             if let Some(jobs) = screen.jobs_handle.try_recv_latest() {
-                screen.jobs = jobs;
+                let hidden = &self.persisted.hidden_agents;
+                let job_sessions: Vec<String> = jobs.iter().filter_map(|j| j.session.clone()).collect();
+                let sessions = crate::sessions::scan(
+                    &self.options.lazar_home,
+                    self.session_id.as_deref(),
+                    &job_sessions,
+                    hidden,
+                );
+                screen.jobs = sessions
+                    .into_iter()
+                    .chain(jobs.into_iter().filter(|j| !hidden.contains(&j.job_id)))
+                    .collect();
                 let total = jobs::selectable_jobs(&screen.jobs).len();
                 screen.selected = if total == 0 { 0 } else { screen.selected.min(total - 1) };
             }
@@ -564,7 +575,7 @@ impl App {
         }
         if key.code == KeyCode::Left
             && key.modifiers.is_empty()
-            && should_open_agents_screen(self.composer.is_empty(), self.composer.cursor_col())
+            && should_open_agents_screen(self.composer.is_empty(), self.composer.at_start())
         {
             self.open_agents_screen();
             return false;
@@ -881,6 +892,7 @@ impl App {
                     }
                 }
             }
+            KeyCode::Backspace | KeyCode::Delete if composer_empty && !in_detail => self.hide_selected_agent(),
             KeyCode::Enter => {
                 if !composer_empty {
                     self.agents_submit(in_detail);
@@ -959,9 +971,40 @@ impl App {
                 .get(screen.selected)
                 .map(|job| job.job_id.clone())
         });
-        if let Some(job_id) = job_id {
-            self.open_job_detail(job_id);
+        let Some(job_id) = job_id else { return };
+        // This window's own session: go back to it.
+        if self.is_main_row(&job_id) {
+            self.agents_screen = None;
+            return;
         }
+        self.open_job_detail(job_id);
+    }
+
+    fn is_main_row(&self, job_id: &str) -> bool {
+        crate::sessions::session_id_of(job_id).is_some() && crate::sessions::session_id_of(job_id) == self.session_id.as_deref()
+    }
+
+    /// Backspace/Delete on an Agents row: drop it from the list for good.
+    /// Its job record / session log stays on disk.
+    fn hide_selected_agent(&mut self) {
+        let Some(screen) = self.agents_screen.as_ref() else { return };
+        let Some(job_id) = jobs::selectable_jobs(&screen.jobs).get(screen.selected).map(|j| j.job_id.clone()) else {
+            return;
+        };
+        if self.is_main_row(&job_id) {
+            self.notice = "this is the current session; it can't be hidden".into();
+            return;
+        }
+        if !self.persisted.hidden_agents.contains(&job_id) {
+            self.persisted.hidden_agents.push(job_id.clone());
+            self.persist();
+        }
+        if let Some(screen) = self.agents_screen.as_mut() {
+            screen.jobs.retain(|j| j.job_id != job_id);
+            let total = jobs::selectable_jobs(&screen.jobs).len();
+            screen.selected = if total == 0 { 0 } else { screen.selected.min(total - 1) };
+        }
+        self.notice = "removed from the list (still on disk)".into();
     }
 
     /// Enter with text in the Agents list's new-task composer: `jobs
@@ -1124,11 +1167,25 @@ impl App {
             return;
         }
         self.composer.take();
-        if self.turn_running || !self.ready {
-            if steer && self.turn_running {
-                let _ = self.kernel.cancel();
-                self.status = "steering after cancel".into();
+        if self.turn_running {
+            // Steer the running turn: the kernel reads the session inbox
+            // before its next model request. Never cancel, never overwrite.
+            let _ = steer;
+            match self.steer_running_turn(&text) {
+                Ok(()) => {
+                    self.transcript.push_user(text);
+                    self.transcript.push_marker("steered mid-turn");
+                    self.scroll_from_bottom = 0;
+                    self.notice = "sent to the running turn".into();
+                }
+                Err(err) => {
+                    self.composer.set_text(&text);
+                    self.error(err);
+                }
             }
+            return;
+        }
+        if !self.ready {
             self.queued = Some(text.clone());
             self.notice = "message queued".into();
             if let Err(err) = self.kernel.prompt(text) {
@@ -1138,6 +1195,23 @@ impl App {
             return;
         }
         self.send_prompt(text);
+    }
+
+    fn steer_running_turn(&self, text: &str) -> Result<(), String> {
+        use std::io::Write;
+        let id = self.session_id.as_deref().ok_or("no session to steer")?;
+        let path = self
+            .options
+            .lazar_home
+            .join("user/logs/sessions")
+            .join(format!("{id}.inbox"));
+        let line = serde_json::json!({ "text": text }).to_string();
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| writeln!(file, "{line}"))
+            .map_err(|e| format!("cannot steer {}: {e}", path.display()))
     }
 
     fn send_prompt(&mut self, text: String) {
@@ -1527,6 +1601,18 @@ impl App {
             .and_then(|id| self.providers.iter().find(|p| p.id == id))
             .map(|p| p.models.clone())
             .unwrap_or_default();
+        match live_models(&self.kernel_binary, &self.options.lazar_home, self.provider.as_deref()) {
+            Ok(live) => {
+                for model in live {
+                    if !models.contains(&model) {
+                        models.push(model);
+                    }
+                }
+            }
+            Err(error) => {
+                self.notice = format!("live model list unavailable: {}", error.lines().last().unwrap_or(""));
+            }
+        }
         if let Some(model) = self.model.clone() {
             if !models.contains(&model) {
                 models.insert(0, model);
@@ -1890,9 +1976,66 @@ impl App {
                         .unwrap_or(0),
                 );
                 self.transcript.finish_assistant();
+                if let Some(text) = self.served_model_divider(&event) {
+                    self.transcript.push_marker(text);
+                }
+            }
+            "api_retry" => {
+                // A transient provider failure the kernel is retrying: say so,
+                // or the turn just looks frozen.
+                let attempt = event.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+                let of = event.get("of").and_then(Value::as_u64).unwrap_or(0);
+                let secs = event.get("delay_ms").and_then(Value::as_u64).unwrap_or(0) as f64 / 1000.0;
+                let error = event.get("error").and_then(Value::as_str).unwrap_or("");
+                let reason: String = error.chars().take(60).collect();
+                self.transcript
+                    .push_marker(format!("provider error, retry {attempt}/{of} in {secs:.0}s · {reason}"));
+            }
+            "fallback" => {
+                let agent = event.get("agent").and_then(Value::as_str).unwrap_or("?");
+                self.transcript.push_marker(format!("provider down · handing this turn to {agent}"));
+            }
+            "fallback_failed" => {
+                let agent = event.get("agent").and_then(Value::as_str).unwrap_or("?");
+                let error = event.get("error").and_then(Value::as_str).unwrap_or("");
+                let reason: String = error.chars().take(80).collect();
+                self.transcript.push_marker(format!("fallback {agent} failed · {reason}"));
+            }
+            "guard" => {
+                let text = event.get("text").and_then(Value::as_str).unwrap_or("");
+                let label = if text.contains("exact tool call") {
+                    "kernel: repeated command — told the model to stop and report"
+                } else {
+                    "kernel: asked the model for a status update"
+                };
+                self.transcript.push_marker(label.to_string());
             }
             _ => {}
         }
+    }
+
+    /// `<served model>  cache N%` when the provider opts in
+    /// (`show_served_model` in providers.toml).
+    fn served_model_divider(&self, event: &Value) -> Option<String> {
+        let provider = self.provider.as_deref()?;
+        let info = self.providers.iter().find(|p| p.id == provider)?;
+        if !info.show_served_model {
+            return None;
+        }
+        let served = self
+            .context
+            .as_ref()
+            .map(|c| c.served_model.clone())
+            .filter(|m| !m.is_empty())
+            .or_else(|| self.model.clone())?;
+        let input = event.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let cached = event.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+        let total = input.saturating_add(cached);
+        Some(if total == 0 {
+            served
+        } else {
+            format!("{served}  cache {}%", cached * 100 / total)
+        })
     }
 
     fn open_session_picker(&mut self, rows: Vec<SessionRow>) {
@@ -2103,6 +2246,7 @@ impl App {
             transcript_area.width,
             &self.theme,
             &self.highlighter,
+            self.spinner_frame,
         );
         let still_needs_scrollbar = lines.len() > viewport;
         if still_needs_scrollbar != narrow {
@@ -2120,6 +2264,7 @@ impl App {
                 transcript_area.width,
                 &self.theme,
                 &self.highlighter,
+                self.spinner_frame,
             );
         }
         self.needs_scrollbar = transcript_area.width < full_width;
@@ -2320,8 +2465,8 @@ impl App {
 /// The Left key opens the Agents screen only when the composer has nothing
 /// typed, or the cursor sits at column 0 of whatever line it's on —
 /// otherwise Left just moves the cursor, as usual.
-fn should_open_agents_screen(composer_empty: bool, cursor_col: usize) -> bool {
-    composer_empty || cursor_col == 0
+fn should_open_agents_screen(composer_empty: bool, at_start: bool) -> bool {
+    composer_empty || at_start
 }
 
 fn prompt_limit_notice(text: &str) -> Option<String> {
@@ -2508,9 +2653,9 @@ mod tests {
 
     #[test]
     fn left_key_opens_the_agents_screen_only_at_column_zero_or_an_empty_composer() {
-        assert!(should_open_agents_screen(true, 5), "empty composer: any column");
-        assert!(should_open_agents_screen(false, 0), "non-empty composer at column 0");
-        assert!(!should_open_agents_screen(false, 1), "mid-line: Left just moves the cursor");
+        assert!(should_open_agents_screen(true, false), "empty composer");
+        assert!(should_open_agents_screen(false, true), "cursor before the first character");
+        assert!(!should_open_agents_screen(false, false), "anywhere else Left just moves the cursor");
     }
 
     #[test]
@@ -2575,6 +2720,26 @@ mod tests {
         // Esc from the list: back to chat.
         assert!(!app.key(plain_key(KeyCode::Esc)));
         assert!(app.agents_screen.is_none());
+
+        // Sessions: Backspace hides a row (kept on disk), the main session
+        // can't be hidden, and Enter on it returns to the chat.
+        app.session_id = Some("mine".into());
+        app.open_agents_screen();
+        {
+            let screen = app.agents_screen.as_mut().unwrap();
+            screen.jobs = vec![
+                Job { job_id: "session:mine".into(), task: "main · x".into(), status: "running".into(), ..Job::default() },
+                Job { job_id: "session:other".into(), task: "y".into(), status: "running".into(), ..Job::default() },
+            ];
+            screen.selected = 1;
+        }
+        assert!(!app.key(plain_key(KeyCode::Backspace)));
+        assert!(app.persisted.hidden_agents.contains(&"session:other".to_string()));
+        assert_eq!(app.agents_screen.as_ref().unwrap().jobs.len(), 1);
+        assert!(!app.key(plain_key(KeyCode::Backspace)));
+        assert!(app.notice.contains("can't be hidden"));
+        assert!(!app.key(plain_key(KeyCode::Enter)));
+        assert!(app.agents_screen.is_none(), "Enter on main returns to the chat");
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -2694,7 +2859,23 @@ mod tests {
             key_available: false,
             default_model: "alternate-model".into(),
             models: vec!["alternate-model".into()],
+            show_served_model: true,
         }];
+        app.provider = Some("alternate".into());
+        app.handle_lazar_event(serde_json::json!({"type":"context","model":"auto","served_model":"gpt-6-sol-high","input_tokens":100,"output_tokens":5,"window":200000}));
+        app.handle_lazar_event(serde_json::json!({"type":"invoke_end","input_tokens":5,"cache_read_input_tokens":95}));
+        assert!(app.transcript.blocks.iter().any(|b| matches!(
+            b, crate::transcript::Block::Marker { text } if text == "gpt-6-sol-high  cache 95%"
+        )), "{:?}", app.transcript.blocks);
+        app.handle_lazar_event(serde_json::json!({"type":"api_retry","attempt":1,"of":3,"delay_ms":2000,"error":"API 502 Bad Gateway"}));
+        assert!(app.transcript.blocks.iter().any(|b| matches!(
+            b, crate::transcript::Block::Marker { text } if text.starts_with("provider error, retry 1/3 in 2s")
+        )));
+        app.handle_lazar_event(serde_json::json!({"type":"fallback","agent":"claude-code-acp","error":"API 503"}));
+        assert!(app.transcript.blocks.iter().any(|b| matches!(
+            b, crate::transcript::Block::Marker { text } if text == "provider down · handing this turn to claude-code-acp"
+        )));
+        app.provider = None;
         app.turn_running = true;
 
         app.switch_model("new-model".into());

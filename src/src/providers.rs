@@ -31,6 +31,10 @@ pub(crate) struct Provider {
     /// kernel default (`context::DEFAULT_CONTEXT_WINDOW_TOKENS`).
     #[serde(default)]
     pub context_window: Option<u64>,
+    /// Front ends draw a `─── <served model>  cache N% ───` divider after
+    /// each turn — useful for router aliases like `auto`.
+    #[serde(default)]
+    pub show_served_model: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -38,6 +42,18 @@ pub(crate) struct Provider {
 pub(crate) struct Catalog {
     #[serde(default)]
     pub providers: Vec<Provider>,
+    /// ACP agents to hand a turn to when the provider stays down.
+    #[serde(default)]
+    pub fallback: Option<Fallback>,
+}
+
+/// `[fallback] agents = [["claude-code-acp"], ["gemini", "--acp"]]` — tried
+/// in order; the first on PATH is used. `agents = []` turns fallback off.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Fallback {
+    #[serde(default)]
+    pub agents: Vec<Vec<String>>,
 }
 
 impl Catalog {
@@ -242,6 +258,7 @@ pub(crate) fn describe(catalog: &Catalog, keys: &dyn KeyStore) -> Vec<Value> {
                 "default_model": p.default_model,
                 "models": p.models,
                 "context_window": p.context_window,
+                "show_served_model": p.show_served_model,
             })
         })
         .collect()

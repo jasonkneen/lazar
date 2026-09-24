@@ -55,7 +55,7 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_TOOL_OUTPUT_MAX_BYTES: usize = core::context::MAX_TOOL_OUTPUT_BYTES;
-const DEFAULT_MAX_AGENT_TURNS: u32 = 50;
+const DEFAULT_MAX_AGENT_TURNS: u32 = 100;
 const DEFAULT_MAX_TOOL_CALLS: u32 = 200;
 const DEFAULT_MAX_TOKENS: u32 = core::context::MAX_OUTPUT_TOKENS;
 const TOOL_READ_CHUNK_BYTES: usize = 8192;
@@ -351,6 +351,13 @@ enum Command {
         /// Emit JSON (one object per provider) for front ends.
         #[arg(long)]
         json: bool,
+    },
+    /// Ask the provider for its live model list (`GET <base>/v1/models`) and
+    /// print the ids as a JSON array.
+    Models {
+        /// Catalog provider id; defaults to LAZAR_PROVIDER / the legacy env.
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// Running and recently finished sub-agent jobs (lazar-spawn) as JSON.
     Jobs {
@@ -1400,6 +1407,18 @@ async fn response_preview(
     Ok(preview)
 }
 
+/// Retries after a transient provider failure (connection error, timeout,
+/// 408/429/5xx) before any response body is streamed. `LAZAR_API_RETRIES`
+/// overrides the count; the delay doubles from `LAZAR_API_RETRY_DELAY_MS`.
+const DEFAULT_API_RETRIES: u32 = 3;
+const DEFAULT_API_RETRY_DELAY_MS: u64 = 2_000;
+
+/// Quota and billing failures do not clear by retrying.
+fn is_final_provider_error(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    ["usage limit", "quota", "insufficient", "billing", "credit"].iter().any(|needle| text.contains(needle))
+}
+
 async fn request_model(
     client: &reqwest::Client,
     api_url: &str,
@@ -1407,26 +1426,51 @@ async fn request_model(
     body: &Value,
     format: OutputFormat,
 ) -> Result<ParsedSse, Box<dyn std::error::Error>> {
-    let request = client
-        .post(api_url)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("content-type", "application/json")
-        .json(body)
-        .send();
-    let mut response = tokio::select! {
-        biased;
-        _ = wait_for_session_cancel() => return Err("cancelled".into()),
-        response = request => match response {
-            Ok(response) => response,
-            Err(error) => return Err(format!("API request failed: {error}").into()),
-        },
+    let retries = env::var("LAZAR_API_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(DEFAULT_API_RETRIES);
+    let mut delay_ms = env::var("LAZAR_API_RETRY_DELAY_MS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DEFAULT_API_RETRY_DELAY_MS);
+    let mut attempt = 0;
+    let response = loop {
+        let request = client
+            .post(api_url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("content-type", "application/json")
+            .json(body)
+            .send();
+        let failure = tokio::select! {
+            biased;
+            _ = wait_for_session_cancel() => return Err("cancelled".into()),
+            response = request => match response {
+                Ok(response) if response.status().is_success() => break response,
+                Ok(mut response) => {
+                    let status = response.status();
+                    let text = response_preview(&mut response).await?;
+                    let transient = (status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error())
+                        && !is_final_provider_error(&text);
+                    (format!("API {status}: {text}"), transient)
+                }
+                Err(error) => (format!("API request failed: {error}"), true),
+            },
+        };
+        let (message, transient) = failure;
+        if !transient || attempt >= retries {
+            return Err(message.into());
+        }
+        attempt += 1;
+        append_stream(json!({"kind": "api_retry", "attempt": attempt, "of": retries, "delay_ms": delay_ms, "error": &message}));
+        if format == OutputFormat::StreamJson {
+            emit_event(json!({"type": "api_retry", "attempt": attempt, "of": retries, "delay_ms": delay_ms, "error": &message}));
+        }
+        tokio::select! {
+            biased;
+            _ = wait_for_session_cancel() => return Err("cancelled".into()),
+            _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}
+        }
+        delay_ms = delay_ms.saturating_mul(2);
     };
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response_preview(&mut response).await?;
-        return Err(format!("API {status}: {text}").into());
-    }
     let max_output = body["max_tokens"].as_u64().unwrap_or(0).min(u32::MAX as u64) as u32;
     parse_sse_response(
         response,
@@ -1637,6 +1681,53 @@ fn print_providers(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         print!("{}", providers::render_table(&rows));
     }
+    Ok(())
+}
+
+/// Model ids from a `/v1/models` body: Anthropic and OpenAI both use
+/// `{"data":[{"id":..}]}`; a bare array of ids or objects is accepted too.
+fn parse_model_ids(body: &Value) -> Vec<String> {
+    let list = body.get("data").or(body.get("models")).unwrap_or(body);
+    list.as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().or_else(|| item.get("id").and_then(Value::as_str)))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_models(provider: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(id) = provider {
+        env::set_var("LAZAR_PROVIDER", id);
+    }
+    let config = resolve_provider(None)?;
+    let url = format!("{}/models", config.api_url.trim_end_matches("/messages"));
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let body: Value = runtime.block_on(async {
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()?
+            .get(&url)
+            .header("x-api-key", &config.api_key)
+            .header("authorization", format!("Bearer {}", config.api_key))
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("GET {url}: {status}: {}", text.chars().take(300).collect::<String>()).into());
+        }
+        Ok::<Value, Box<dyn std::error::Error>>(response.json().await?)
+    })?;
+    let ids = parse_model_ids(&body);
+    if ids.is_empty() {
+        return Err(format!("GET {url} returned no model ids").into());
+    }
+    println!("{}", serde_json::to_string(&ids)?);
     Ok(())
 }
 
@@ -2093,7 +2184,7 @@ pub(crate) fn run_agent(
     let mut messages: Vec<Value> = Vec::new();
     if let Some(ref id) = session_id {
         if depth == 0 {
-            let prior = match session::load_messages_checked(id, window.history) {
+            let prior = match session::load_messages_checked(id) {
                 Ok(prior) => prior,
                 Err(error) => return Err(abort_invoke(format, &session_guard, "context_limit", error)),
             };
@@ -2250,6 +2341,8 @@ pub(crate) fn run_agent(
         (!text.trim().is_empty()).then_some(text)
     };
 
+    let mut guard = core::guard::Guard::default();
+    let mut guard_note: Option<String> = None;
     loop {
         if acp::is_session_cancelled() {
             return Err(abort_invoke(
@@ -2268,6 +2361,15 @@ pub(crate) fn run_agent(
             return Err(abort_invoke(format, &session_guard, "aborted", msg));
         }
 
+        // Kernel safeguards raised by the previous response ride along
+        // with its tool results.
+        if let Some(note) = guard_note.take() {
+            append_stream(json!({"kind": "steer", "content": &note}));
+            if format == OutputFormat::StreamJson {
+                emit_event(json!({"type": "guard", "text": &note}));
+            }
+            push_user_text(&mut messages, &note);
+        }
         // Operator steering queued for this job since the last request.
         for text in drain_inbox() {
             let note = format!("[operator message, sent while you were working]\n{text}");
@@ -2325,6 +2427,22 @@ pub(crate) fn run_agent(
                     if verbose {
                         eprintln!("[lazar] {msg}");
                     }
+                    if depth == 0 && msg.starts_with("API ") {
+                        if let Some(outcome) = run_fallback(&messages, &msg, format) {
+                            let text = format!("[answered by {} — provider was down: {}]\n\n{}", outcome.agent, msg.chars().take(160).collect::<String>(), outcome.text);
+                            append_stream(json!({"kind": "assistant", "content": [{"type": "text", "text": text}]}));
+                            append_stream(json!({"kind": "invoke_end", "stop_reason": "end_turn", "fallback": &outcome.agent, "tool_calls": outcome.tool_calls}));
+                            session_write_failed(format, &session_guard)?;
+                            if format == OutputFormat::StreamJson {
+                                emit_event(json!({"type": "text_done"}));
+                                emit_event(json!({"type": "invoke_end", "stop_reason": "end_turn", "duration_ms": started.elapsed().as_millis()}));
+                            } else if format == OutputFormat::Json {
+                                println!("{}", json!({"type": "result", "stop_reason": "end_turn", "model": &outcome.agent, "result": &outcome.text}));
+                            }
+                            session_guard.mark_ok();
+                            return Ok(AgentOutcome { stop_reason: "end_turn".into() });
+                        }
+                    }
                     session_write_failed(format, &session_guard)?;
                     return Err(abort_invoke(format, &session_guard, "error", msg));
                 }
@@ -2359,6 +2477,11 @@ pub(crate) fn run_agent(
         messages.push(json!({"role": "assistant", "content": content.clone()}));
         append_stream(json!({"kind": "assistant", "content": content.clone()}));
         session_write_failed(format, &session_guard)?;
+        match guard.observe(content.as_array().map(Vec::as_slice).unwrap_or(&[])) {
+            core::guard::Verdict::Ok => {}
+            core::guard::Verdict::Nudge(note) => guard_note = Some(note),
+            core::guard::Verdict::Abort(msg) => return Err(abort_invoke(format, &session_guard, "aborted", msg)),
+        }
 
         let stop_reason = stop_reason_str.as_str();
 
@@ -2446,6 +2569,7 @@ pub(crate) fn run_agent(
                     "duration_ms": duration_ms,
                     "input_tokens": total_usage_in,
                     "output_tokens": total_usage_out,
+                    "cache_read_input_tokens": total_cache_read,
                 }));
             } else if format == OutputFormat::Json {
                 let mut result = json!({
@@ -2602,6 +2726,9 @@ fn compact_messages(
         emit_event(emitted);
     }
     if fits(messages) {
+        // The compacted conversation is what later turns resume from;
+        // without it the session loader replays (and re-compacts) the full log.
+        append_stream(json!({"kind": "context_checkpoint", "messages": &*messages}));
         Ok(())
     } else {
         Err(format!(
@@ -2660,12 +2787,84 @@ fn emit_phase(format: OutputFormat, phase: &str) {
     }
 }
 
+/// Hand the turn to the first available ACP agent (`[fallback]` in
+/// providers.toml, else Claude Code → Codex → Gemini → OpenCode). `None`
+/// when fallback is off (`LAZAR_FALLBACK=0`), none is installed, or it fails.
+fn run_fallback(messages: &[Value], error: &str, format: OutputFormat) -> Option<core::fallback::Outcome> {
+    if env::var("LAZAR_FALLBACK").is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    let agents = providers::Catalog::load(&lazar_home())
+        .ok()
+        .and_then(|catalog| catalog.fallback)
+        .map(|fallback| fallback.agents)
+        .unwrap_or_else(core::fallback::default_agents);
+    let prompt = format!(
+        "{}\n\n{}",
+        core::fallback::HANDOFF,
+        core::compact::transcript(messages, core::context::MAX_CONTEXT_ITEM_BYTES * 4)
+    );
+    let cwd = access::current().tool_cwd().to_path_buf();
+    for argv in core::fallback::available(&agents) {
+        if acp::is_session_cancelled() {
+            return None;
+        }
+        if let Some(outcome) = run_one_fallback(&argv, &cwd, &prompt, error, format) {
+            return Some(outcome);
+        }
+    }
+    None
+}
+
+fn run_one_fallback(
+    argv: &[String],
+    cwd: &Path,
+    prompt: &str,
+    error: &str,
+    format: OutputFormat,
+) -> Option<core::fallback::Outcome> {
+    let agent = argv.join(" ");
+    let note = json!({"agent": &agent, "error": error});
+    let mut logged = note.clone();
+    logged["kind"] = json!("fallback");
+    append_stream(logged);
+    if format == OutputFormat::StreamJson {
+        let mut emitted = note;
+        emitted["type"] = json!("fallback");
+        emit_event(emitted);
+    }
+    let mut emit = |event: Value| {
+        if format == OutputFormat::StreamJson {
+            emit_event(event);
+        }
+    };
+    match core::fallback::run(argv, cwd, prompt, &mut emit, &acp::is_session_cancelled) {
+        Ok(outcome) => Some(outcome),
+        Err(err) => {
+            append_stream(json!({"kind": "fallback_failed", "agent": &agent, "error": &err}));
+            if format == OutputFormat::StreamJson {
+                emit_event(json!({"type": "fallback_failed", "agent": &agent, "error": &err}));
+            }
+            None
+        }
+    }
+}
+
 /// Messages queued in `LAZAR_INBOX` (one JSON `{"text"}` or plain line
 /// each), taken atomically so a concurrent `jobs --send` is never half-read.
 fn drain_inbox() -> Vec<String> {
-    let Some(path) = env::var_os("LAZAR_INBOX").map(PathBuf::from) else {
-        return Vec::new();
-    };
+    let mut texts = Vec::new();
+    if let Some(path) = env::var_os("LAZAR_INBOX").map(PathBuf::from) {
+        texts.extend(drain_inbox_file(&path));
+    }
+    // A front end steering its own session (lazartui: Enter mid-turn).
+    if let Some(id) = core::invocation::session_id().filter(|id| session::validate_session_id(id).is_ok()) {
+        texts.extend(drain_inbox_file(&session::session_inbox_path(&id)));
+    }
+    texts
+}
+
+fn drain_inbox_file(path: &Path) -> Vec<String> {
     let taken = path.with_extension(format!("inbox.{}.taking", std::process::id()));
     if fs::rename(&path, &taken).is_err() {
         return Vec::new();
@@ -2798,6 +2997,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.command {
         Some(Command::Acp(acp_args)) => return acp::run(acp_args),
         Some(Command::Providers { json }) => return print_providers(json),
+        Some(Command::Models { provider }) => return print_models(provider),
         Some(Command::Verify { lint }) => return run_verify(lint),
         Some(Command::Jobs { show, since, start, send, run }) => {
             let recent = since.map_or(jobs::RECENT_MS, |secs| u128::from(secs) * 1000);
@@ -3026,10 +3226,16 @@ mod tests {
                 for body in responses {
                     let Ok((mut stream, _)) = listener.accept() else { return };
                     seen.lock().unwrap().push(read_http_request(&mut stream));
-                    let reply = format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
+                    // A body that is already a raw HTTP reply (an error
+                    // status, say) is sent as is.
+                    let reply = if body.starts_with("HTTP/") {
+                        body
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
                     let _ = stream.write_all(reply.as_bytes());
                     let _ = stream.flush();
                 }
@@ -3104,6 +3310,8 @@ mod tests {
 
     const AGENT_TEST_VARS: &[&str] = &[
         "LAZAR_HOME",
+        "LAZAR_FALLBACK",
+        "LAZAR_API_RETRIES",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
         "MINIMAX_API_KEY",
@@ -3145,6 +3353,8 @@ mod tests {
                 env::remove_var(key);
             }
             env::set_var("LAZAR_HOME", &home);
+            // Never hand a test turn to a real Claude Code / Codex.
+            env::set_var("LAZAR_FALLBACK", "0");
             env::set_var("ANTHROPIC_API_KEY", "test-key");
             env::set_var("ANTHROPIC_BASE_URL", &api.base_url);
             Self {
@@ -3311,7 +3521,7 @@ mod tests {
         ];
         fs::write(&path, events.iter().map(|event| format!("{event}\n")).collect::<String>()).unwrap();
 
-        let messages = session::load_messages_checked(id, 32_000).expect("repair load");
+        let messages = session::load_messages_checked(id).expect("repair load");
         let repaired = messages
             .iter()
             .find_map(|message| {
@@ -3328,6 +3538,83 @@ mod tests {
         assert!(persisted.contains("may already have happened"));
         assert!(!test_env.home.join("user/workspace/ran.txt").exists());
         assert!(api.requests().is_empty());
+    }
+
+    fn http_error(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[test]
+    fn model_ids_parse_from_anthropic_openai_and_bare_shapes() {
+        assert_eq!(parse_model_ids(&json!({"data":[{"id":"a"},{"id":"b"}]})), vec!["a", "b"]);
+        assert_eq!(parse_model_ids(&json!({"object":"list","data":[{"id":"gpt"}]})), vec!["gpt"]);
+        assert_eq!(parse_model_ids(&json!(["x", {"id":"y"}])), vec!["x", "y"]);
+        assert!(parse_model_ids(&json!({"error":"no"})).is_empty());
+    }
+
+    #[test]
+    fn transient_proxy_errors_are_retried() {
+        let api = FakeApi::serve(vec![
+            http_error("502 Bad Gateway", r#"{"error":"upstream timeout"}"#),
+            http_error("503 Service Unavailable", "busy"),
+            sse_end_turn("recovered"),
+        ]);
+        let _test_env = AgentTestEnv::new("retry", &api);
+        env::set_var("LAZAR_API_RETRY_DELAY_MS", "1");
+        let result = run_agent("hi", OutputFormat::Json, false, None, AgentLifecycle::default());
+        env::remove_var("LAZAR_API_RETRY_DELAY_MS");
+        result.expect("a transient 5xx is retried");
+        assert_eq!(api.requests().len(), 3);
+    }
+
+    #[test]
+    fn a_down_provider_hands_the_turn_to_the_fallback_acp_agent() {
+        let api = FakeApi::serve(vec![http_error("503 Service Unavailable", "down")]);
+        let test_env = AgentTestEnv::new("fallback", &api);
+        env::set_var("LAZAR_SESSION_ID", "fb");
+        env::set_var("LAZAR_API_RETRIES", "0");
+        env::remove_var("LAZAR_FALLBACK");
+        let agent = test_env.home.join("agent.py");
+        fs::write(&agent, r#"
+import json, sys
+for line in sys.stdin:
+    m = json.loads(line); i = m.get("id")
+    if m.get("method") == "initialize": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{}}), flush=True)
+    elif m.get("method") == "session/new": print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"sessionId":"s"}}), flush=True)
+    elif m.get("method") == "session/prompt":
+        ok = "please fix it" in m["params"]["prompt"][0]["text"]
+        print(json.dumps({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fixed" if ok else "no context"}}}}), flush=True)
+        print(json.dumps({"jsonrpc":"2.0","id":i,"result":{"stopReason":"end_turn"}}), flush=True)
+"#).unwrap();
+        fs::write(
+            test_env.home.join("providers.toml"),
+            format!("[fallback]\nagents = [[\"python3\", {:?}]]\n", agent.to_string_lossy()),
+        )
+        .unwrap();
+        let outcome = run_agent("please fix it", OutputFormat::Json, false, None, AgentLifecycle::default())
+            .expect("the fallback agent completes the turn");
+        assert_eq!(outcome.stop_reason, "end_turn");
+        let resumed = session::load_messages_checked("fb").unwrap();
+        let text = serde_json::to_string(&resumed).unwrap();
+        assert!(text.contains("answered by python3") && text.contains("fixed"), "{text}");
+    }
+
+    #[test]
+    fn usage_limit_errors_are_not_retried() {
+        let api = FakeApi::serve(vec![
+            http_error("502 Bad Gateway", r#"{"error":{"message":"You've hit your usage limit."}}"#),
+            sse_end_turn("should not be requested"),
+        ]);
+        let _test_env = AgentTestEnv::new("no-retry", &api);
+        env::set_var("LAZAR_API_RETRY_DELAY_MS", "1");
+        let result = run_agent("hi", OutputFormat::Json, false, None, AgentLifecycle::default());
+        env::remove_var("LAZAR_API_RETRY_DELAY_MS");
+        let err = result.expect_err("a usage limit is final");
+        assert!(err.to_string().contains("usage limit"), "{err}");
+        assert_eq!(api.requests().len(), 1);
     }
 
     #[test]
@@ -3473,6 +3760,22 @@ mod tests {
     }
 
     #[test]
+    fn session_inbox_steers_a_running_turn() {
+        let api = FakeApi::serve(vec![sse_tool_use("true"), sse_end_turn("done")]);
+        let test_env = AgentTestEnv::new("session-steer", &api);
+        env::set_var("LAZAR_SESSION_ID", "steered");
+        let inbox = test_env.home.join("user/logs/sessions/steered.inbox");
+        fs::create_dir_all(inbox.parent().unwrap()).unwrap();
+        fs::write(&inbox, format!("{}\n", json!({"text": "also check the footer"}))).unwrap();
+        run_agent("fix it", OutputFormat::Json, false, None, AgentLifecycle::default()).unwrap();
+        assert!(!inbox.exists(), "the inbox is drained");
+        let requests = api.requests();
+        assert!(requests[0]["messages"].to_string().contains("also check the footer"), "{:?}", requests[0]);
+        let resumed = session::load_messages_checked("steered").unwrap();
+        assert!(serde_json::to_string(&resumed).unwrap().contains("also check the footer"), "steer is replayed");
+    }
+
+    #[test]
     fn operator_steering_in_the_inbox_reaches_the_next_request() {
         let api = FakeApi::serve(vec![
             sse_tool_use("true"),
@@ -3520,6 +3823,7 @@ mod tests {
             sse_end_turn("done"),
         ]);
         let _test_env = AgentTestEnv::new("overflow", &api);
+        env::set_var("LAZAR_SESSION_ID", "overflow");
         let outcome = run_agent("read the big file", OutputFormat::Json, false, None, AgentLifecycle::default())
             .expect("overflow is recovered by compaction");
         assert_eq!(outcome.stop_reason, "end_turn");
@@ -3531,6 +3835,11 @@ mod tests {
         assert!(sent(3) < sent(1) / 2, "retry {} vs overflow {}", sent(3), sent(1));
         let first = requests[3]["messages"][0]["content"].as_str().unwrap();
         assert!(first.contains("summary of the work") && first.contains("read the big file"), "{first}");
+        // The compaction is persisted: the next turn resumes from it rather
+        // than replaying (and re-compacting) the whole log.
+        let resumed = session::load_messages_checked("overflow").unwrap();
+        let opening = resumed[0]["content"].as_str().unwrap_or_default();
+        assert!(opening.contains("summary of the work"), "{resumed:#?}");
     }
 
     #[test]

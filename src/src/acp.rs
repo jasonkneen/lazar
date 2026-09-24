@@ -611,8 +611,7 @@ fn replay_history(session_id: &SessionId) -> Vec<SessionUpdate> {
     let id = session_id_str(session_id);
     // Unreplayable history is not a turn. `session/load` still completes;
     // the next prompt refuses with the context-limit error.
-    let history = context::Window::resolve(None, context::MAX_OUTPUT_TOKENS).history;
-    let Ok(messages) = session::load_messages_checked(&id, history) else {
+    let Ok(messages) = session::load_messages_checked(&id) else {
         return Vec::new();
     };
     let mut updates = Vec::new();

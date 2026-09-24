@@ -23,6 +23,9 @@ pub struct PersistedState {
     /// events, and full detail. Off by default — see `LAZARTUI_DEBUG`.
     pub debug: bool,
     pub composer_history: Vec<String>,
+    /// Agents-screen rows the operator removed (Backspace/Delete); the
+    /// jobs and session logs stay on disk.
+    pub hidden_agents: Vec<String>,
 }
 
 pub fn state_path(lazar_home: &Path) -> PathBuf {
@@ -73,6 +76,7 @@ mod tests {
             thin: true,
             debug: true,
             composer_history: vec!["hi".into()],
+            hidden_agents: vec!["session:old".into()],
         };
         state.save(&path).unwrap();
         assert_eq!(PersistedState::load(&path), state);

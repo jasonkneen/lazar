@@ -15,6 +15,9 @@ pub struct ProviderInfo {
     pub default_model: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Draw `─── <served model>  cache N% ───` after each turn.
+    #[serde(default)]
+    pub show_served_model: bool,
 }
 
 /// Resolve the kernel binary: `LAZAR_BIN`, then `$LAZAR_HOME/bin/lazar`,
@@ -43,6 +46,21 @@ pub fn load_catalog(kernel: &Path, lazar_home: &Path) -> Result<Vec<ProviderInfo
         ));
     }
     parse_catalog(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The provider's live model list via `lazar models` (which calls its
+/// `/v1/models`). Errors carry the kernel's message for the notice line.
+pub fn live_models(kernel: &Path, lazar_home: &Path, provider: Option<&str>) -> Result<Vec<String>, String> {
+    let mut command = Command::new(kernel);
+    command.arg("models").env("LAZAR_HOME", lazar_home);
+    if let Some(id) = provider {
+        command.args(["--provider", id]);
+    }
+    let output = command.output().map_err(|e| format!("cannot run {}: {e}", kernel.display()))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("bad `lazar models` output: {e}"))
 }
 
 pub fn parse_catalog(json: &str) -> Result<Vec<ProviderInfo>, String> {

@@ -168,6 +168,8 @@ fn with_fold(block: &Block, unfolded: bool) -> Block {
             output: output.clone(),
             exit_code: *exit_code,
             folded: !unfolded,
+            running: false,
+            count: 1,
         },
         other => other.clone(),
     }
@@ -278,7 +280,7 @@ pub fn render_job_detail(
         let mut lines: Vec<Line<'static>> = Vec::new();
         for block in &detail.blocks {
             let block = with_fold(block, detail.tools_unfolded);
-            lines.extend(render_block(&block, body_area.width, theme, hl, false));
+            lines.extend(render_block(&block, body_area.width, theme, hl, false, 0));
         }
         if let Some(pending) = &detail.pending_send {
             lines.extend(render_block(
@@ -287,6 +289,7 @@ pub fn render_job_detail(
                 theme,
                 hl,
                 false,
+                0,
             ));
             lines.extend(render_block(
                 &Block::Marker { text: "sending…".into() },
@@ -294,6 +297,7 @@ pub fn render_job_detail(
                 theme,
                 hl,
                 false,
+                0,
             ));
         }
         if lines.first().is_some_and(|line| line.width() == 0) {

@@ -57,6 +57,8 @@ impl Harness {
             .env("LAZAR_NO_SANDBOX", if active_hook { "1" } else { "0" })
             .env("ANTHROPIC_API_KEY", "offline-test-key")
             .env("ANTHROPIC_BASE_URL", "http://127.0.0.1:1")
+            .env("LAZAR_API_RETRIES", "0")
+            .env("LAZAR_FALLBACK", "0")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

@@ -102,10 +102,26 @@ impl RenderCache {
         width: u16,
         theme: &Theme,
         hl: &Highlighter,
+        spinner_frame: usize,
     ) -> Vec<Line<'static>> {
         self.entries.truncate(transcript.blocks.len());
+        let plan = tool_fold_plan(&transcript.blocks, transcript.hooks_visible());
         let mut out = Vec::new();
         for (i, block) in transcript.blocks.iter().enumerate() {
+            // Entries are indexed by block; a folded block still needs its
+            // slot (with a key that can never match) so later indices line up.
+            if self.entries.len() <= i {
+                self.entries.push(CacheEntry { key: u64::MAX, width: 0, theme_key: 0, debug: false, lines: Vec::new() });
+            }
+            match &plan[i] {
+                Fold::Show => {}
+                Fold::Hide => continue,
+                Fold::Summary(members) => {
+                    out.extend(tool_summary_lines(&transcript.blocks, members, width, theme));
+                    self.entries[i].key = u64::MAX;
+                    continue;
+                }
+            }
             if matches!(block, Block::Hook { .. }) && !transcript.hooks_visible() {
                 if i < self.entries.len() {
                     self.entries[i].lines.clear();
@@ -127,7 +143,7 @@ impl RenderCache {
                 })
                 .unwrap_or(true);
             if fresh {
-                let rendered = render_block(block, width, theme, hl, debug);
+                let rendered = render_block(block, width, theme, hl, debug, spinner_frame);
                 let entry = CacheEntry {
                     key,
                     width,
@@ -150,6 +166,133 @@ impl RenderCache {
         }
         out
     }
+}
+
+/// How one block takes part in cascading tool folding.
+#[derive(Debug, Clone, PartialEq)]
+enum Fold {
+    /// Render the block normally.
+    Show,
+    /// Folded into a summary drawn at an earlier index.
+    Hide,
+    /// Draw one summary row for these tool blocks.
+    Summary(Vec<usize>),
+}
+
+fn tool_program(command: &str) -> &str {
+    let trimmed = command.trim_start();
+    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+    if end == 0 { "(command)" } else { &trimmed[..end] }
+}
+
+fn tool_is_live(block: &Block) -> bool {
+    matches!(block, Block::Tool { running: true, .. } | Block::Tool { output: None, .. })
+}
+
+fn tool_folded(block: &Block) -> bool {
+    matches!(block, Block::Tool { folded: true, .. } | Block::Tool { output: None, .. })
+}
+
+/// Cascading fold: a finished run of consecutive tool calls (something came
+/// after it) collapses to one row; the live run at the tail collapses each
+/// stretch of same-program calls, keeping the running call on its own row.
+/// Unfolding (^T) shows every call.
+fn tool_fold_plan(blocks: &[Block], hooks_visible: bool) -> Vec<Fold> {
+    let mut plan = vec![Fold::Show; blocks.len()];
+    let skippable = |b: &Block| matches!(b, Block::Hook { .. }) && !hooks_visible;
+    let mut i = 0;
+    while i < blocks.len() {
+        if !matches!(blocks[i], Block::Tool { .. }) {
+            i += 1;
+            continue;
+        }
+        let mut run = Vec::new();
+        let mut j = i;
+        while j < blocks.len() && (matches!(blocks[j], Block::Tool { .. }) || skippable(&blocks[j])) {
+            if matches!(blocks[j], Block::Tool { .. }) {
+                run.push(j);
+            }
+            j += 1;
+        }
+        let all_folded = run.iter().all(|&k| tool_folded(&blocks[k]));
+        let finished = j < blocks.len() && !run.iter().any(|&k| tool_is_live(&blocks[k]));
+        if all_folded && finished && run.len() > 1 {
+            plan[run[0]] = Fold::Summary(run.clone());
+            for &k in &run[1..] {
+                plan[k] = Fold::Hide;
+            }
+        } else if all_folded {
+            // Live: fold each stretch of finished same-program calls.
+            let mut s = 0;
+            while s < run.len() {
+                let program = match &blocks[run[s]] { Block::Tool { command, .. } => tool_program(command), _ => "" };
+                let mut e = s;
+                while e + 1 < run.len()
+                    && !tool_is_live(&blocks[run[e + 1]])
+                    && !tool_is_live(&blocks[run[s]])
+                    && matches!(&blocks[run[e + 1]], Block::Tool { command, .. } if tool_program(command) == program)
+                {
+                    e += 1;
+                }
+                if e > s {
+                    plan[run[s]] = Fold::Summary(run[s..=e].to_vec());
+                    for &k in &run[s + 1..=e] {
+                        plan[k] = Fold::Hide;
+                    }
+                }
+                s = e + 1;
+            }
+        }
+        i = j;
+    }
+    plan
+}
+
+/// One row standing for several tool calls: `grep ×4` for a same-program
+/// stretch, `12 tool calls · grep ×4 · sed ×6` for a whole finished run.
+fn tool_summary_lines(blocks: &[Block], members: &[usize], width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    let mut failed = 0;
+    for &k in members {
+        if let Block::Tool { command, exit_code, .. } = &blocks[k] {
+            let program = tool_program(command).to_string();
+            match groups.last_mut() {
+                Some((p, n)) if *p == program => *n += 1,
+                _ => groups.push((program, 1)),
+            }
+            if exit_code.is_some_and(|c| c != 0) {
+                failed += 1;
+            }
+        }
+    }
+    let icon = theme.icon("󰞷 ", "◆ ", "$ ");
+    let status = if failed > 0 {
+        Span::styled(format!(" ✗ {failed} failed"), theme.fail)
+    } else {
+        Span::styled(" ✓ ok".to_string(), theme.ok)
+    };
+    let mut spans = vec![Span::styled(icon.to_string(), theme.accent)];
+    if groups.len() == 1 {
+        let (program, n) = &groups[0];
+        spans.push(Span::styled(program.clone(), theme.tool_cmd));
+        spans.push(Span::styled(format!(" ×{n}"), theme.tool_args));
+    } else {
+        let parts = groups
+            .iter()
+            .map(|(p, n)| if *n > 1 { format!("{p} ×{n}") } else { p.clone() })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        spans.push(Span::styled(format!("{} tool calls", members.len()), theme.tool_cmd));
+        let budget = (width as usize).saturating_sub(icon.width() + 16 + status.content.width());
+        spans.push(Span::styled(fit(&format!(" · {parts}"), budget), theme.tool_args));
+    }
+    spans.push(status);
+    let hint = format!("  {} {} calls folded (^T to unfold)", theme.icon("󰅂", "▸", ">"), members.len());
+    vec![
+        Line::default(),
+        Line::from(spans),
+        Line::from(Span::styled(fit(&hint, width as usize), theme.dim)),
+    ]
 }
 
 /// Split a line's spans at display column `cols`.
@@ -321,6 +464,7 @@ pub(crate) fn render_block(
     theme: &Theme,
     hl: &Highlighter,
     debug: bool,
+    spinner_frame: usize,
 ) -> Vec<Line<'static>> {
     #[cfg(test)]
     RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -398,14 +542,25 @@ pub(crate) fn render_block(
             output,
             exit_code,
             folded,
+            running,
+            count,
             ..
         } => {
             out.push(Line::default());
-            let status = match (output, exit_code) {
-                (None, _) => Span::styled(" ~ running".to_string(), theme.warn),
-                (Some(_), Some(0)) => Span::styled(" ok exit 0".to_string(), theme.ok),
-                (Some(_), Some(c)) => Span::styled(format!(" x exit {c}"), theme.fail),
-                (Some(_), None) => Span::styled(" done".to_string(), theme.dim),
+            // A live braille spinner replaces the static "~ running" glyph so
+            // the user sees movement while the call is in flight. Once output
+            // lands the spinner is dropped in favour of a ✓/✗ status glyph.
+            let status = if *running {
+                let glyphs = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let g = glyphs[spinner_frame % glyphs.len()];
+                Span::styled(format!(" {g} running"), theme.warn)
+            } else {
+                match (output, exit_code) {
+                    (Some(_), Some(0)) => Span::styled(" ✓ ok exit 0".to_string(), theme.ok),
+                    (Some(_), Some(c)) => Span::styled(format!(" ✗ exit {c}"), theme.fail),
+                    (Some(_), None) => Span::styled(" ✓ done".to_string(), theme.ok),
+                    (None, _) => Span::styled(" ~ running".to_string(), theme.warn),
+                }
             };
             // The program name keeps the tool colour; its arguments are quieter.
             let (program, args) = if command.is_empty() {
@@ -423,7 +578,12 @@ pub(crate) fn render_block(
                 let more = command.trim().lines().nth(1).is_some();
                 let budget = (width as usize)
                     .saturating_sub(icon.width() + program.width() + status.content.width());
-                let shown = fit(&format!("{first}{}", if more { " …" } else { "" }), budget);
+                let count_suffix = if *count > 1 {
+                    format!(" (×{})", count)
+                } else {
+                    String::new()
+                };
+                let shown = fit(&format!("{first}{count_suffix}{}", if more { " …" } else { "" }), budget);
                 out.push(Line::from(vec![
                     Span::styled(icon.to_string(), theme.accent),
                     Span::styled(program.to_string(), theme.tool_cmd),
@@ -694,9 +854,9 @@ mod tests {
         t.append_assistant("Hello there");
         t.finish_assistant();
         let mut cache = RenderCache::default();
-        cache.lines(&t, 40, &theme, &hl);
+        cache.lines(&t, 40, &theme, &hl, 0);
         let after_first = RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
-        cache.lines(&t, 40, &theme, &hl);
+        cache.lines(&t, 40, &theme, &hl, 0);
         let after_second = RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
             after_first, after_second,
@@ -712,20 +872,20 @@ mod tests {
         t.push_user("hi");
         t.append_assistant("Hello **there**");
         let mut cache = RenderCache::default();
-        let first = text(&cache.lines(&t, 40, &theme, &hl));
+        let first = text(&cache.lines(&t, 40, &theme, &hl, 0));
         assert!(first.iter().any(|l| l.trim() == "› hi"));
         assert!(first.iter().any(|l| l.contains("Hello there")));
         t.append_assistant(" again");
-        let second = text(&cache.lines(&t, 40, &theme, &hl));
+        let second = text(&cache.lines(&t, 40, &theme, &hl, 0));
         assert!(second.iter().any(|l| l.contains("Hello there again")));
         assert_eq!(cache.entries.len(), 2);
 
         t.show_hooks = false;
         t.push_hook(&serde_json::json!({"kind":"hook_end","event":"pre-tool","script":"x.sh","action":"continue"}));
-        let hidden = text(&cache.lines(&t, 40, &theme, &hl));
+        let hidden = text(&cache.lines(&t, 40, &theme, &hl, 0));
         assert!(!hidden.iter().any(|l| l.contains("hook pre-tool")));
         t.show_hooks = true;
-        let shown = text(&cache.lines(&t, 40, &theme, &hl));
+        let shown = text(&cache.lines(&t, 40, &theme, &hl, 0));
         assert!(shown.iter().any(|l| l.contains("hook pre-tool")));
     }
 
@@ -736,7 +896,7 @@ mod tests {
         let mut transcript = Transcript::new();
         transcript.push_user("one two three four five");
         let mut cache = RenderCache::default();
-        let lines = text(&cache.lines(&transcript, 16, &theme, &hl));
+        let lines = text(&cache.lines(&transcript, 16, &theme, &hl, 0));
         let first = lines.iter().find(|line| line.contains("one")).unwrap();
         let continuation = lines.iter().find(|line| line.contains("three")).unwrap();
         assert!(first.starts_with("  › "), "{first:?}");
@@ -749,14 +909,14 @@ mod tests {
     fn user_messages_have_half_block_padding_and_assistant_messages_are_transparent() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
-        let user = render_block(&Block::User { text: "Hello".into() }, 24, &theme, &hl, false);
+        let user = render_block(&Block::User { text: "Hello".into() }, 24, &theme, &hl, false, 0);
         let rendered = text(&user);
         assert_eq!(rendered[1], "▄".repeat(24));
         assert_eq!(rendered.last().unwrap(), &"▀".repeat(24));
         assert_eq!(user[2].style.bg, theme.user_surface.bg);
         let assistant = render_block(&Block::Assistant {
             markdown: "Hello from Lazar.".into(), streaming: false,
-        }, 24, &theme, &hl, false);
+        }, 24, &theme, &hl, false, 0);
         assert!(text(&assistant).iter().any(|line| line.contains("Hello from Lazar.")));
         assert!(assistant.iter().all(|line| line.style.bg.is_none()
             && line.spans.iter().all(|span| span.style.bg.is_none())));
@@ -771,8 +931,10 @@ mod tests {
             output: Some("done\n".into()),
             exit_code: Some(0),
             folded: true,
-        };
-        let rendered = text(&render_block(&block, 60, &theme, &Highlighter::new(), false));
+            count: 1,
+            running: false,
+            };
+        let rendered = text(&render_block(&block, 60, &theme, &Highlighter::new(), false, 0));
         assert_eq!(rendered.len(), 3, "blank, header, fold hint: {rendered:?}");
         assert!(rendered[1].chars().count() <= 60, "{rendered:?}");
         assert!(rendered[1].contains("cat") && rendered[1].contains('…') && rendered[1].ends_with("ok exit 0"), "{rendered:?}");
@@ -789,11 +951,13 @@ mod tests {
             output: Some("a\nb\n".into()),
             exit_code: Some(0),
             folded: true,
-        };
+            count: 1,
+            running: false,
+            };
         let empty = Block::Assistant { markdown: "\n\n\n".into(), streaming: false };
         let mut lines = Vec::new();
         for block in [tool("tail -n 30 journal.md"), empty, tool("git log")] {
-            lines.extend(render_block(&block, 80, &theme, &hl, false));
+            lines.extend(render_block(&block, 80, &theme, &hl, false, 0));
         }
         let rendered = text(&lines);
         assert_eq!(rendered.len(), 6, "{rendered:?}");
@@ -810,7 +974,7 @@ mod tests {
     fn wrapped_list_items_hang_under_their_text() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let md = "- memory — plain markdown notes that survive across invocations and stay readable\n\n1. first numbered item that is long enough to wrap onto another row";
-        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new(), false);
+        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new(), false, 0);
         let rendered = text(&lines);
         let bullet = rendered.iter().position(|l| l.contains("• memory")).unwrap();
         let col = |line: &str, word: &str| line[..line.find(word).unwrap()].chars().count();
@@ -837,14 +1001,14 @@ mod tests {
             title: title.map(str::to_string),
         };
         let block = Block::Sources { entries: vec![entry(Some("Three.js flight sims")), entry(None)], speech: String::new() };
-        let rendered = text(&render_block(&block, 50, &theme, &Highlighter::new(), false));
+        let rendered = text(&render_block(&block, 50, &theme, &Highlighter::new(), false, 0));
         assert!(rendered.iter().any(|l| l.contains("Three.js flight sims:4")), "{rendered:?}");
-        let wide = text(&render_block(&block, 100, &theme, &Highlighter::new(), false));
+        let wide = text(&render_block(&block, 100, &theme, &Highlighter::new(), false, 0));
         assert!(wide.iter().any(|l| l.contains("Three.js flight sims:4") && l.contains("threejs-3d-games")), "{wide:?}");
         assert!(!rendered.iter().any(|l| l.contains("/Users/x")), "no full paths: {rendered:?}");
         assert!(rendered.iter().all(|l| l.chars().count() <= 50), "{rendered:?}");
         assert_eq!(rendered.iter().filter(|l| l.trim_start().starts_with('·')).count(), 2, "one row each: {rendered:?}");
-        let debug = text(&render_block(&block, 200, &theme, &Highlighter::new(), true));
+        let debug = text(&render_block(&block, 200, &theme, &Highlighter::new(), true, 0));
         assert!(debug.iter().any(|l| l.contains("/Users/x/lazar/user/memory/research/")), "{debug:?}");
     }
 
@@ -852,7 +1016,7 @@ mod tests {
     fn long_assistant_paragraphs_wrap_instead_of_clipping() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let md = "Want me to look at the scroll/viewport logic in `app.rs` to see if there's a clamp bug? Or rebuild the TUI from source so you're running current code?\n\n- a list item that is long enough to need wrapping onto a second line";
-        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new(), false);
+        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new(), false, 0);
         let rendered = text(&lines);
         let joined = rendered.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
         assert!(joined.contains("running current code?"), "{rendered:?}");
@@ -871,7 +1035,7 @@ mod tests {
             markdown: "Run this:\n\n```sh\nls -la\n```\n".into(),
             streaming: false,
         };
-        let lines = render_block(&block, 40, &theme, &Highlighter::new(), false);
+        let lines = render_block(&block, 40, &theme, &Highlighter::new(), false, 0);
         // The highlighter may split the command into several spans; find the
         // line whose concatenated text carries it.
         let code_line = lines
@@ -926,9 +1090,9 @@ mod tests {
             markdown: "Done.\n\n[VERIFY]\nexists=/tmp/x\n[/VERIFY]".into(),
             streaming: false,
         };
-        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true));
+        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true, 0));
         assert!(debug_lines.iter().any(|l| l.contains("[VERIFY]")));
-        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
         assert!(!plain_lines.iter().any(|l| l.to_ascii_lowercase().contains("verify")));
     }
 
@@ -940,7 +1104,7 @@ mod tests {
             markdown: "[VERIFY]\nexists=/tmp/x\n[/VERIFY]\n".into(),
             streaming: false,
         };
-        let lines = render_block(&block, 40, &theme, &hl, false);
+        let lines = render_block(&block, 40, &theme, &hl, false, 0);
         assert!(lines.is_empty(), "{lines:?}");
     }
 
@@ -957,10 +1121,10 @@ mod tests {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
         let block = Block::Assistant { markdown: markdown.into(), streaming: false };
-        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true));
+        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true, 0));
         let joined = debug_lines.join("\n");
         assert!(joined.contains("[SPEAK]") && joined.contains("[SOURCES]"), "{debug_lines:?}");
-        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
         let plain_lower = plain_lines.join("\n").to_ascii_lowercase();
         assert!(!plain_lower.contains("speak") && !plain_lower.contains("sources"), "{plain_lines:?}");
     }
@@ -1010,7 +1174,7 @@ mod tests {
             ],
             speech: String::new(),
         };
-        let lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
         let joined = lines.join("\n");
         assert!(joined.contains("sources"));
         // File names by default; full paths are debug-only.
@@ -1024,9 +1188,9 @@ mod tests {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
         let block = Block::Sources { entries: vec![], speech: "It's fixed.".into() };
-        let plain = render_block(&block, 80, &theme, &hl, false);
+        let plain = render_block(&block, 80, &theme, &hl, false, 0);
         assert!(plain.is_empty(), "{plain:?}");
-        let debug = text(&render_block(&block, 80, &theme, &hl, true));
+        let debug = text(&render_block(&block, 80, &theme, &hl, true, 0));
         assert!(debug.iter().any(|l| l.contains("speak:") && l.contains("It's fixed.")), "{debug:?}");
     }
 
@@ -1049,7 +1213,7 @@ mod tests {
             tools_run: 2,
             claims: vec![claim("exists=/tmp/x", true, "exists")],
         };
-        let lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
         assert!(lines.iter().any(|l| l.contains("verified") && l.contains("1 claim")), "{lines:?}");
         assert!(!lines.iter().any(|l| l.contains("exists")), "claim detail is debug-only: {lines:?}");
     }
@@ -1065,7 +1229,7 @@ mod tests {
             tools_run: 2,
             claims: vec![claim("exists=/tmp/x", true, "exists"), claim("contains=/tmp/y:z", false, "not found")],
         };
-        let lines = text(&render_block(&block, 80, &theme, &hl, true));
+        let lines = text(&render_block(&block, 80, &theme, &hl, true, 0));
         assert!(lines.iter().any(|l| l.contains("1 of 2") && l.contains("correcting")), "{lines:?}");
         assert!(lines.iter().any(|l| l.contains("contains=/tmp/y:z") && l.contains("not found")), "{lines:?}");
     }
@@ -1081,8 +1245,121 @@ mod tests {
             tools_run: 2,
             claims: vec![claim("exists=/tmp/x", false, "missing")],
         };
-        let lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
         assert!(lines.iter().any(|l| l.contains("1 of 1") && !l.contains("correcting")), "{lines:?}");
+    }
+
+    fn done_tool(command: &str, code: i32) -> Block {
+        Block::Tool {
+            id: command.into(),
+            command: command.into(),
+            output: Some("out".into()),
+            exit_code: Some(code),
+            folded: true,
+            running: false,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn finished_tool_run_folds_to_one_summary_row() {
+        let blocks = vec![
+            done_tool("cd a", 0),
+            done_tool("cd b", 0),
+            done_tool("grep x", 1),
+            Block::Assistant { markdown: "found it".into(), streaming: false },
+        ];
+        let plan = tool_fold_plan(&blocks, false);
+        assert_eq!(plan[0], Fold::Summary(vec![0, 1, 2]));
+        assert_eq!(plan[1], Fold::Hide);
+        assert_eq!(plan[3], Fold::Show);
+        let row: String = tool_summary_lines(&blocks, &[0, 1, 2], 120, &Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode))[1]
+            .spans.iter().map(|s| s.content.to_string()).collect();
+        assert!(row.contains("3 tool calls · cd ×2 · grep"), "{row}");
+        assert!(row.contains("1 failed"), "{row}");
+    }
+
+    #[test]
+    fn live_run_folds_same_program_stretches_but_keeps_the_running_call() {
+        let mut running = done_tool("grep y", 0);
+        if let Block::Tool { output, running: r, exit_code, .. } = &mut running {
+            *output = None;
+            *r = true;
+            *exit_code = None;
+        }
+        let blocks = vec![done_tool("cd a", 0), done_tool("cd b", 0), done_tool("cd c", 0), done_tool("sed 1p f", 0), running];
+        let plan = tool_fold_plan(&blocks, false);
+        assert_eq!(plan[0], Fold::Summary(vec![0, 1, 2]));
+        assert_eq!(plan[3], Fold::Show);
+        assert_eq!(plan[4], Fold::Show);
+    }
+
+    #[test]
+    fn rendering_a_folded_run_then_more_blocks_does_not_panic() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let mut t = Transcript::new();
+        for n in 0..3 {
+            t.start_tool(&format!("t{n}"), &format!("cd d{n}"));
+            t.finish_tool(&format!("t{n}"), "x\n".repeat(40), Some(0));
+        }
+        t.push_marker("after");
+        t.start_tool("t9", "ls");
+        let mut cache = RenderCache::default();
+        let first = cache.lines(&t, 100, &theme, &hl, 0);
+        let second = cache.lines(&t, 100, &theme, &hl, 1);
+        let text: String = second.iter().flat_map(|l| l.spans.iter().map(|s| s.content.to_string())).collect();
+        assert!(text.contains("cd ×3"), "{text}");
+        assert_eq!(first.len(), second.len());
+    }
+
+    #[test]
+    fn unfolded_tools_are_never_grouped() {
+        let mut open = done_tool("cd b", 0);
+        if let Block::Tool { folded, .. } = &mut open {
+            *folded = false;
+        }
+        let blocks = vec![done_tool("cd a", 0), open, Block::Assistant { markdown: "x".into(), streaming: false }];
+        assert!(tool_fold_plan(&blocks, false).iter().all(|f| *f == Fold::Show));
+    }
+
+    #[test]
+    fn running_tool_shows_braille_spinner_and_advances_with_frame() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let running_block = Block::Tool {
+            id: "t1".into(),
+            command: "sleep 5".into(),
+            output: None,
+            exit_code: None,
+            folded: false,
+            running: true,
+            count: 1,
+        };
+        // Frame 0: first braille glyph
+        let lines0 = text(&render_block(&running_block, 60, &theme, &hl, false, 0));
+        assert!(lines0.iter().any(|l| l.contains("running")));
+        // Frame 1: second braille glyph
+        let lines1 = text(&render_block(&running_block, 60, &theme, &hl, false, 1));
+        assert!(lines1.iter().any(|l| l.contains("running")));
+    }
+
+    #[test]
+    fn collapsed_tool_chip_shows_multiplier_suffix() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let collapsed_block = Block::Tool {
+            id: "t1".into(),
+            command: "git status".into(),
+            output: Some("clean
+".into()),
+            exit_code: Some(0),
+            folded: true,
+            running: false,
+            count: 5,
+        };
+        let lines = text(&render_block(&collapsed_block, 60, &theme, &hl, false, 0));
+        assert!(lines.iter().any(|l| l.contains("(×5)")), "expected (×5) multiplier in: {lines:?}");
     }
 }
 

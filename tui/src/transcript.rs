@@ -23,6 +23,14 @@ pub enum Block {
         output: Option<String>,
         exit_code: Option<i32>,
         folded: bool,
+        /// True while the call has not yet produced output. Lets the renderer
+        /// show a live braille spinner instead of a static status glyph, and
+        /// keeps the row in the "latest running" set for collapse decisions.
+        running: bool,
+        /// How many consecutive identical calls this chip represents. 1 for a
+        /// single call. Nothing sets it above 1 now (folding is render-time); shown in the
+        /// fold hint as `cmd (×N)`.
+        count: u32,
     },
     Banner {
         kind: BannerKind,
@@ -246,6 +254,8 @@ impl Transcript {
             output: None,
             exit_code: None,
             folded: false,
+            running: true,
+            count: 1,
         });
     }
 
@@ -264,12 +274,16 @@ impl Transcript {
                     output: slot,
                     exit_code: code,
                     folded,
+                    running,
+                    count,
                     ..
                 },
             )) => {
                 *folded = fold_long && output.lines().count() > FOLD_THRESHOLD_LINES;
                 *slot = Some(output);
                 *code = exit_code;
+                *running = false;
+                *count = 1;
                 self.bump(i);
             }
             _ => {
@@ -281,6 +295,8 @@ impl Transcript {
                     output: Some(output),
                     exit_code,
                     folded: false,
+                    running: false,
+                    count: 1,
                 });
             }
         }
@@ -302,6 +318,7 @@ impl Transcript {
             if let Block::Tool {
                 folded,
                 output: Some(_),
+                running: false,
                 ..
             } = block
             {
@@ -528,4 +545,5 @@ mod tests {
             Block::Sources { entries, speech } if entries.is_empty() && speech == "Also this."
         ));
     }
+
 }

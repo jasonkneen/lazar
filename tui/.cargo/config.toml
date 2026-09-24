@@ -1,0 +1,4 @@
+# Build where scripts/tui-build.sh builds, so a manual `cargo build` never
+# leaves a stale lazartui in tui/target (the installed binary is bin/lazartui).
+[build]
+target-dir = "../user/workspace/.cargo-target-tui"

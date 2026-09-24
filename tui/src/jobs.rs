@@ -229,6 +229,10 @@ pub fn fetch_job_show(
     thread::Builder::new()
         .name("lazartui-job-show".into())
         .spawn(move || {
+            if let Some(id) = crate::sessions::session_id_of(&job_id) {
+                let _ = tx.send(crate::sessions::show(&lazar_home, id));
+                return;
+            }
             let outcome = match Command::new(&kernel)
                 .arg("jobs")
                 .arg("--show")
@@ -301,6 +305,10 @@ pub fn send_job(
     thread::Builder::new()
         .name("lazartui-job-send".into())
         .spawn(move || {
+            if let Some(id) = crate::sessions::session_id_of(&job_id) {
+                let _ = tx.send(crate::sessions::steer(&lazar_home, id, &text));
+                return;
+            }
             let outcome = match Command::new(&kernel)
                 .arg("jobs")
                 .arg("--send")

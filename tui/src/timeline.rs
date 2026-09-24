@@ -52,6 +52,8 @@ pub fn timeline_blocks(timeline: &Value) -> Vec<Block> {
                 // Folded one-line header by default; the detail screen's
                 // Enter/Ctrl+T unfolds every tool at once.
                 folded: true,
+                running: false,
+                count: 1,
             }),
             "verify" => {
                 let status = match step.get("status").and_then(Value::as_str) {
@@ -194,7 +196,7 @@ mod tests {
         let blocks = timeline_blocks(&json!([{"kind": "tool", "id": "t1", "command": "pwd"}]));
         assert!(matches!(
             &blocks[0],
-            Block::Tool { id, command, output: None, exit_code: None, folded: true }
+            Block::Tool { id, command, output: None, exit_code: None, folded: true, .. }
                 if id == "t1" && command == "pwd"
         ));
     }

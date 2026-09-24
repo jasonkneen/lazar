@@ -63,6 +63,12 @@ pub fn validate_session_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Operator messages for a running turn of this session, one JSON `{"text"}`
+/// per line; the turn loop drains it before every model request.
+pub fn session_inbox_path(id: &str) -> PathBuf {
+    session_log_path(id).with_extension("inbox")
+}
+
 /// Path to the trusted, kernel-owned session log for this id. The sandbox
 /// profile must not grant tools write access to this tree. Caller is responsible for
 /// validating the id first.
@@ -218,9 +224,14 @@ pub fn delete_session(id: &str) -> Result<(), String> {
 /// (truncated past a safe boundary, or otherwise unreplayable). That error
 /// is not a conversation item: callers must not replay it as a user or
 /// assistant turn. A missing or empty log is `Ok` and empty.
-pub fn load_messages_checked(id: &str, history_cap: usize) -> Result<Vec<Value>, String> {
+///
+/// History is never silently dropped: the whole conversation since the last
+/// `context_checkpoint` (written only by deliberate compaction) is replayed,
+/// and an oversized history is compacted by the turn loop, which records a
+/// new checkpoint.
+pub fn load_messages_checked(id: &str) -> Result<Vec<Value>, String> {
     let path = session_log_path(id);
-    let (messages, repairs) = load_history(&path, resolve_history_cap(history_cap));
+    let (messages, repairs) = load_history(&path, usize::MAX);
     for repair in repairs {
         append_session(id, repair)?;
     }
@@ -324,6 +335,11 @@ fn load_history(path: &Path, cap: usize) -> (Vec<Value>, Vec<Value>) {
             "assistant" => history.assistant(event.get("content")),
             "tool_result" => history.tool_result(&event),
             "continuation" => history.user_text(crate::core::compact::CONTINUE_PROMPT),
+            "context_checkpoint" => {
+                if let Some(messages) = event.get("messages").and_then(Value::as_array) {
+                    history.checkpoint(messages.clone());
+                }
+            }
             "steer" => {
                 if let Some(text) = event.get("content").and_then(Value::as_str) {
                     history.user_text(text);
@@ -358,6 +374,13 @@ struct History {
 }
 
 impl History {
+    /// Deliberate compaction replaced everything before this point with
+    /// exactly these messages.
+    fn checkpoint(&mut self, messages: Vec<Value>) {
+        self.close_pending();
+        self.messages = messages;
+    }
+
     fn user_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
@@ -525,12 +548,33 @@ fn bounded_result_to(content: &str, exit_code: Option<i64>, cap: usize) -> Strin
 
 /// True for a message the operator typed (as opposed to a tool_result
 /// carrier). Only these are valid places to start a truncated history.
+/// A prompt typed after an interrupted tool round rides as a text block in
+/// that round's tool_result carrier; it still counts.
 fn is_operator_message(message: &Value) -> bool {
-    message["role"] == "user" && message["content"].is_string()
+    message["role"] == "user"
+        && (message["content"].is_string()
+            || message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "text")))
+}
+
+/// Opening a truncated history on a carrier would orphan its tool_results
+/// (their tool_use was dropped); keep only the operator's text.
+fn operator_text_only(message: &mut Value) {
+    if let Some(blocks) = message["content"].as_array() {
+        let text = blocks
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        message["content"] = json!(text);
+    }
 }
 
 /// Resolve the session-history byte cap: LAZAR_SESSION_HISTORY_MAX_BYTES
 /// when set to a positive value, else the window-derived `default`.
+#[cfg(test)]
 fn resolve_history_cap(default: usize) -> usize {
     std::env::var("LAZAR_SESSION_HISTORY_MAX_BYTES")
         .ok()
@@ -580,8 +624,14 @@ fn truncate_to_cap(mut messages: Vec<Value>, cap: usize) -> Vec<Value> {
         }
         messages.drain(0..starts[1]);
     }
+    if let Some(first) = messages.first_mut() {
+        operator_text_only(first);
+    }
     if json_len(&messages) > cap {
-        if let Some(user) = messages.iter().find(|message| is_operator_message(message)).cloned() {
+        // Keep the newest prompt: the oldest one is the context least
+        // relevant to what the operator is asking now.
+        if let Some(mut user) = messages.iter().rev().find(|message| is_operator_message(message)).cloned() {
+            operator_text_only(&mut user);
             messages = vec![user];
         }
         if json_len(&messages) > cap {
@@ -958,6 +1008,68 @@ mod tests {
         assert!(is_operator_message(&messages[0]), "{messages:#?}");
         assert_eq!(messages[0]["content"], "recent prompt");
         assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn checkpoint_replaces_prior_history_and_later_turns_append() {
+        let events = [
+            json!({"kind":"user","content":"before compaction"}),
+            json!({"kind":"assistant","content":[{"type":"text","text":"old answer"}]}),
+            json!({"kind":"context_checkpoint","messages":[
+                {"role":"user","content":"[summary] earlier work"},
+                {"role":"assistant","content":[{"type":"text","text":"kept tail"}]},
+            ]}),
+            json!({"kind":"user","content":"after compaction"}),
+        ];
+        let path = std::env::temp_dir().join(format!("lazar-checkpoint-{}.jsonl", std::process::id()));
+        fs::write(&path, events.iter().map(|e| e.to_string() + "\n").collect::<String>()).unwrap();
+        let (msgs, _) = load_history(&path, usize::MAX);
+        let _ = fs::remove_file(&path);
+        assert_eq!(msgs.len(), 3, "{msgs:#?}");
+        assert_eq!(msgs[0]["content"], "[summary] earlier work");
+        assert_eq!(msgs[2]["content"], "after compaction");
+    }
+
+    #[test]
+    fn production_load_never_drops_rounds() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let big = "o".repeat(1_500);
+        let mut events = Vec::new();
+        for n in 0..400 {
+            events.push(json!({"kind":"user","content":format!("prompt {n}")}));
+            events.push(json!({"kind":"assistant","content":[{"type":"text","text":big}]}));
+        }
+        let path = std::env::temp_dir().join(format!("lazar-nodrop-{}.jsonl", std::process::id()));
+        fs::write(&path, events.iter().map(|e| e.to_string() + "\n").collect::<String>()).unwrap();
+        let (messages, _) = load_history(&path, usize::MAX);
+        let _ = fs::remove_file(&path);
+        assert_eq!(messages.len(), 800);
+        assert_eq!(messages[0]["content"], "prompt 0");
+    }
+
+    #[test]
+    fn prompts_after_interrupted_rounds_stay_round_starts() {
+        // Every turn aborted mid tool round, so each later prompt rides in a
+        // tool_result carrier. Truncation must still keep the newest prompts,
+        // not collapse to the oldest one.
+        let big = "o".repeat(400);
+        let mut events = vec![json!({"kind":"user","content":"ancient prompt"})];
+        for (n, prompt) in ["second prompt", "third prompt", "newest prompt"].iter().enumerate() {
+            let id = format!("c{n}");
+            events.push(json!({"kind":"assistant","content":[{"type":"tool_use","id":id,"name":"bash","input":{"command":"ls"}}]}));
+            events.push(json!({"kind":"tool_result","tool_use_id":id,"content":big,"exit_code":0}));
+            events.push(json!({"kind":"user","content":prompt}));
+        }
+        let path = std::env::temp_dir().join(format!("lazar-interrupted-{}.jsonl", std::process::id()));
+        fs::write(&path, events.iter().map(|e| e.to_string() + "\n").collect::<String>()).unwrap();
+        let (messages, _) = load_history(&path, 1_500);
+        let _ = fs::remove_file(&path);
+        let text = serde_json::to_string(&messages).unwrap();
+        assert!(text.contains("newest prompt"), "{messages:#?}");
+        assert!(!text.contains("ancient prompt"), "{messages:#?}");
+        assert!(messages.len() > 1, "{messages:#?}");
+        assert!(is_operator_message(&messages[0]), "{messages:#?}");
+        assert!(messages[0]["content"].is_string(), "history must not open with orphan tool results: {messages:#?}");
     }
 
     #[test]

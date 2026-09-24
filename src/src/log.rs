@@ -344,7 +344,17 @@ pub(crate) fn append_stream(mut event: Value) {
         let mirror = session_id.is_some()
             && matches!(
                 kind,
-                "user" | "assistant" | "tool_result" | "invoke_start" | "invoke_end"
+                "user"
+                    | "assistant"
+                    | "tool_result"
+                    | "invoke_start"
+                    | "invoke_end"
+                    // Replayed by the session loader; without them a resumed
+                    // session loses steering and every compaction.
+                    | "steer"
+                    | "continuation"
+                    | "verify_correction"
+                    | "context_checkpoint"
             );
         let lock = match open_append_no_follow(&lock_path, "stream lock") {
             Ok(file) => Some(file),

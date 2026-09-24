@@ -8,6 +8,7 @@ mod keys;
 mod overlays;
 mod providers;
 mod render;
+mod sessions;
 mod skills;
 mod state;
 mod status;
