@@ -804,6 +804,13 @@ thread_local! {
     static SERVED_MODEL: std::cell::RefCell<Option<String>> = const {
         std::cell::RefCell::new(None)
     };
+    /// Whether any response this turn carried a cache usage field. Proxies
+    /// that drop them would otherwise look like a 0% cache hit.
+    static CACHE_REPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The model a router actually dispatched to, from its `X-Routed-Via:
+    /// <platform>/<model>` header (freellmapi). Beats the echoed alias in
+    /// `message_start`.
+    static ROUTED_MODEL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     static EVENT_SINK: std::cell::RefCell<Option<UnboundedSender<Value>>> = const {
         std::cell::RefCell::new(None)
     };
@@ -847,6 +854,9 @@ fn absorb_usage(usage: &Value, input_tokens: &mut u64, output_tokens: &mut u64, 
     }
     if let Some(n) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
         *cache_read_tokens = n;
+    }
+    if usage.get("cache_read_input_tokens").is_some() || usage.get("cache_creation_input_tokens").is_some() {
+        CACHE_REPORTED.with(|flag| flag.set(true));
     }
 }
 
@@ -1413,6 +1423,13 @@ async fn response_preview(
 const DEFAULT_API_RETRIES: u32 = 3;
 const DEFAULT_API_RETRY_DELAY_MS: u64 = 2_000;
 
+/// `groq/llama-3` → `llama-3`; the platform is the first segment only, as
+/// model ids may contain slashes themselves.
+fn routed_model_from_header(value: &str) -> Option<String> {
+    let (_, model) = value.split_once('/')?;
+    (!model.trim().is_empty()).then(|| model.trim().to_string())
+}
+
 /// Quota and billing failures do not clear by retrying.
 fn is_final_provider_error(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
@@ -1444,7 +1461,15 @@ async fn request_model(
             biased;
             _ = wait_for_session_cancel() => return Err("cancelled".into()),
             response = request => match response {
-                Ok(response) if response.status().is_success() => break response,
+                Ok(response) if response.status().is_success() => {
+                    let routed = response
+                        .headers()
+                        .get("x-routed-via")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(routed_model_from_header);
+                    ROUTED_MODEL.with(|slot| *slot.borrow_mut() = routed);
+                    break response;
+                }
                 Ok(mut response) => {
                     let status = response.status();
                     let text = response_preview(&mut response).await?;
@@ -1574,6 +1599,8 @@ struct ProviderConfig {
     provider_id: Option<String>,
     /// Catalog context window in tokens, when the provider declares one.
     context_window: Option<u64>,
+    /// Model for turns that carry attached images (`vision_model`).
+    vision_model: Option<String>,
 }
 
 // Manual so a panic or log line can never print the key.
@@ -1666,6 +1693,7 @@ fn resolve_provider(model_override: Option<String>) -> Result<ProviderConfig, St
         api_url,
         model,
         context_window: selected.as_ref().and_then(|p| p.context_window),
+        vision_model: selected.as_ref().and_then(|p| p.vision_model.clone()),
         provider_id: selected.map(|p| p.id),
     })
 }
@@ -2081,14 +2109,43 @@ fn request_body(
             }
         }
     }
+    if !prompt_cache_enabled() {
+        return json!({
+            "model": model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "tools": [tool],
+            "messages": messages,
+            "stream": true,
+        });
+    }
+    // Prompt caching: breakpoints after the tools, the system prompt, and the
+    // newest message, so each request reuses the whole previous prefix.
+    let cache = json!({"type": "ephemeral"});
+    let mut tool = tool.clone();
+    tool["cache_control"] = cache.clone();
+    if let Some(last) = messages.last_mut() {
+        if let Some(text) = last["content"].as_str().map(str::to_string) {
+            last["content"] = json!([{"type": "text", "text": text}]);
+        }
+        if let Some(block) = last["content"].as_array_mut().and_then(|blocks| blocks.last_mut()) {
+            block["cache_control"] = cache.clone();
+        }
+    }
     json!({
         "model": model,
         "max_tokens": max_tokens,
-        "system": system,
+        "system": [{"type": "text", "text": system, "cache_control": cache}],
         "tools": [tool],
         "messages": messages,
         "stream": true,
     })
+}
+
+/// Prompt-cache breakpoints are on unless `LAZAR_PROMPT_CACHE=0` (for a
+/// provider that rejects `cache_control`).
+fn prompt_cache_enabled() -> bool {
+    !env::var("LAZAR_PROMPT_CACHE").is_ok_and(|v| v.trim() == "0")
 }
 
 /// agent-stop hook, top level only.
@@ -2131,6 +2188,7 @@ pub(crate) fn run_agent(
         model,
         provider_id,
         context_window,
+        vision_model,
     } = provider;
     let limits = LoopLimits::from_env();
     let window = core::context::Window::resolve(context_window, limits.max_tokens);
@@ -2225,6 +2283,19 @@ pub(crate) fn run_agent(
         return Err(abort_invoke(format, &session_guard, "error", msg));
     }
     messages.push(json!({"role": "user", "content": &model_prompt}));
+    // Attached images go to the model as image blocks, on the provider's
+    // vision model when it names one.
+    let mut image_errors = Vec::new();
+    let requested_model = model.clone();
+    let model = match core::images::user_content(&model_prompt, &mut image_errors) {
+        Some(content) => {
+            if let Some(last) = messages.last_mut() {
+                last["content"] = content;
+            }
+            vision_model.clone().unwrap_or(model)
+        }
+        None => model,
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -2255,7 +2326,7 @@ pub(crate) fn run_agent(
     append_stream(json!({
         "kind": "invoke_start",
         "depth": depth,
-        "model": model,
+        "model": &requested_model,
         "provider": provider_id,
         "client": acp_client,
     }));
@@ -2274,11 +2345,18 @@ pub(crate) fn run_agent(
         emit_event(json!({
             "type": "invoke_start",
             "depth": depth,
-            "model": &model,
+            "model": &requested_model,
             "provider": &provider_id,
             "client": acp_client,
             "prompt": prompt,
         }));
+        // This turn only: the image went to the provider's vision model.
+        if model != requested_model {
+            emit_event(json!({"type": "vision_model", "model": &model}));
+        }
+        for error in &image_errors {
+            emit_event(json!({"type": "image_error", "error": error}));
+        }
     }
     if let Some(inv) = &skill {
         let event = json!({
@@ -2341,6 +2419,7 @@ pub(crate) fn run_agent(
         (!text.trim().is_empty()).then_some(text)
     };
 
+    CACHE_REPORTED.with(|flag| flag.set(false));
     let mut guard = core::guard::Guard::default();
     let mut guard_note: Option<String> = None;
     loop {
@@ -2380,7 +2459,7 @@ pub(crate) fn run_agent(
             push_user_text(&mut messages, &note);
         }
         let mut body = request_body(&model, limits.max_tokens, &system, &tool, &messages);
-        let body_len = body.to_string().len();
+        let body_len = core::images::weighted_len(&body);
         if body_len > window.compact_at {
             let overhead = body_len.saturating_sub(core::compact::bytes(&messages));
             let plan = CompactPlan {
@@ -2427,9 +2506,9 @@ pub(crate) fn run_agent(
                     if verbose {
                         eprintln!("[lazar] {msg}");
                     }
-                    if depth == 0 && msg.starts_with("API ") {
+                    if depth == 0 && provider_is_down(&msg) {
                         if let Some(outcome) = run_fallback(&messages, &msg, format) {
-                            let text = format!("[answered by {} — provider was down: {}]\n\n{}", outcome.agent, msg.chars().take(160).collect::<String>(), outcome.text);
+                            let text = format!("[answered by {} — provider error: {}]\n\n{}", outcome.agent, msg.chars().take(160).collect::<String>(), outcome.text);
                             append_stream(json!({"kind": "assistant", "content": [{"type": "text", "text": text}]}));
                             append_stream(json!({"kind": "invoke_end", "stop_reason": "end_turn", "fallback": &outcome.agent, "tool_calls": outcome.tool_calls}));
                             session_write_failed(format, &session_guard)?;
@@ -2453,7 +2532,9 @@ pub(crate) fn run_agent(
         if format == OutputFormat::StreamJson {
             // How full the window is after this request: status lines show it
             // as a percentage, and `lazar jobs` reads it from child logs.
-            let served = SERVED_MODEL.with(|slot| slot.borrow_mut().take());
+            let served = ROUTED_MODEL
+                .with(|slot| slot.borrow_mut().take())
+                .or_else(|| SERVED_MODEL.with(|slot| slot.borrow_mut().take()));
             emit_event(json!({
                 "type": "context",
                 "input_tokens": usage_in.saturating_add(cache_read),
@@ -2570,6 +2651,7 @@ pub(crate) fn run_agent(
                     "input_tokens": total_usage_in,
                     "output_tokens": total_usage_out,
                     "cache_read_input_tokens": total_cache_read,
+                    "cache_reported": CACHE_REPORTED.with(|flag| flag.get()),
                 }));
             } else if format == OutputFormat::Json {
                 let mut result = json!({
@@ -2785,6 +2867,17 @@ fn emit_phase(format: OutputFormat, phase: &str) {
     if format == OutputFormat::StreamJson {
         emit_event(json!({"type": "phase", "phase": phase}));
     }
+}
+
+/// A provider failure worth handing the turn to another agent: unreachable,
+/// timed out, overloaded (408/429/5xx), or out of quota. A 4xx rejection of
+/// the request itself (400/401/404…) is not an outage and is shown as is.
+fn provider_is_down(error: &str) -> bool {
+    if error.starts_with("API request failed") || is_final_provider_error(error) {
+        return true;
+    }
+    let status: Option<u16> = error.strip_prefix("API ").and_then(|rest| rest.split_whitespace().next()).and_then(|code| code.parse().ok());
+    matches!(status, Some(408 | 429 | 500..=599))
 }
 
 /// Hand the turn to the first available ACP agent (`[fallback]` in
@@ -3312,6 +3405,7 @@ mod tests {
         "LAZAR_HOME",
         "LAZAR_FALLBACK",
         "LAZAR_API_RETRIES",
+        "LAZAR_PROMPT_CACHE",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_BASE_URL",
         "MINIMAX_API_KEY",
@@ -3355,6 +3449,8 @@ mod tests {
             env::set_var("LAZAR_HOME", &home);
             // Never hand a test turn to a real Claude Code / Codex.
             env::set_var("LAZAR_FALLBACK", "0");
+            // Plain request bodies unless a test opts into cache breakpoints.
+            env::set_var("LAZAR_PROMPT_CACHE", "0");
             env::set_var("ANTHROPIC_API_KEY", "test-key");
             env::set_var("ANTHROPIC_BASE_URL", &api.base_url);
             Self {
@@ -3553,6 +3649,73 @@ mod tests {
         assert_eq!(parse_model_ids(&json!({"object":"list","data":[{"id":"gpt"}]})), vec!["gpt"]);
         assert_eq!(parse_model_ids(&json!(["x", {"id":"y"}])), vec!["x", "y"]);
         assert!(parse_model_ids(&json!({"error":"no"})).is_empty());
+    }
+
+    #[test]
+    fn routed_via_header_names_the_served_model() {
+        assert_eq!(routed_model_from_header("custom/qwen3.8-flash-next").as_deref(), Some("qwen3.8-flash-next"));
+        assert_eq!(
+            routed_model_from_header("openrouter/dots-studio/dots-3-note-preview:free").as_deref(),
+            Some("dots-studio/dots-3-note-preview:free")
+        );
+        assert_eq!(routed_model_from_header("nomodel"), None);
+    }
+
+    #[test]
+    fn only_real_outages_trigger_the_fallback() {
+        assert!(provider_is_down("API request failed: error sending request for url"));
+        assert!(provider_is_down("API 503 Service Unavailable: busy"));
+        assert!(provider_is_down("API 429 Too Many Requests: slow down"));
+        assert!(provider_is_down("API 402 Payment Required: You've hit your usage limit"));
+        assert!(!provider_is_down("API 400 Bad Request: All routed providers rejected the request as invalid"));
+        assert!(!provider_is_down("API 401 Unauthorized: bad key"));
+        assert!(!provider_is_down("API 404 Not Found: no such model"));
+    }
+
+    #[test]
+    fn attached_images_are_sent_as_blocks_on_the_vision_model() {
+        let api = FakeApi::serve(vec![sse_end_turn("red")]);
+        let test_env = AgentTestEnv::new("vision", &api);
+        fs::write(
+            test_env.home.join("providers.toml"),
+            format!(
+                "[[providers]]\nid = \"fake\"\nname = \"Fake\"\nbase_url = \"{}\"\nkey_env = \"FAKE_KEY\"\ndefault_model = \"chat\"\nvision_model = \"auto:images\"\n",
+                api.base_url
+            ),
+        )
+        .unwrap();
+        env::set_var("FAKE_KEY", "k");
+        env::set_var("LAZAR_PROVIDER", "fake");
+        let image = test_env.home.join("shot.png");
+        fs::write(&image, b"\x89PNG fake").unwrap();
+        let prompt = format!("what colour [Image #1: {}]", image.display());
+        run_agent(&prompt, OutputFormat::Json, false, None, AgentLifecycle::default()).unwrap();
+        env::remove_var("FAKE_KEY");
+        let request = &api.requests()[0];
+        assert_eq!(request["model"], "auto:images");
+        let content = request["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content.last().unwrap()["text"], prompt);
+    }
+
+    #[test]
+    fn requests_carry_prompt_cache_breakpoints() {
+        let api = FakeApi::serve(vec![sse_tool_use("true"), sse_end_turn("done")]);
+        let _test_env = AgentTestEnv::new("cache", &api);
+        env::remove_var("LAZAR_PROMPT_CACHE");
+        run_agent("hi", OutputFormat::Json, false, None, AgentLifecycle::default()).unwrap();
+        let requests = api.requests();
+        for request in &requests {
+            assert_eq!(request["system"][0]["cache_control"]["type"], "ephemeral", "{request}");
+            assert_eq!(request["tools"][0]["cache_control"]["type"], "ephemeral");
+            let last = request["messages"].as_array().unwrap().last().unwrap();
+            let block = last["content"].as_array().unwrap().last().unwrap();
+            assert_eq!(block["cache_control"]["type"], "ephemeral", "{last}");
+        }
+        // Only the newest message carries a breakpoint.
+        let first_message = &requests[1]["messages"][0]["content"];
+        assert!(first_message.to_string().find("cache_control").is_none(), "{first_message}");
     }
 
     #[test]

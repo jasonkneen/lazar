@@ -35,6 +35,10 @@ pub(crate) struct Provider {
     /// each turn — useful for router aliases like `auto`.
     #[serde(default)]
     pub show_served_model: bool,
+    /// Model used for a turn that carries attached images (e.g. freellmapi's
+    /// `auto:images` chain of vision models). Unset: the turn's own model.
+    #[serde(default)]
+    pub vision_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -208,6 +212,7 @@ pub(crate) struct Resolved {
     pub key_env: String,
     pub default_model: String,
     pub context_window: Option<u64>,
+    pub vision_model: Option<String>,
     pub api_key: Option<String>,
 }
 
@@ -229,6 +234,7 @@ pub(crate) fn resolve(
         key_env: provider.key_env.clone(),
         default_model: provider.default_model.clone(),
         context_window: provider.context_window,
+        vision_model: provider.vision_model.clone(),
         api_key: keys.lookup(&provider.key_env),
     })
 }
@@ -259,6 +265,7 @@ pub(crate) fn describe(catalog: &Catalog, keys: &dyn KeyStore) -> Vec<Value> {
                 "models": p.models,
                 "context_window": p.context_window,
                 "show_served_model": p.show_served_model,
+                "vision_model": p.vision_model,
             })
         })
         .collect()

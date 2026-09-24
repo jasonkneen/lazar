@@ -5,3 +5,4 @@ pub(crate) mod invocation;
 pub(crate) mod verify;
 pub(crate) mod guard;
 pub(crate) mod fallback;
+pub(crate) mod images;

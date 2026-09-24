@@ -34,8 +34,9 @@ pub(crate) const CONTINUE_PROMPT: &str = "[kernel: your previous reply stopped a
 pub(crate) const SUMMARY_SYSTEM_PROMPT: &str = "You compress an AI agent's working history so it can keep going with a smaller context. Write a dense, factual summary for the agent itself: the operator's goals and constraints, decisions made, what was tried and what happened (commands, files, key outputs, errors), current state, and what remains to do. Keep exact paths, identifiers, numbers and error text. No preamble, no advice.";
 
 /// Serialized size of a message list as it will appear in a request.
+/// Attached images count as their token cost, not their base64 size.
 pub(crate) fn bytes(messages: &[Value]) -> usize {
-    serde_json::to_string(messages).map(|s| s.len()).unwrap_or(0)
+    crate::core::images::weighted_len(&Value::Array(messages.to_vec()))
 }
 
 /// Keep the head and tail of `text` within `max` bytes, marking the gap.
