@@ -20,6 +20,8 @@ pub struct Composer {
     history: Vec<String>,
     history_pos: Option<usize>,
     draft: Option<Vec<String>>,
+    /// Dropped/pasted files shown as one `[Image #N]` / `[File #N]` token each.
+    attachments: Vec<(String, std::path::PathBuf)>,
 }
 
 impl Composer {
@@ -30,6 +32,7 @@ impl Composer {
             history,
             history_pos: None,
             draft: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -109,6 +112,58 @@ impl Composer {
         self.cursor = (0, 0);
         self.history_pos = None;
         self.draft = None;
+        self.attachments.clear();
+    }
+
+    /// Insert a file as one token: `[Image #N]` for images, `[File #N]`
+    /// otherwise. Numbers keep counting up within a prompt.
+    pub fn attach(&mut self, path: std::path::PathBuf) {
+        let image = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff"));
+        let n = self.attachments.len() + 1;
+        let token = if image { format!("[Image #{n}]") } else { format!("[File #{n}]") };
+        self.insert_str(&token);
+        self.insert_str(" ");
+        self.attachments.push((token, path));
+    }
+
+    /// Paste handling: when every pasted item is an existing file (a
+    /// drag-and-drop), attach each; otherwise insert the text as typed.
+    pub fn paste(&mut self, text: &str) {
+        match dropped_paths(text) {
+            Some(paths) => paths.into_iter().for_each(|p| self.attach(p)),
+            None => self.insert_str(text),
+        }
+    }
+
+    /// Prompt text with each token spelled out as `[Image #1: /path]`.
+    pub fn expand_attachments(&self, text: &str) -> String {
+        self.attachments.iter().fold(text.to_string(), |acc, (token, path)| {
+            let spelled = format!("{}: {}]", token.trim_end_matches(']'), path.display());
+            acc.replace(token.as_str(), &spelled)
+        })
+    }
+
+    /// The attachment token ending exactly at the cursor, if any.
+    fn token_before_cursor(&self) -> Option<usize> {
+        let (row, col) = self.cursor;
+        let before: String = self.lines[row].chars().take(col).collect();
+        self.attachments
+            .iter()
+            .find(|(token, _)| before.ends_with(token.as_str()))
+            .map(|(token, _)| token.chars().count())
+    }
+
+    /// The attachment token starting exactly at the cursor, if any.
+    fn token_after_cursor(&self) -> Option<usize> {
+        let (row, col) = self.cursor;
+        let after: String = self.lines[row].chars().skip(col).collect();
+        self.attachments
+            .iter()
+            .find(|(token, _)| after.starts_with(token.as_str()))
+            .map(|(token, _)| token.chars().count())
     }
 
     fn line_len(&self, idx: usize) -> usize {
@@ -152,6 +207,14 @@ impl Composer {
     }
 
     pub fn backspace(&mut self) {
+        if let Some(len) = self.token_before_cursor() {
+            let (row, col) = self.cursor;
+            let start = Self::byte_index(&self.lines[row], col - len);
+            let end = Self::byte_index(&self.lines[row], col);
+            self.lines[row].replace_range(start..end, "");
+            self.cursor.1 -= len;
+            return;
+        }
         let (row, col) = self.cursor;
         if col > 0 {
             let at = Self::byte_index(&self.lines[row], col - 1);
@@ -166,6 +229,13 @@ impl Composer {
     }
 
     pub fn delete(&mut self) {
+        if let Some(len) = self.token_after_cursor() {
+            let (row, col) = self.cursor;
+            let start = Self::byte_index(&self.lines[row], col);
+            let end = Self::byte_index(&self.lines[row], col + len);
+            self.lines[row].replace_range(start..end, "");
+            return;
+        }
         let (row, col) = self.cursor;
         if col < self.line_len(row) {
             let at = Self::byte_index(&self.lines[row], col);
@@ -358,6 +428,51 @@ impl Composer {
     }
 }
 
+/// Files dropped onto the terminal arrive as pasted paths: space-separated,
+/// with spaces backslash-escaped or the path quoted. `Some` only when every
+/// item is an existing file, so ordinary pasted text is never swallowed.
+fn dropped_paths(text: &str) -> Option<Vec<std::path::PathBuf>> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.trim().chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    items.push(std::mem::take(&mut current));
+                }
+            }
+            (_, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        items.push(current);
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    items
+        .into_iter()
+        .map(|item| {
+            let item = item.strip_prefix("file://").unwrap_or(&item).to_string();
+            let path = match (item.strip_prefix("~/"), &home) {
+                (Some(rest), Some(home)) => home.join(rest),
+                _ => std::path::PathBuf::from(&item),
+            };
+            (path.is_absolute() && path.is_file()).then_some(path)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +558,36 @@ mod tests {
             HISTORY_LIMIT,
             "identical consecutive entry not duplicated"
         );
+    }
+
+    #[test]
+    fn dropped_files_become_single_tokens_deleted_in_one_keystroke() {
+        let dir = std::env::temp_dir().join(format!("lazartui-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shot = dir.join("Screen Shot.png");
+        let notes = dir.join("notes.md");
+        std::fs::write(&shot, b"x").unwrap();
+        std::fs::write(&notes, b"x").unwrap();
+        let mut c = Composer::new(Vec::new());
+        c.insert_str("look at ");
+        c.paste(&format!("{} '{}'", shot.display().to_string().replace(' ', "\\ "), notes.display()));
+        assert_eq!(c.text(), "look at [Image #1] [File #2] ");
+        let sent = c.expand_attachments(&c.text());
+        assert!(sent.contains(&format!("[Image #1: {}]", shot.display())), "{sent}");
+        assert!(sent.contains(&format!("[File #2: {}]", notes.display())), "{sent}");
+        c.backspace(); // the trailing space
+        c.backspace(); // the whole [File #2]
+        assert_eq!(c.text(), "look at [Image #1] ");
+        c.backspace();
+        c.backspace();
+        assert_eq!(c.text(), "look at ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_pasted_text_is_not_treated_as_files() {
+        let mut c = Composer::new(Vec::new());
+        c.paste("hello /definitely/not/a/file.png");
+        assert_eq!(c.text(), "hello /definitely/not/a/file.png");
     }
 }

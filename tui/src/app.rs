@@ -82,6 +82,8 @@ pub struct App {
     ready: bool,
     effective_sandbox_off: bool,
     turn_running: bool,
+    /// A `/model` choice made mid-turn, applied when the turn ends.
+    pending_model: Option<String>,
     queued: Option<String>,
     scroll_from_bottom: usize,
     previous_visual_lines: usize,
@@ -252,6 +254,7 @@ impl App {
             ready: false,
             effective_sandbox_off: false,
             turn_running: false,
+            pending_model: None,
             queued: None,
             scroll_from_bottom: 0,
             previous_visual_lines: 0,
@@ -495,7 +498,7 @@ impl App {
 
     pub fn paste(&mut self, text: &str) {
         if self.overlay.is_none() {
-            self.composer.insert_str(text);
+            self.composer.paste(text);
         }
     }
 
@@ -1161,7 +1164,7 @@ impl App {
             self.composer.take();
             return;
         }
-        let text = self.expand_skill(raw);
+        let text = self.expand_skill(self.composer.expand_attachments(&raw));
         if let Some(notice) = prompt_limit_notice(&text) {
             self.notice = notice;
             return;
@@ -1681,11 +1684,14 @@ impl App {
     }
 
     fn switch_model(&mut self, model: String) {
-        if self.turn_running {
-            self.notice = "cancel the running turn before switching model".into();
+        if model.trim().is_empty() {
             return;
         }
-        if model.trim().is_empty() {
+        if self.turn_running {
+            // Switching restarts the kernel, which would kill the turn: queue it.
+            self.transcript.push_marker(format!("model → {model} when this turn ends"));
+            self.notice = format!("model will switch to {model} after this turn");
+            self.pending_model = Some(model);
             return;
         }
         self.model = Some(model.clone());
@@ -1799,6 +1805,9 @@ impl App {
                 self.phase = None;
                 self.status = stop_reason;
                 self.persist();
+                if let Some(model) = self.pending_model.take() {
+                    self.switch_model(model);
+                }
             }
             KernelEvent::PromptAccepted(text) => {
                 self.transcript.push_user(text);
@@ -1822,6 +1831,9 @@ impl App {
                 self.turn_started = None;
                 self.phase = None;
                 self.error(err);
+                if let Some(model) = self.pending_model.take() {
+                    self.switch_model(model);
+                }
             }
         }
     }
@@ -1991,9 +2003,24 @@ impl App {
                 self.transcript
                     .push_marker(format!("provider error, retry {attempt}/{of} in {secs:.0}s · {reason}"));
             }
+            "vision_model" => {
+                let model = event.get("model").and_then(Value::as_str).unwrap_or("?");
+                self.transcript.push_marker(format!("image attached · this turn on {model}"));
+            }
+            "image_error" => {
+                let error = event.get("error").and_then(Value::as_str).unwrap_or("");
+                self.transcript.push_marker(format!("image not sent · {error}"));
+            }
+            "session_reset" => {
+                let detail = event.get("detail").and_then(Value::as_str).unwrap_or("");
+                self.transcript
+                    .push_marker(format!("could not reload the previous session ({detail}) · started a new one"));
+            }
             "fallback" => {
                 let agent = event.get("agent").and_then(Value::as_str).unwrap_or("?");
-                self.transcript.push_marker(format!("provider down · handing this turn to {agent}"));
+                let error = event.get("error").and_then(Value::as_str).unwrap_or("");
+                let reason: String = error.split(':').next().unwrap_or("provider error").chars().take(60).collect();
+                self.transcript.push_marker(format!("{reason} · handing this turn to {agent}"));
             }
             "fallback_failed" => {
                 let agent = event.get("agent").and_then(Value::as_str).unwrap_or("?");
@@ -2031,7 +2058,11 @@ impl App {
         let input = event.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
         let cached = event.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
         let total = input.saturating_add(cached);
-        Some(if total == 0 {
+        // A provider (or proxy) that never sends cache usage is "n/a", not 0%.
+        let reported = event.get("cache_reported").and_then(Value::as_bool).unwrap_or(true);
+        Some(if !reported {
+            format!("{served}  cache n/a")
+        } else if total == 0 {
             served
         } else {
             format!("{served}  cache {}%", cached * 100 / total)
@@ -2867,20 +2898,24 @@ mod tests {
         assert!(app.transcript.blocks.iter().any(|b| matches!(
             b, crate::transcript::Block::Marker { text } if text == "gpt-6-sol-high  cache 95%"
         )), "{:?}", app.transcript.blocks);
+        app.handle_lazar_event(serde_json::json!({"type":"invoke_end","input_tokens":5,"cache_read_input_tokens":0,"cache_reported":false}));
+        assert!(app.transcript.blocks.iter().any(|b| matches!(
+            b, crate::transcript::Block::Marker { text } if text == "gpt-6-sol-high  cache n/a"
+        )));
         app.handle_lazar_event(serde_json::json!({"type":"api_retry","attempt":1,"of":3,"delay_ms":2000,"error":"API 502 Bad Gateway"}));
         assert!(app.transcript.blocks.iter().any(|b| matches!(
             b, crate::transcript::Block::Marker { text } if text.starts_with("provider error, retry 1/3 in 2s")
         )));
         app.handle_lazar_event(serde_json::json!({"type":"fallback","agent":"claude-code-acp","error":"API 503"}));
         assert!(app.transcript.blocks.iter().any(|b| matches!(
-            b, crate::transcript::Block::Marker { text } if text == "provider down · handing this turn to claude-code-acp"
+            b, crate::transcript::Block::Marker { text } if text == "API 503 · handing this turn to claude-code-acp"
         )));
         app.provider = None;
         app.turn_running = true;
 
         app.switch_model("new-model".into());
-        assert_eq!(app.model.as_deref(), Some("original-model"));
-        assert!(app.notice.contains("running turn"));
+        assert_eq!(app.model.as_deref(), Some("original-model"), "not mid-turn");
+        assert_eq!(app.pending_model.as_deref(), Some("new-model"), "queued for the turn's end");
 
         app.grant_directory(root.clone(), Scope::Always);
         assert!(app.access.session_dirs.is_empty());
@@ -2892,10 +2927,14 @@ mod tests {
         assert!(app.effective_sandbox_off);
         app.handle_lazar_event(serde_json::json!({"type":"access_mode","unsandboxed":false}));
         assert!(!app.effective_sandbox_off);
+        app.handle_kernel_event(KernelEvent::TurnFinished { stop_reason: "end_turn".into() });
+        assert_eq!(app.model.as_deref(), Some("new-model"), "applied when the turn ends");
+        assert!(app.pending_model.is_none());
+        app.turn_running = true;
 
         app.switch_provider("alternate".into());
         assert_eq!(app.provider, None);
-        assert_eq!(app.model.as_deref(), Some("original-model"));
+        assert_eq!(app.model.as_deref(), Some("new-model"));
         assert!(app.notice.contains("running turn"));
 
         drop(app);

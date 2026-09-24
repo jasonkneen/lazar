@@ -522,6 +522,7 @@ fn handle_wire(state: &mut WorkerState, message: Value, events: &Sender<KernelEv
         if matches!(pending, Pending::ListSessions) {
             let _ = events.send(KernelEvent::Notice(detail.to_string()));
         } else if matches!(pending, Pending::LoadSession { fallback_new: true }) {
+            let _ = events.send(KernelEvent::Lazar(serde_json::json!({"type": "session_reset", "detail": detail})));
             state.session_id = None;
             let params = state.session_params(None);
             if let Err(err) = state.request("session/new", params, Pending::NewSession) {
