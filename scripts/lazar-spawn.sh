@@ -188,19 +188,23 @@ JOB_ID="${TASK_ID}-$(date +%s)-$$"
 JOB_FILE="$JOB_DIR/$JOB_ID.json"
 
 run_child_fg(){
-  python3 "$TIMEOUT_RUNNER" --timeout "$KILL_AFTER" -- env LAZAR_DEPTH="$CHILD_DEPTH" "$LAZAR_BIN" -p "$PROMPT" --output-format stream-json
+  python3 "$TIMEOUT_RUNNER" --timeout "$KILL_AFTER" -- env LAZAR_DEPTH="$CHILD_DEPTH" LAZAR_SPAWNED=1 "$LAZAR_BIN" -p "$PROMPT" --output-format stream-json
 }
 
 # Write the final job record. $1 = matched (true|false), $2 = child rc,
 # $3 = failed-claims JSON array (only read when matched=false).
 finish_job(){
-  local matched="$1" rc="$2" failed_json="$3"
+  local matched="$1" rc="$2" failed_json="$3" started
+  # Keep the start time from the running record so `lazar jobs` can report
+  # how long a finished job took.
+  started=$(jq '.started_ms // null' "$JOB_FILE" 2>/dev/null || echo null)
+  [ -n "$started" ] || started=null
   if [ "$matched" = "true" ] && [ "$rc" -eq 0 ]; then
-    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" \
-      '{status:"ok",job_id:$id,task:$task,matched:true,child_rc:$rc,output:$out}' >"$JOB_FILE"
+    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" --argjson started "$started" \
+      '{status:"ok",job_id:$id,task:$task,matched:true,child_rc:$rc,output:$out,started_ms:$started}' >"$JOB_FILE"
   else
-    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" --argjson failed "$failed_json" \
-      '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out}' >"$JOB_FILE"
+    jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson rc "$rc" --arg out "$OUTFILE" --argjson failed "$failed_json" --argjson started "$started" \
+      '{status:"fail",job_id:$id,task:$task,matched:false,child_rc:$rc,failed_claims:$failed,output:$out,started_ms:$started}' >"$JOB_FILE"
   fi
 }
 
@@ -220,7 +224,7 @@ if [ "$DETACH" = "1" ]; then
     --arg failure_file "$CFILE" --arg claims "$CLAIMS_FILE" --arg runner "$TIMEOUT_RUNNER" --arg binary "$LAZAR_BIN" --arg verifier "$VERIFY_BIN" \
     --arg prompt "$PROMPT" --arg depth "$CHILD_DEPTH" --argjson timeout "$KILL_AFTER" \
     '{id:$id,task:$task,output:$output,claims:$claims,runner:$runner,verifier:$verifier,timeout:$timeout,failure_file:$failure_file,
-      argv:["env",("LAZAR_DEPTH="+$depth),$binary,"-p",$prompt,"--output-format","stream-json"]}' >"${JOB_FILE%.json}.spec.json"
+      argv:["env",("LAZAR_DEPTH="+$depth),"LAZAR_SPAWNED=1",$binary,"-p",$prompt,"--output-format","stream-json"]}' >"${JOB_FILE%.json}.spec.json"
   jq -n --arg id "$JOB_ID" '{status:"starting",job_id:$id}' >"$JOB_FILE"
   BG_PID=$(python3 "$SUPERVISOR" --detach "$JOB_FILE") || emit_err "cannot start job supervisor"
   jq -cn --arg id "$JOB_ID" --arg task "$TASK_ID" --argjson pid "$BG_PID" --arg output "$OUTFILE" \
@@ -228,6 +232,10 @@ if [ "$DETACH" = "1" ]; then
   exit 0
 fi
 
+# A running record lets `lazar jobs` (and the TUI footer) show live children.
+jq -n --arg id "$JOB_ID" --arg task "$TASK_ID" --arg output "$OUTFILE" --argjson pid "$$" \
+  --argjson started "$(python3 -c 'import time; print(int(time.time()*1000))')" \
+  '{status:"running",job_id:$id,task:$task,pid:$pid,output:$output,started_ms:$started}' >"$JOB_FILE"
 run_child_fg >"$OUTFILE" 2>/dev/null; RC=$?
 if [ "$RC" -eq 124 ]; then python3 "$HELPER_DIR/spawn-supervisor.py" --failure "$CFILE"; emit_err "child timed out after ${KILL_AFTER}s (wedged) — killed"; fi
 

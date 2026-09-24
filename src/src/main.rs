@@ -28,6 +28,7 @@ mod hooks;
 mod log;
 mod providers;
 mod session;
+mod jobs;
 mod skill;
 mod spawn;
 mod text;
@@ -261,6 +262,11 @@ struct Args {
     #[command(subcommand)]
     command: Option<Command>,
 
+    /// `structured`: end every answer with a typed record (reply, speech,
+    /// sources, verification) for rich clients. Default `raw`.
+    #[arg(long, value_name = "raw|structured", value_parser = ["raw", "structured"])]
+    answer_format: Option<String>,
+
     /// Prompt for the agent.
     #[arg(short, long, conflicts_with = "reset_all")]
     prompt: Option<String>,
@@ -343,6 +349,21 @@ enum Command {
     /// List the provider catalog ($LAZAR_HOME/providers.toml). Never prints secrets.
     Providers {
         /// Emit JSON (one object per provider) for front ends.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Running and recently finished sub-agent jobs (lazar-spawn) as JSON.
+    Jobs {
+        /// Print one job's record and timeline instead of the list.
+        #[arg(long, value_name = "JOB_ID")]
+        show: Option<String>,
+        /// Include jobs finished within this many seconds (default 600).
+        #[arg(long, value_name = "SECS")]
+        since: Option<u64>,
+    },
+    /// List installed skills ($LAZAR_HOME/user/skills) for pickers.
+    Skills {
+        /// Emit JSON (one object per skill).
         #[arg(long)]
         json: bool,
     },
@@ -762,6 +783,11 @@ fn active_provider_credential(current_depth: u32) -> Option<(String, String)> {
 }
 
 thread_local! {
+    /// Model id the provider reported in the latest `message_start`. Routers
+    /// such as an `auto` model name the model that actually answered here.
+    static SERVED_MODEL: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
     static EVENT_SINK: std::cell::RefCell<Option<UnboundedSender<Value>>> = const {
         std::cell::RefCell::new(None)
     };
@@ -915,6 +941,9 @@ impl SseMessage {
                     .into());
                 }
                 self.account(initial_bytes)?;
+                if block["type"] == "thinking" && format == OutputFormat::StreamJson {
+                    emit_event(json!({"type": "phase", "phase": "reasoning"}));
+                }
                 if block["type"] == "tool_use" {
                     self.open_tool_blocks.insert(idx);
                 }
@@ -1015,6 +1044,9 @@ impl SseMessage {
                 }
             }
             "message_start" => {
+                if let Some(served) = v["message"]["model"].as_str().filter(|m| !m.is_empty()) {
+                    SERVED_MODEL.with(|slot| *slot.borrow_mut() = Some(served.to_string()));
+                }
                 // Anthropic reports input_tokens here; message_delta usually
                 // carries only the (cumulative) output_tokens.
                 if let Some(u) = v["message"].get("usage") {
@@ -1527,8 +1559,10 @@ fn resolve_provider(model_override: Option<String>) -> Result<ProviderConfig, St
                 .and_then(|d| d.parse().ok())
                 .unwrap_or(0);
             let catalog = providers::Catalog::load(&lazar_home())?;
+            // A child started by the trusted lazar-spawn reads the Keychain
+            // itself, so the key never has to sit in a tool's environment.
             let keys = providers::EnvThenKeychain {
-                allow_keychain: depth == 0,
+                allow_keychain: depth == 0 || env::var("LAZAR_SPAWNED").as_deref() == Ok("1"),
             };
             Some(providers::resolve(&catalog, &id, &keys)?)
         }
@@ -1760,7 +1794,11 @@ fn execute_tool_use(block: &Value, depth: u32, verbose: bool, format: OutputForm
     let mut executed_command: Option<String> = None;
     let mut kernel_exit_code = 1_i32;
 
-    let output = if command_invokes_raw_lazar(cmd) {
+    let output = if command_hunts_credentials(cmd) {
+        kernel_exit_code = 1;
+        "[vetoed: reading stored credentials (Keychain, process environments, env dumps of keys/tokens) is blocked. If a key or token is missing, stop and tell the operator which one and where it is expected — do not search for it.]\n[exit 1]"
+            .to_string()
+    } else if command_invokes_raw_lazar(cmd) {
         kernel_exit_code = 1;
         "[vetoed: raw `lazar -p` spawns are disabled — delegate via locked bin: bash $LAZAR_HOME/bin/lazar-spawn <task-id> <prompt-file>]\n[exit 1]"
             .to_string()
@@ -1893,6 +1931,27 @@ fn command_invokes_raw_lazar(command: &str) -> bool {
     false
 }
 
+/// Commands whose purpose is reading stored secrets: Keychain dumps, another
+/// process's environment, or an env listing filtered for keys and tokens.
+/// A model that hits a missing credential must report it, not go looking.
+fn command_hunts_credentials(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    let keychain = lower.contains("security ")
+        && ["find-generic-password", "find-internet-password", "dump-keychain", "export -k"]
+            .iter()
+            .any(|verb| lower.contains(verb));
+    let process_env = lower.contains("/proc/") && lower.contains("environ");
+    let squashed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lists_env = ["printenv", "env |", "env|", "export -p", "set |", "declare -p", "declare -x"]
+        .iter()
+        .any(|listing| squashed.contains(listing));
+    let filters_secrets = lower.contains("grep")
+        && ["key", "token", "secret", "passw", "credential"]
+            .iter()
+            .any(|needle| lower.contains(needle));
+    keychain || process_env || (lists_env && filters_secrets)
+}
+
 fn prompt_flag_in_tokens(after_name: &str) -> bool {
     after_name.split_whitespace().any(|token| {
         let token = token.trim_matches(|ch: char| matches!(ch, '"' | '\'' | ';' | '&' | '|'));
@@ -2013,6 +2072,7 @@ pub(crate) fn run_agent(
         &api_url,
         provider_id.as_deref(),
     ) {
+        Ok(system) if core::answer::enabled() => format!("{system}\n\n{}", core::answer::PROMPT_SECTION),
         Ok(system) => system,
         Err(msg) => return Err(abort_invoke(format, &session_guard, "error", msg)),
     };
@@ -2163,6 +2223,8 @@ pub(crate) fn run_agent(
     // next successful request.
     let mut overflow_retried = false;
     let mut verify_attempts: u32 = 0;
+    // What the final answer's verification concluded, for the answer record.
+    let mut verify_summary = json!({"status": "none", "claims": 0});
     let summary_tokens = limits.max_tokens.min(4_096);
     let mut summarise = |transcript: &str| -> Option<String> {
         let body = json!({
@@ -2211,6 +2273,7 @@ pub(crate) fn run_agent(
             body = request_body(&model, limits.max_tokens, &system, &tool, &messages);
         }
 
+        emit_phase(format, "thinking");
         let (content, stop_reason_str, usage_in, usage_out, cache_read) =
             match http_runtime.block_on(request_model(
                 &client,
@@ -2251,6 +2314,19 @@ pub(crate) fn run_agent(
         total_usage_in = total_usage_in.saturating_add(usage_in);
         total_usage_out = total_usage_out.saturating_add(usage_out);
         total_cache_read = total_cache_read.saturating_add(cache_read);
+        if format == OutputFormat::StreamJson {
+            // How full the window is after this request: status lines show it
+            // as a percentage, and `lazar jobs` reads it from child logs.
+            let served = SERVED_MODEL.with(|slot| slot.borrow_mut().take());
+            emit_event(json!({
+                "type": "context",
+                "input_tokens": usage_in.saturating_add(cache_read),
+                "output_tokens": usage_out,
+                "window": window.tokens,
+                "model": &model,
+                "served_model": served.unwrap_or_else(|| model.clone()),
+            }));
+        }
         if stop_reason_str == "model_context_window_exceeded" && !overflow_retried {
             overflow_retried = true;
             let current = core::compact::bytes(&messages);
@@ -2272,6 +2348,7 @@ pub(crate) fn run_agent(
             // Grounded verification: claims in the answer are checked against
             // the real filesystem before the turn is allowed to end.
             if let Some(parsed) = core::verify::extract_block(&final_answer_text(&messages)) {
+                emit_phase(format, "verifying");
                 let outcomes = match parsed {
                     Ok(lines) => core::verify::check_all(&lines, access::current().tool_cwd()),
                     Err(detail) => vec![core::verify::Outcome {
@@ -2309,11 +2386,29 @@ pub(crate) fn run_agent(
                     let msg = core::verify::failure_message(&outcomes);
                     return Err(abort_invoke(format, &session_guard, "grounding_failed", msg));
                 }
+                verify_summary = json!({"status": "passed", "claims": outcomes.len()});
             }
         }
 
         if is_terminal_stop_reason(stop_reason) {
             let final_text = text::extract_text(&content);
+            let answer = core::answer::enabled().then(|| {
+                core::answer::build(
+                    &final_answer_text(&messages),
+                    access::current().tool_cwd(),
+                    verify_summary.clone(),
+                )
+            });
+            if let Some(answer) = &answer {
+                let mut logged = answer.clone();
+                logged["kind"] = json!("answer");
+                append_stream(logged);
+                if format == OutputFormat::StreamJson {
+                    let mut emitted = answer.clone();
+                    emitted["type"] = json!("answer");
+                    emit_event(emitted);
+                }
+            }
             let duration_ms = started.elapsed().as_millis();
             fire_agent_stop(depth, stop_reason, duration_ms);
 
@@ -2335,7 +2430,7 @@ pub(crate) fn run_agent(
                     "output_tokens": total_usage_out,
                 }));
             } else if format == OutputFormat::Json {
-                let result = json!({
+                let mut result = json!({
                     "type": "result",
                     "stop_reason": stop_reason,
                     "model": &model,
@@ -2345,6 +2440,9 @@ pub(crate) fn run_agent(
                     "input_tokens": total_usage_in,
                     "output_tokens": total_usage_out,
                 });
+                if let Some(answer) = answer {
+                    result["answer"] = answer;
+                }
                 println!("{result}");
             }
 
@@ -2450,6 +2548,7 @@ fn compact_messages(
     format: OutputFormat,
 ) -> Result<(), String> {
     use core::compact;
+    emit_phase(format, "compacting");
     let before = compact::bytes(messages);
     let fits = |m: &Vec<Value>| compact::bytes(m) <= plan.ceiling;
     let mut stage = "elide";
@@ -2531,6 +2630,15 @@ fn run_verify(lint: bool) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     } else {
         std::process::exit(1)
+    }
+}
+
+/// Announce what the turn is doing that a client cannot see from the stream:
+/// waiting on the model, compacting, verifying. Text streaming and tool calls
+/// already arrive as their own events.
+fn emit_phase(format: OutputFormat, phase: &str) {
+    if format == OutputFormat::StreamJson {
+        emit_event(json!({"type": "phase", "phase": phase}));
     }
 }
 
@@ -2634,10 +2742,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Acp(acp_args)) => return acp::run(acp_args),
         Some(Command::Providers { json }) => return print_providers(json),
         Some(Command::Verify { lint }) => return run_verify(lint),
+        Some(Command::Jobs { show, since }) => {
+            let recent = since.map_or(jobs::RECENT_MS, |secs| u128::from(secs) * 1000);
+            let dir = user_dir("workspace").join("subagent").join("jobs");
+            match show {
+                Some(id) => match jobs::detail(&dir, &id, now_millis()) {
+                    Some(detail) => println!("{detail}"),
+                    None => return Err(format!("no job with id {id}").into()),
+                },
+                None => println!("{}", Value::Array(jobs::list(&dir, now_millis(), recent))),
+            }
+            return Ok(());
+        }
+        Some(Command::Skills { json }) => {
+            let skills = skill::list(&user_dir("skills"));
+            if json {
+                let rows: Vec<Value> = skills
+                    .iter()
+                    .map(|s| json!({"name": s.name, "description": s.description}))
+                    .collect();
+                println!("{}", Value::Array(rows));
+            } else {
+                for s in &skills {
+                    println!("{:<28} {}", s.name, s.description);
+                }
+            }
+            return Ok(());
+        }
         None => {}
     }
     if let Some(provider) = args.provider.as_deref() {
         env::set_var("LAZAR_PROVIDER", provider);
+    }
+    if let Some(format) = args.answer_format.as_deref() {
+        env::set_var("LAZAR_ANSWER_FORMAT", format);
     }
     if let Some(model) = args.model.as_deref() {
         env::set_var("LAZAR_MODEL", model);
@@ -3233,6 +3371,33 @@ mod tests {
     }
 
     #[test]
+    fn structured_answers_carry_reply_speech_sources_and_verification() {
+        let api = FakeApi::serve(vec![
+            sse_tool_use("printf hi > \"$LAZAR_WORKSPACE/a.txt\""),
+            sse_end_turn("Wrote a.txt.\n[SPEAK]\nI wrote the file.\n[/SPEAK]\n[SOURCES]\n$LAZAR_HOME/user/workspace/a.txt\n[/SOURCES]\n[VERIFY]\ncontains=$LAZAR_HOME/user/workspace/a.txt:hi\n[/VERIFY]"),
+        ]);
+        let test_env = AgentTestEnv::new("answer", &api);
+        let _format = crate::test_support::EnvSnapshot::capture(&["LAZAR_ANSWER_FORMAT"]);
+        env::set_var("LAZAR_ANSWER_FORMAT", "structured");
+        run_agent("write a", OutputFormat::Json, false, None, AgentLifecycle::default())
+            .expect("structured turn");
+        assert!(api.requests()[0]["system"].as_str().unwrap().contains("ANSWER FORMAT"));
+        let answer = test_env.log_events().into_iter().find(|e| e["kind"] == "answer").unwrap();
+        assert_eq!(answer["reply"], "Wrote a.txt.");
+        assert_eq!(answer["speech"], "I wrote the file.");
+        assert_eq!(answer["sources"][0]["exists"], true);
+        assert_eq!(answer["verify"], json!({"status": "passed", "claims": 1}));
+
+        // Raw mode (the default) adds no contract and no record.
+        env::remove_var("LAZAR_ANSWER_FORMAT");
+        let raw = FakeApi::serve(vec![sse_end_turn("hello")]);
+        env::set_var("ANTHROPIC_BASE_URL", &raw.base_url);
+        run_agent("hi", OutputFormat::Json, false, None, AgentLifecycle::default()).unwrap();
+        assert!(!raw.requests()[0]["system"].as_str().unwrap().contains("ANSWER FORMAT"));
+        assert_eq!(test_env.log_events().iter().filter(|e| e["kind"] == "answer").count(), 1);
+    }
+
+    #[test]
     fn output_limit_cut_is_continued_not_failed() {
         let api = FakeApi::serve(vec![
             sse_text_stop("part one", "max_tokens"),
@@ -3321,6 +3486,24 @@ mod tests {
     #[test]
     fn raw_lazar_prompt_is_refused_by_the_dispatcher() {
         assert!(command_invokes_raw_lazar("lazar -p hi"));
+        // Credential hunting is refused; ordinary env use is not.
+        for hunt in [
+            "security find-generic-password -a FREELLM_API_KEY -s lazar -w",
+            "cat /proc/$$/environ | tr '\\0' '\\n'",
+            "env | grep -i API_KEY",
+            "printenv | grep TOKEN",
+        ] {
+            assert!(command_hunts_credentials(hunt), "{hunt}");
+        }
+        for fine in [
+            "env | grep PATH",
+            "echo $HOME",
+            "grep -r key_env src/",
+            "export PATH=/x:$PATH; grep -r token src/",
+            "cargo test",
+        ] {
+            assert!(!command_hunts_credentials(fine), "{fine}");
+        }
         assert!(command_invokes_raw_lazar("echo done; lazar --prompt=hi"));
         assert!(!command_invokes_raw_lazar("bash $LAZAR_HOME/bin/lazar-spawn t1 prompt.txt"));
 
@@ -3970,6 +4153,18 @@ data: {"type":"message_stop"}
         let data = format!("data: {event}\n");
         let err = parse_sse_reader(Cursor::new(data.as_bytes()), OutputFormat::Json).unwrap_err();
         assert!(err.to_string().contains("per-item limit"));
+    }
+
+    #[test]
+    fn sse_parser_records_the_model_a_router_actually_served() {
+        SERVED_MODEL.with(|slot| *slot.borrow_mut() = None);
+        let data = format!(
+            "data: {}\ndata: {}\n",
+            json!({"type":"message_start","message":{"model":"glm-4.6","usage":{"input_tokens":1}}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        );
+        parse_sse_reader(Cursor::new(data.as_bytes()), OutputFormat::Json).unwrap();
+        assert_eq!(SERVED_MODEL.with(|slot| slot.borrow().clone()).as_deref(), Some("glm-4.6"));
     }
 
     #[test]

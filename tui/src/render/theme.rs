@@ -15,21 +15,67 @@ pub enum IconMode {
 }
 
 impl IconMode {
-    fn from_env() -> Self {
-        if let Ok(value) = std::env::var("LAZARTUI_ICONS") {
-            match value.to_ascii_lowercase().as_str() {
-                "nerd" => return Self::Nerd,
-                "ascii" => return Self::Ascii,
-                "unicode" => return Self::Unicode,
-                _ => {}
-            }
+    /// Parses the same names accepted by `LAZARTUI_ICONS`, `/icons`, and the
+    /// persisted preference: `nerd`, `unicode`, `ascii`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "nerd" => Some(Self::Nerd),
+            "ascii" => Some(Self::Ascii),
+            "unicode" => Some(Self::Unicode),
+            _ => None,
         }
+    }
+
+    /// `LAZARTUI_ICONS`, then `persisted` (the `/icons` preference), then
+    /// auto-detection (`LAZARTUI_ASCII`, an installed Nerd Font, else
+    /// Unicode).
+    pub fn resolve(persisted: Option<&str>) -> Self {
+        std::env::var("LAZARTUI_ICONS")
+            .ok()
+            .and_then(|v| Self::from_name(&v))
+            .or_else(|| persisted.and_then(Self::from_name))
+            .unwrap_or_else(Self::autodetect)
+    }
+
+    fn autodetect() -> Self {
         if std::env::var("LAZARTUI_ASCII").as_deref() == Ok("1") {
             Self::Ascii
+        } else if nerd_font_installed() {
+            Self::Nerd
         } else {
             Self::Unicode
         }
     }
+}
+
+/// True when a Nerd Font is installed in a standard font directory. This is
+/// what is installed, not what the terminal uses; LAZARTUI_ICONS overrides it.
+fn nerd_font_installed() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dirs = [
+        format!("{home}/Library/Fonts"),
+        "/Library/Fonts".to_string(),
+        format!("{home}/.local/share/fonts"),
+        format!("{home}/.fonts"),
+        "/usr/share/fonts".to_string(),
+        "/usr/local/share/fonts".to_string(),
+    ];
+    dirs.iter().any(|dir| has_nerd_font(std::path::Path::new(dir), 2))
+}
+
+fn has_nerd_font(dir: &std::path::Path, depth: u8) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.contains("nerdfont") || name.contains("nerd font") || name.contains("nerd-font") {
+            return true;
+        }
+        depth > 0
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+            && has_nerd_font(&entry.path(), depth - 1)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -330,10 +376,6 @@ pub struct Theme {
 }
 
 impl Theme {
-    pub fn nerv() -> Self {
-        Self::new(ThemeKind::Nerv, IconMode::from_env())
-    }
-    #[cfg(test)]
     pub fn nerv_with_icons(icon_mode: IconMode) -> Self {
         Self::new(ThemeKind::Nerv, icon_mode)
     }
@@ -433,6 +475,9 @@ impl Theme {
     }
     pub fn with_kind(&self, kind: ThemeKind) -> Self {
         Self::new(kind, self.icon_mode).with_thin(self.thin)
+    }
+    pub fn with_icon_mode(&self, icon_mode: IconMode) -> Self {
+        Self::new(self.selected_kind, icon_mode).with_thin(self.thin)
     }
     pub fn with_thin(mut self, thin: bool) -> Self {
         if self.thin == thin {
@@ -583,6 +628,17 @@ fn nearest_basic(r: u8, g: u8, b: u8) -> Color {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nerd_fonts_are_found_by_file_name_in_nested_font_dirs() {
+        let root = std::env::temp_dir().join(format!("lazartui-fonts-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("truetype/caskaydia")).unwrap();
+        assert!(!has_nerd_font(&root, 2));
+        std::fs::write(root.join("truetype/caskaydia/CaskaydiaCoveNerdFont-Regular.ttf"), b"").unwrap();
+        assert!(has_nerd_font(&root, 2));
+        assert!(!has_nerd_font(&root, 0), "depth bounds the walk");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]
@@ -599,6 +655,38 @@ mod tests {
             Theme::nerv_with_icons(IconMode::Ascii).icon("nf", "uni", "ascii"),
             "ascii"
         );
+    }
+
+    #[test]
+    fn resolve_prefers_env_then_persisted_then_autodetect() {
+        // Isolate from a developer's real LAZARTUI_ICONS/LAZARTUI_ASCII.
+        std::env::remove_var("LAZARTUI_ICONS");
+        std::env::remove_var("LAZARTUI_ASCII");
+        assert_eq!(IconMode::resolve(Some("ascii")), IconMode::Ascii);
+        std::env::set_var("LAZARTUI_ICONS", "unicode");
+        assert_eq!(
+            IconMode::resolve(Some("ascii")),
+            IconMode::Unicode,
+            "env var wins over the persisted preference"
+        );
+        std::env::remove_var("LAZARTUI_ICONS");
+    }
+
+    #[test]
+    fn icon_mode_from_name_parses_the_three_names_case_insensitively() {
+        assert_eq!(IconMode::from_name("Nerd"), Some(IconMode::Nerd));
+        assert_eq!(IconMode::from_name("UNICODE"), Some(IconMode::Unicode));
+        assert_eq!(IconMode::from_name(" ascii "), Some(IconMode::Ascii));
+        assert_eq!(IconMode::from_name("nope"), None);
+    }
+
+    #[test]
+    fn with_icon_mode_keeps_theme_kind_and_weight_and_changes_icons_only() {
+        let theme = Theme::new(ThemeKind::GrokNight, IconMode::Unicode).with_thin(true);
+        let switched = theme.with_icon_mode(IconMode::Ascii);
+        assert_eq!(switched.icon_mode, IconMode::Ascii);
+        assert_eq!(switched.selected_kind, theme.selected_kind);
+        assert_eq!(switched.thin, theme.thin);
     }
 
     #[test]

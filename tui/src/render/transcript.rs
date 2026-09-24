@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthStr;
 use super::block_frame::BlockFrame;
 use super::markdown::{render_markdown, Highlighter};
 use super::theme::Theme;
-use crate::transcript::{BannerKind, Block, Transcript, VerifyStatus};
+use crate::transcript::{BannerKind, Block, SourceKind, Transcript, VerifyStatus};
 
 /// Wrap one line to `width` columns, breaking at spaces where possible and
 /// hard-breaking otherwise. Styles are preserved per span.
@@ -143,8 +143,83 @@ impl RenderCache {
             }
             out.extend(self.entries[i].lines.iter().cloned());
         }
+        // Every block opens with a spacer row; the first one would sit under
+        // the header's own underline row, so drop it.
+        if out.first().is_some_and(|line| line.width() == 0) {
+            out.remove(0);
+        }
         out
     }
+}
+
+/// Split a line's spans at display column `cols`.
+fn split_at_column(line: Line<'static>, cols: usize) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
+    let mut prefix = Vec::new();
+    let mut body = Vec::new();
+    let mut used = 0;
+    for span in line.spans {
+        if used >= cols {
+            body.push(span);
+            continue;
+        }
+        let mut head = String::new();
+        let mut tail = String::new();
+        for ch in span.content.chars() {
+            if used < cols {
+                used += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                head.push(ch);
+            } else {
+                tail.push(ch);
+            }
+        }
+        if !head.is_empty() {
+            prefix.push(Span::styled(head, span.style));
+        }
+        if !tail.is_empty() {
+            body.push(Span::styled(tail, span.style));
+        }
+    }
+    (prefix, body)
+}
+
+/// Columns a wrapped line's continuation rows should indent: leading spaces
+/// plus a list or quote marker (`• `, `- `, `* `, `12. `, `│ `).
+fn hanging_indent(text: &str) -> usize {
+    let spaces = text.len() - text.trim_start_matches(' ').len();
+    let rest = &text[spaces..];
+    let marker = ["• ", "- ", "* ", "│ ", "▎ "]
+        .iter()
+        .find(|m| rest.starts_with(**m))
+        .map(|m| m.width())
+        .or_else(|| {
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            (digits > 0 && rest[digits..].starts_with(". ")).then_some(digits + 2)
+        })
+        .unwrap_or(0);
+    spaces + marker
+}
+
+/// `text` cut to `max` columns, ending in … when anything was dropped.
+/// `pub(crate)`: also used by `render::agents` for the Agents screen's row
+/// truncation.
+pub(crate) fn fit(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    if max > 0 {
+        out.push('…');
+    }
+    out
 }
 
 fn wrap_all(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
@@ -162,15 +237,22 @@ fn wrap_overlong(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
             continue;
         }
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        let indent = text.len() - text.trim_start_matches(' ').len();
-        let indent = if indent >= width as usize { 0 } else { indent };
-        let indent_style = line.spans.first().map(|s| s.style).unwrap_or_default();
+        let indent = hanging_indent(&text);
+        let indent = if indent >= width as usize / 2 { 0 } else { indent };
         let line_style = line.style;
-        for wrapped in wrap_line(&line, width.saturating_sub(indent as u16).max(1)) {
-            let mut spans = Vec::with_capacity(wrapped.spans.len() + 1);
-            if indent > 0 {
-                spans.push(Span::styled(" ".repeat(indent), indent_style));
-            }
+        // The prefix (indent + bullet/number/quote) stays on the first row;
+        // the body wraps in the remaining width and later rows hang under it.
+        let (prefix, body) = split_at_column(line, indent);
+        let pad_style = prefix.first().map(|s| s.style).unwrap_or_default();
+        let rows = wrap_line(&Line::from(body), width.saturating_sub(indent as u16).max(1));
+        for (row, wrapped) in rows.into_iter().enumerate() {
+            let mut spans = if row == 0 {
+                prefix.clone()
+            } else if indent > 0 {
+                vec![Span::styled(" ".repeat(indent), pad_style)]
+            } else {
+                Vec::new()
+            };
             spans.extend(wrapped.spans);
             out.push(Line::from(spans).style(line_style));
         }
@@ -181,22 +263,28 @@ fn wrap_overlong(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 #[cfg(test)]
 pub static RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Strip `[VERIFY]...[/VERIFY]` blocks the kernel's grounding check consumes
-/// (tag case-insensitive; the closing tag may be missing its `]`, e.g. an
-/// unclosed `[/VERIFY` at the end of a still-streaming reply). The kernel
-/// reports the outcome separately as a `Block::Verify`, so the raw block is
-/// just noise in the rendered transcript.
-fn strip_verify_blocks(markdown: &str) -> String {
+/// Strip `[TAG]...[/TAG]` blocks the kernel consumes for its own purposes —
+/// `VERIFY` (grounding check), `SPEAK` (voice-only summary) and `SOURCES`
+/// (citation list) — before the reply is rendered (tag case-insensitive; the
+/// closing tag may be missing its final `]`, e.g. an unclosed `[/VERIFY` at
+/// the end of a still-streaming reply). The kernel reports each of these
+/// separately (`Block::Verify`, the `answer` event's `speech`/`sources`), so
+/// the raw block is just noise in the rendered transcript.
+fn strip_tagged_blocks(markdown: &str, tag: &str) -> String {
+    let open = format!("[{tag}]");
+    let close = format!("[/{tag}");
     let lower = markdown.to_ascii_lowercase();
+    let open_lower = open.to_ascii_lowercase();
+    let close_lower = close.to_ascii_lowercase();
     let mut out = String::with_capacity(markdown.len());
     let mut pos = 0usize;
     loop {
-        match lower[pos..].find("[verify]") {
+        match lower[pos..].find(&open_lower) {
             Some(rel) => {
                 let start = pos + rel;
                 out.push_str(&markdown[pos..start]);
-                let after_open = start + "[verify]".len();
-                pos = match lower[after_open..].find("[/verify") {
+                let after_open = start + open_lower.len();
+                pos = match lower[after_open..].find(&close_lower) {
                     Some(rel_close) => {
                         let close_start = after_open + rel_close;
                         match lower[close_start..].find(']') {
@@ -217,7 +305,17 @@ fn strip_verify_blocks(markdown: &str) -> String {
     out
 }
 
-fn render_block(
+fn strip_verify_blocks(markdown: &str) -> String {
+    let stripped = strip_tagged_blocks(markdown, "VERIFY");
+    let stripped = strip_tagged_blocks(&stripped, "SPEAK");
+    strip_tagged_blocks(&stripped, "SOURCES")
+}
+
+/// `pub(crate)`: also used directly by `render::agents` to render a job
+/// detail's `timeline_blocks` output with the same look as the live
+/// transcript, without going through `RenderCache` (whose per-block
+/// revision counters don't apply to a one-off, periodically-refetched list).
+pub(crate) fn render_block(
     block: &Block,
     width: u16,
     theme: &Theme,
@@ -317,8 +415,34 @@ fn render_block(
                 let split = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
                 trimmed.split_at(split)
             };
+            let icon = theme.icon("󰞷 ", "◆ ", "$ ");
+            if *folded || output.is_none() {
+                // Folded or still running: the header is one row — the
+                // command's first line, cut with … so the status always fits.
+                let first = args.lines().next().unwrap_or("");
+                let more = command.trim().lines().nth(1).is_some();
+                let budget = (width as usize)
+                    .saturating_sub(icon.width() + program.width() + status.content.width());
+                let shown = fit(&format!("{first}{}", if more { " …" } else { "" }), budget);
+                out.push(Line::from(vec![
+                    Span::styled(icon.to_string(), theme.accent),
+                    Span::styled(program.to_string(), theme.tool_cmd),
+                    Span::styled(shown, theme.tool_args),
+                    status,
+                ]));
+                if let Some(text) = output {
+                    let total = text.lines().count();
+                    let hint = format!(
+                        "  {} {total} lines folded (^T to unfold)",
+                        theme.icon("󰅂", "▸", ">")
+                    );
+                    out.push(Line::from(Span::styled(fit(&hint, width as usize), theme.dim)));
+                }
+                return out;
+            }
+            // Unfolded: the whole command and its output, wrapped.
             let mut header = vec![
-                Span::styled(theme.icon("󰞷 ", "◆ ", "$ "), theme.accent),
+                Span::styled(icon.to_string(), theme.accent),
                 Span::styled(program.to_string(), theme.tool_cmd),
             ];
             if !args.is_empty() {
@@ -327,22 +451,11 @@ fn render_block(
             header.push(status);
             out.push(Line::from(header));
             if let Some(text) = output {
-                let total = text.lines().count();
-                if *folded {
-                    out.push(Line::from(Span::styled(
-                        format!(
-                            "  {} {total} lines folded (^T to unfold)",
-                            theme.icon("󰅂", "▸", ">")
-                        ),
-                        theme.dim,
-                    )));
-                } else {
-                    for l in text.lines() {
-                        out.push(Line::from(vec![
-                            Span::styled(theme.glyph("  │ ", "  | "), theme.dim),
-                            Span::styled(l.to_string(), theme.tool_out),
-                        ]));
-                    }
+                for l in text.lines() {
+                    out.push(Line::from(vec![
+                        Span::styled(theme.glyph("  │ ", "  | "), theme.dim),
+                        Span::styled(l.to_string(), theme.tool_out),
+                    ]));
                 }
             }
             wrap_all(out, width)
@@ -460,6 +573,63 @@ fn render_block(
                         Span::styled(claim.detail.clone(), theme.dim),
                     ]));
                 }
+            }
+            wrap_all(out, width)
+        }
+        Block::Sources { entries, speech } => {
+            if entries.is_empty() && !(debug && !speech.is_empty()) {
+                return out;
+            }
+            out.push(Line::default());
+            if !entries.is_empty() {
+                out.push(Line::from(Span::styled("sources", theme.dim)));
+                for entry in entries {
+                    let (icon, label, detail, missing) = match entry.kind {
+                        SourceKind::File => {
+                            // Debug shows the full path; otherwise the
+                            // document's title, or just its file name.
+                            let path = entry.path.as_deref().unwrap_or(&entry.raw);
+                            let name = entry.name.clone().unwrap_or_else(|| {
+                                path.rsplit('/').next().unwrap_or(path).to_string()
+                            });
+                            let base = if debug {
+                                path.to_string()
+                            } else {
+                                entry.title.clone().unwrap_or_else(|| name.clone())
+                            };
+                            let label = match entry.line {
+                                Some(line) => format!("{base}:{line}"),
+                                None => base,
+                            };
+                            let detail = (!debug && entry.title.is_some()).then_some(name);
+                            (theme.icon("󰈔", "·", "[f]"), label, detail, entry.exists == Some(false))
+                        }
+                        SourceKind::Url => (theme.icon("󰖟", "~", "[url]"), entry.raw.clone(), None, false),
+                    };
+                    // One row per source: drop the dim file name first, then cut
+                    // the label with … — never wrap.
+                    let prefix = format!("  {icon} ");
+                    let flag = if missing { " ✗ missing" } else { "" };
+                    let room = (width as usize).saturating_sub(prefix.width() + flag.width());
+                    let detail = detail
+                        .map(|d| format!("  {d}"))
+                        .filter(|d| label.width() + d.width() <= room);
+                    let label = fit(&label, room.saturating_sub(detail.as_ref().map_or(0, |d| d.width())));
+                    let mut spans = vec![Span::styled(prefix, theme.link), Span::styled(label, theme.link)];
+                    if let Some(detail) = detail {
+                        spans.push(Span::styled(detail, theme.dim));
+                    }
+                    if missing {
+                        spans.push(Span::styled(flag, theme.fail));
+                    }
+                    out.push(Line::from(spans));
+                }
+            }
+            if debug && !speech.is_empty() {
+                out.push(Line::from(vec![
+                    Span::styled("speak: ", theme.dim),
+                    Span::styled(speech.clone(), theme.dim),
+                ]));
             }
             wrap_all(out, width)
         }
@@ -593,6 +763,23 @@ mod tests {
     }
 
     #[test]
+    fn a_long_folded_command_stays_on_one_header_row() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let block = Block::Tool {
+            id: String::new(),
+            command: format!("cat >> /tmp/notes.md << 'EOF'\n{}\nEOF", "word ".repeat(80)),
+            output: Some("done\n".into()),
+            exit_code: Some(0),
+            folded: true,
+        };
+        let rendered = text(&render_block(&block, 60, &theme, &Highlighter::new(), false));
+        assert_eq!(rendered.len(), 3, "blank, header, fold hint: {rendered:?}");
+        assert!(rendered[1].chars().count() <= 60, "{rendered:?}");
+        assert!(rendered[1].contains("cat") && rendered[1].contains('…') && rendered[1].ends_with("ok exit 0"), "{rendered:?}");
+        assert!(rendered[2].contains("1 lines folded"), "{rendered:?}");
+    }
+
+    #[test]
     fn folded_tool_rows_are_one_line_apart_with_quiet_arguments() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
@@ -614,9 +801,51 @@ mod tests {
         let header = &lines[1];
         let program = header.spans.iter().find(|s| s.content == "tail").unwrap();
         assert_eq!(program.style, theme.tool_cmd);
-        let args = header.spans.iter().find(|s| s.content == "-n").unwrap();
+        let args = header.spans.iter().find(|s| s.content.contains("-n 30")).unwrap();
         assert_eq!(args.style, theme.tool_args);
         assert_ne!(theme.tool_args, theme.tool_cmd);
+    }
+
+    #[test]
+    fn wrapped_list_items_hang_under_their_text() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let md = "- memory — plain markdown notes that survive across invocations and stay readable\n\n1. first numbered item that is long enough to wrap onto another row";
+        let lines = render_block(&Block::Assistant { markdown: md.into(), streaming: false }, 40, &theme, &Highlighter::new(), false);
+        let rendered = text(&lines);
+        let bullet = rendered.iter().position(|l| l.contains("• memory")).unwrap();
+        let col = |line: &str, word: &str| line[..line.find(word).unwrap()].chars().count();
+        let bullet_col = col(&rendered[bullet], "memory");
+        let next = &rendered[bullet + 1];
+        assert_eq!(next.len() - next.trim_start().len(), bullet_col, "{rendered:?}");
+        let numbered = rendered.iter().position(|l| l.contains("1. first")).unwrap();
+        let text_col = col(&rendered[numbered], "first");
+        let next = &rendered[numbered + 1];
+        assert_eq!(next.len() - next.trim_start().len(), text_col, "{rendered:?}");
+        assert!(rendered.iter().all(|l| l.chars().count() <= 40), "{rendered:?}");
+    }
+
+    #[test]
+    fn sources_show_titles_or_file_names_on_one_row() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let entry = |title: Option<&str>| crate::transcript::SourceEntry {
+            raw: "/Users/x/lazar/user/memory/research/threejs-3d-games-flight-simulators.md".into(),
+            kind: crate::transcript::SourceKind::File,
+            path: Some("/Users/x/lazar/user/memory/research/threejs-3d-games-flight-simulators.md".into()),
+            line: Some(4),
+            exists: Some(true),
+            name: Some("threejs-3d-games-flight-simulators.md".into()),
+            title: title.map(str::to_string),
+        };
+        let block = Block::Sources { entries: vec![entry(Some("Three.js flight sims")), entry(None)], speech: String::new() };
+        let rendered = text(&render_block(&block, 50, &theme, &Highlighter::new(), false));
+        assert!(rendered.iter().any(|l| l.contains("Three.js flight sims:4")), "{rendered:?}");
+        let wide = text(&render_block(&block, 100, &theme, &Highlighter::new(), false));
+        assert!(wide.iter().any(|l| l.contains("Three.js flight sims:4") && l.contains("threejs-3d-games")), "{wide:?}");
+        assert!(!rendered.iter().any(|l| l.contains("/Users/x")), "no full paths: {rendered:?}");
+        assert!(rendered.iter().all(|l| l.chars().count() <= 50), "{rendered:?}");
+        assert_eq!(rendered.iter().filter(|l| l.trim_start().starts_with('·')).count(), 2, "one row each: {rendered:?}");
+        let debug = text(&render_block(&block, 200, &theme, &Highlighter::new(), true));
+        assert!(debug.iter().any(|l| l.contains("/Users/x/lazar/user/memory/research/")), "{debug:?}");
     }
 
     #[test]
@@ -713,6 +942,92 @@ mod tests {
         };
         let lines = render_block(&block, 40, &theme, &hl, false);
         assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn strips_speak_and_sources_blocks_but_keeps_them_in_debug() {
+        let markdown = "Done.\n[SPEAK]\nIt's fixed.\n[/SPEAK]\n[SOURCES]\n/abs/x.rs:42\n[/SOURCES]\nmore text";
+        let stripped = strip_verify_blocks(markdown);
+        let lower = stripped.to_ascii_lowercase();
+        assert!(!lower.contains("speak"), "{stripped:?}");
+        assert!(!lower.contains("sources"), "{stripped:?}");
+        assert!(stripped.contains("Done."));
+        assert!(stripped.contains("more text"));
+
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Assistant { markdown: markdown.into(), streaming: false };
+        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true));
+        let joined = debug_lines.join("\n");
+        assert!(joined.contains("[SPEAK]") && joined.contains("[SOURCES]"), "{debug_lines:?}");
+        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let plain_lower = plain_lines.join("\n").to_ascii_lowercase();
+        assert!(!plain_lower.contains("speak") && !plain_lower.contains("sources"), "{plain_lines:?}");
+    }
+
+    #[test]
+    fn strips_unclosed_speak_and_sources_tag_variants() {
+        // Matches the VERIFY behaviour: closing tag may lack the final `]`,
+        // and a still-streaming reply may have no closing tag at all.
+        assert_eq!(strip_verify_blocks("before\n[SPEAK]\nhi\n[/SPEAK"), "before\n");
+        assert_eq!(strip_verify_blocks("before\n[speak]\nhi"), "before\n");
+        assert_eq!(strip_verify_blocks("before\n[SOURCES]\n/x\n[/SOURCES"), "before\n");
+    }
+
+    fn file_source(raw: &str, line: Option<u64>, exists: Option<bool>) -> crate::transcript::SourceEntry {
+        crate::transcript::SourceEntry {
+            raw: raw.into(),
+            kind: crate::transcript::SourceKind::File,
+            path: Some(raw.into()),
+            line,
+            exists,
+            name: None,
+            title: None,
+        }
+    }
+
+    fn url_source(raw: &str) -> crate::transcript::SourceEntry {
+        crate::transcript::SourceEntry {
+            raw: raw.into(),
+            kind: crate::transcript::SourceKind::Url,
+            path: None,
+            line: None,
+            exists: None,
+            name: None,
+            title: None,
+        }
+    }
+
+    #[test]
+    fn renders_a_sources_block_with_file_url_and_missing_entries() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Sources {
+            entries: vec![
+                file_source("/abs/x.rs", Some(42), Some(true)),
+                file_source("/abs/gone.rs", Some(7), Some(false)),
+                url_source("https://example.com/page"),
+            ],
+            speech: String::new(),
+        };
+        let lines = text(&render_block(&block, 80, &theme, &hl, false));
+        let joined = lines.join("\n");
+        assert!(joined.contains("sources"));
+        // File names by default; full paths are debug-only.
+        assert!(joined.contains("x.rs:42") && !joined.contains("/abs/x.rs"), "{joined}");
+        assert!(joined.contains("gone.rs:7") && joined.contains("missing"));
+        assert!(joined.contains("https://example.com/page"));
+    }
+
+    #[test]
+    fn sources_block_shows_speech_only_in_debug_mode() {
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
+        let hl = Highlighter::new();
+        let block = Block::Sources { entries: vec![], speech: "It's fixed.".into() };
+        let plain = render_block(&block, 80, &theme, &hl, false);
+        assert!(plain.is_empty(), "{plain:?}");
+        let debug = text(&render_block(&block, 80, &theme, &hl, true));
+        assert!(debug.iter().any(|l| l.contains("speak:") && l.contains("It's fixed.")), "{debug:?}");
     }
 
     fn claim(claim: &str, ok: bool, detail: &str) -> crate::transcript::VerifyClaim {

@@ -10,6 +10,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 
 def write_record(path, record):
@@ -53,7 +54,8 @@ def main():
         return 0
     spec = json.loads(path.with_suffix('.spec.json').read_text())
     record = dict(status='running', job_id=spec['id'], task=spec['task'],
-                  output=spec['output'], pid=os.getpid())
+                  output=spec['output'], pid=os.getpid(),
+                  started_ms=int(time.time() * 1000))
     write_record(path, record)
     module_spec = importlib.util.spec_from_file_location('bounded', spec['runner'])
     bounded = importlib.util.module_from_spec(module_spec)

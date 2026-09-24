@@ -1,14 +1,60 @@
-//! Skill discovery from `$LAZAR_HOME/skills/INDEX.md` for `/<skill>`
-//! autocomplete. The kernel tells the model to read INDEX.md first, so the
-//! same file is the TUI's source of truth.
+//! Skill discovery for `/<skill>` and `$<skill>` autocomplete.
+//!
+//! The kernel (`<lazar> skills --json`) is the source of truth: it knows
+//! which skills are actually installed, the same set it resolves a leading
+//! `$name` against. Parsing `$LAZAR_HOME/skills/INDEX.md` (the file the
+//! kernel tells the model to read first) is kept only as a fallback for when
+//! the kernel command isn't available yet or fails.
 
+use serde::Deserialize;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillEntry {
     pub name: String,
     pub summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkillRow {
+    name: String,
+    #[serde(default)]
+    description: String,
+}
+
+/// `load_from_kernel`, falling back to `load_index` if the kernel command
+/// fails (not built yet, older kernel without `skills --json`, and so on).
+pub fn load(kernel: &Path, lazar_home: &Path) -> Vec<SkillEntry> {
+    load_from_kernel(kernel, lazar_home).unwrap_or_else(|_| load_index(lazar_home))
+}
+
+pub fn load_from_kernel(kernel: &Path, lazar_home: &Path) -> Result<Vec<SkillEntry>, String> {
+    let output = Command::new(kernel)
+        .args(["skills", "--json"])
+        .env("LAZAR_HOME", lazar_home)
+        .output()
+        .map_err(|e| format!("cannot run {}: {e}", kernel.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`lazar skills --json` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_kernel_skills(&String::from_utf8_lossy(&output.stdout))
+}
+
+pub fn parse_kernel_skills(json: &str) -> Result<Vec<SkillEntry>, String> {
+    let rows: Vec<SkillRow> =
+        serde_json::from_str(json).map_err(|e| format!("bad skills JSON: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| SkillEntry {
+            name: row.name,
+            summary: row.description,
+        })
+        .collect())
 }
 
 pub fn load_index(lazar_home: &Path) -> Vec<SkillEntry> {
@@ -89,6 +135,37 @@ mod tests {
         assert_eq!(entries[0].summary, "durable notes");
         assert_eq!(entries[1].summary, "show status");
         assert_eq!(entries[2].summary, "fetch pages");
+    }
+
+    #[test]
+    fn parses_kernel_skill_rows_and_rejects_bad_json() {
+        let rows = parse_kernel_skills(
+            r#"[{"name":"_meta/harness","description":"harness notes"},{"name":"todo"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                SkillEntry { name: "_meta/harness".into(), summary: "harness notes".into() },
+                SkillEntry { name: "todo".into(), summary: String::new() },
+            ]
+        );
+        assert!(parse_kernel_skills("nope").is_err());
+    }
+
+    #[test]
+    fn load_falls_back_to_the_index_when_the_kernel_command_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-skills-load-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("user").join("skills")).unwrap();
+        fs::write(root.join("user/skills/INDEX.md"), "- todo — task list\n").unwrap();
+        let entries = load(Path::new("/usr/bin/false"), &root);
+        assert_eq!(entries, vec![SkillEntry { name: "todo".into(), summary: "task list".into() }]);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

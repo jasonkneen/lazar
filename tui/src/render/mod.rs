@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod block_frame;
 pub mod chrome;
 pub mod markdown;

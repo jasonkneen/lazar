@@ -15,6 +15,9 @@ pub struct PersistedState {
     pub model: Option<String>,
     pub session_id: Option<String>,
     pub theme: Option<String>,
+    /// "nerd" | "unicode" | "ascii" (`/icons`). `None` defers to
+    /// `LAZARTUI_ICONS` or auto-detection.
+    pub icons: Option<String>,
     pub thin: bool,
     /// Debug/verbose view (Ctrl+A / `/debug`): hooks, internal kernel
     /// events, and full detail. Off by default — see `LAZARTUI_DEBUG`.
@@ -66,6 +69,7 @@ mod tests {
             model: Some("kimi-k3".into()),
             session_id: Some("sess_1".into()),
             theme: Some("groknight".into()),
+            icons: Some("ascii".into()),
             thin: true,
             debug: true,
             composer_history: vec!["hi".into()],

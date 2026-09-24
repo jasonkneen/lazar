@@ -116,7 +116,7 @@ pub(crate) fn extract_block(text: &str) -> Option<Result<Vec<String>, String>> {
 
 /// Resolve a claim path: `~`, `$HOME` and `$LAZAR_HOME` expand; relative
 /// paths are taken from the tool working directory.
-fn resolve(path: &str, cwd: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolve(path: &str, cwd: &Path) -> Result<PathBuf, String> {
     let path = path.trim().trim_matches(|c| c == '"' || c == '\'');
     if path.is_empty() {
         return Err("empty path".into());

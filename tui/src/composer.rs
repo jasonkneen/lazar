@@ -41,6 +41,13 @@ impl Composer {
         self.lines.iter().all(|l| l.trim().is_empty())
     }
 
+    /// The cursor's character column on its current line — used by the
+    /// Agents-screen Left-key rule, which only fires at column 0 (otherwise
+    /// Left just moves the cursor, as usual).
+    pub fn cursor_col(&self) -> usize {
+        self.cursor.1
+    }
+
     pub fn history(&self) -> &[String] {
         &self.history
     }

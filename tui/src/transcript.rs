@@ -50,6 +50,14 @@ pub enum Block {
         tools_run: u64,
         claims: Vec<VerifyClaim>,
     },
+    /// Citations and voice summary from the kernel's post-reply `answer`
+    /// event (see `App::handle_lazar_event`'s `"answer"` case). The reply
+    /// text itself already streamed as an `Assistant` block; `speech` is
+    /// shown here only in debug mode, as a preview of the future voice path.
+    Sources {
+        entries: Vec<SourceEntry>,
+        speech: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +71,27 @@ pub struct VerifyClaim {
     pub claim: String,
     pub ok: bool,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    File,
+    Url,
+}
+
+/// One citation from the kernel's post-reply `answer` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceEntry {
+    /// The `ref` field as the kernel sent it, used for the plain-text dump.
+    pub raw: String,
+    pub kind: SourceKind,
+    pub path: Option<String>,
+    pub line: Option<u64>,
+    /// File sources only; `None` for URLs, which the TUI does not probe.
+    pub exists: Option<bool>,
+    /// File name, and the document's own title when the kernel found one.
+    pub name: Option<String>,
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +112,9 @@ pub struct Transcript {
     /// separate from `show_hooks` so the finer Ctrl+H toggle still works on
     /// its own.
     pub debug: bool,
+    /// The most recent `answer` event's voice summary, kept for a future
+    /// voice-output path. Not itself rendered outside debug mode.
+    pub last_speech: Option<String>,
 }
 
 /// Output longer than this many lines starts folded.
@@ -96,6 +128,7 @@ impl Transcript {
             fold_long_tools: true,
             show_hooks: false,
             debug: false,
+            last_speech: None,
         }
     }
 
@@ -146,6 +179,20 @@ impl Transcript {
             tools_run,
             claims,
         });
+    }
+
+    /// Record an `answer` event's citations and voice summary. `speech` is
+    /// kept on the transcript regardless of whether a block is pushed; the
+    /// block itself is only pushed when there's something to show (either
+    /// sources, or a speech line for a later debug toggle).
+    pub fn push_sources(&mut self, entries: Vec<SourceEntry>, speech: String) {
+        if !speech.is_empty() {
+            self.last_speech = Some(speech.clone());
+        }
+        if entries.is_empty() && speech.is_empty() {
+            return;
+        }
+        self.push_block(Block::Sources { entries, speech });
     }
 
     pub fn push_banner(&mut self, kind: BannerKind, text: impl Into<String>) {
@@ -345,6 +392,17 @@ impl Transcript {
                         ));
                     }
                 }
+                Block::Sources { entries, speech } => {
+                    if !entries.is_empty() {
+                        out.push_str("\nsources\n");
+                        for entry in entries {
+                            out.push_str(&format!("  {}\n", entry.raw));
+                        }
+                    }
+                    if !speech.is_empty() {
+                        out.push_str(&format!("\n[speak] {speech}\n"));
+                    }
+                }
             }
         }
         out
@@ -434,6 +492,40 @@ mod tests {
             &t.blocks[0],
             Block::Assistant { markdown, streaming: false }
                 if markdown == "Done.\n[VERIFY] exists=/tmp/x [/VERIFY]\nmore text"
+        ));
+    }
+
+    #[test]
+    fn push_sources_stores_speech_and_skips_an_empty_block() {
+        let mut t = Transcript::new();
+        // Nothing to show yet: no block, and speech left untouched.
+        t.push_sources(vec![], String::new());
+        assert!(t.blocks.is_empty());
+        assert_eq!(t.last_speech, None);
+
+        let entry = SourceEntry {
+            raw: "/abs/x.rs:42".into(),
+            kind: SourceKind::File,
+            path: Some("/abs/x.rs".into()),
+            line: Some(42),
+            exists: Some(true),
+            name: None,
+            title: None,
+        };
+        t.push_sources(vec![entry.clone()], "It's fixed.".into());
+        assert_eq!(t.last_speech.as_deref(), Some("It's fixed."));
+        assert!(matches!(
+            &t.blocks[0],
+            Block::Sources { entries, speech } if entries == &[entry] && speech == "It's fixed."
+        ));
+
+        // Speech-only answer still stores on the transcript and pushes a
+        // block (for a later debug toggle), even with no sources.
+        t.push_sources(vec![], "Also this.".into());
+        assert_eq!(t.last_speech.as_deref(), Some("Also this."));
+        assert!(matches!(
+            &t.blocks[1],
+            Block::Sources { entries, speech } if entries.is_empty() && speech == "Also this."
         ));
     }
 }

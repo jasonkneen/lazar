@@ -17,8 +17,10 @@ pub enum PickerKind {
     Session,
     Theme,
     Weight,
+    Icons,
     Slash,
     Path,
+    Skill,
     AddDirScope,
 }
 
@@ -113,6 +115,7 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         ),
         ("Ctrl+X", "drop the queued message"),
         ("/ or @", "open command/skill or workspace-path completion"),
+        ("$", "open the installed-skills picker"),
         ("Tab", "reopen completion for the current token"),
         ("Esc", "close an overlay / clear the composer"),
     ];
@@ -133,6 +136,22 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         ),
         ("Ctrl+E", "raw kernel event feed"),
         ("Ctrl+G", "sub-agent panel"),
+        (
+            "←",
+            "open the Agents screen (empty composer, or cursor at column 0)",
+        ),
+        (
+            "↓ (empty composer)",
+            "focus the footer agents panel; ↑↓ select, Enter open, Esc back",
+        ),
+        (
+            "Agents screen",
+            "↑↓ select · Enter open job · Esc / → back to chat",
+        ),
+        (
+            "Job detail",
+            "↑↓ PgUp/PgDn scroll · Enter / Ctrl+T unfold tools · Esc back to list",
+        ),
         ("Ctrl+C", "cancel the running turn, or quit when idle"),
         ("Ctrl+Q", "quit"),
     ];
@@ -147,6 +166,7 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
             "preview and persist auto, nerv, groknight, grokday, or tokyonight",
         ),
         ("/weight [thin | regular]", "set terminal text emphasis"),
+        ("/icons [nerd | unicode | ascii]", "set the icon glyph set"),
         ("/session [new | list | resume <id>]", "session control"),
         (
             "/add-dir [path]",
@@ -165,6 +185,10 @@ pub fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         (
             "/<skill>",
             "prefix the prompt with [skill:<name>] (from skills/INDEX.md)",
+        ),
+        (
+            "$<skill>",
+            "sent as typed; the kernel resolves it as a skill directive itself",
         ),
     ];
     let mut lines = Vec::new();

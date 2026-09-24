@@ -1,20 +1,27 @@
 use crate::access::{policy_path, AccessPolicy, AccessState, Scope};
+use crate::agents_state::{AgentsScreenState, JobDetailState};
 use crate::composer::Composer;
+use crate::jobs::{self, Job, JobsHandle};
 use crate::kernel::{KernelConfig, KernelEvent, KernelHandle, SessionRow};
 use crate::keys::{action_for, Action};
 use crate::overlays::picker::{PickItem, Picker, PickerOutcome};
 use crate::overlays::{help_lines, render_text_panel, Overlay, PickerKind};
 use crate::providers::{kernel_binary, load_catalog, ProviderInfo};
-use crate::render::chrome::{render_footer, render_header, FooterInfo, HeaderInfo};
+use crate::render::agents::{render_agents_list, render_job_detail, AgentsListInfo};
+use crate::render::chrome::{
+    render_activity, render_header, render_status, HeaderInfo, StatusInfo, SPINNER, SPINNER_ASCII,
+};
 use crate::render::markdown::Highlighter;
 use crate::render::scrollbar::render_scrollbar;
-use crate::render::theme::{Theme, ThemeKind};
+use crate::render::theme::{IconMode, Theme, ThemeKind};
 use crate::render::transcript::RenderCache;
-use crate::skills::{expand_skill_prompt, load_index, SkillEntry};
+use crate::skills::{self, expand_skill_prompt, SkillEntry};
 use crate::state::{state_path, PersistedState};
-use crate::transcript::{BannerKind, Transcript, VerifyClaim, VerifyStatus};
+use crate::status::{self, ContextInfo, Line1Input, Line2Input};
+use crate::timeline::timeline_blocks;
+use crate::transcript::{BannerKind, SourceEntry, SourceKind, Transcript, VerifyClaim, VerifyStatus};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use ratatui::layout::{Alignment, Constraint, Flex, Layout, Margin, Rect};
+use ratatui::layout::{Constraint, Flex, Layout, Margin, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as FrameBlock, BorderType, Borders, Paragraph};
 use ratatui::Frame;
@@ -22,13 +29,13 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use unicode_width::UnicodeWidthStr;
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("provider", "list or switch provider"),
     ("model", "list or switch model"),
     ("theme", "preview or switch the color theme"),
     ("weight", "switch between thin and regular text"),
+    ("icons", "switch between nerd, unicode, and ascii glyphs"),
     ("session", "start, list, or resume sessions"),
     ("add-dir", "grant sandbox write access"),
     ("clear", "clear the transcript view"),
@@ -90,17 +97,56 @@ pub struct App {
     output_tokens: u64,
     last_theme_refresh: Instant,
     turn_started: Option<Instant>,
+    /// The kernel's own username/host, so the status bar doesn't shell out
+    /// on every frame.
+    user: String,
+    host: String,
+    /// Most recent `context` event: token usage against the model's window.
+    context: Option<ContextInfo>,
+    /// Background sub-agent jobs, polled from the kernel (`<lazar> jobs`).
+    jobs: Vec<Job>,
+    jobs_handle: Option<JobsHandle>,
+    /// The kernel's latest `phase` event for the running turn, reset once it
+    /// finishes.
+    phase: Option<String>,
+    /// When the last assistant text delta arrived, for the "Writing" phase
+    /// of the activity indicator.
+    last_text_delta_at: Option<Instant>,
+    /// The `notice` text as of the last `tick` — lets `tick` detect a change
+    /// made anywhere (there's no single setter) and start that notice's own
+    /// 3s countdown, without every call site having to manage a timestamp.
+    last_notice: String,
+    notice_set_at: Instant,
+    /// mtime+inode of this process's own executable and of the kernel binary
+    /// it launched, recorded at startup so a later rebuild/reinstall of
+    /// either can be detected (see `check_stale_binary`).
+    exe_fingerprint: Option<status::FileFingerprint>,
+    kernel_fingerprint: Option<status::FileFingerprint>,
+    last_binary_check: Instant,
+    /// Set once a rebuild is detected and never cleared — the notice is
+    /// meant to persist until the user actually restarts.
+    stale_binary_notice: Option<String>,
+    /// The full-screen Agents view (Left from the composer, or Enter from
+    /// the focused footer panel), and its own job-detail sub-screen.
+    /// `None` shows the ordinary chat view.
+    agents_screen: Option<AgentsScreenState>,
+    /// Down from an empty composer focuses the footer agents panel: this is
+    /// the selected row (capped at the panel's own 4-row max). `None` means
+    /// the composer has focus, as usual.
+    footer_agent_focus: Option<usize>,
 }
 
 impl App {
     pub fn new(mut options: LaunchOptions) -> Self {
         let state_file = state_path(&options.lazar_home);
-        let skills = load_index(&options.lazar_home);
         let persisted = PersistedState::load(&state_file);
         let kernel_binary = options
             .kernel
             .clone()
             .unwrap_or_else(|| kernel_binary(&options.lazar_home));
+        // The kernel is the source of truth for installed skills (it's what
+        // resolves `$name`); INDEX.md parsing is only a fallback.
+        let skills = skills::load(&kernel_binary, &options.lazar_home);
         let (providers, catalog_error) = match load_catalog(&kernel_binary, &options.lazar_home) {
             Ok(rows) => (rows, None),
             Err(err) => (Vec::new(), Some(err)),
@@ -159,7 +205,8 @@ impl App {
             .or_else(font_weight_from_env)
             .unwrap_or(persisted.thin);
         let debug = debug_from_env() || persisted.debug;
-        let base_theme = Theme::nerv().with_thin(thin);
+        let icon_mode = IconMode::resolve(persisted.icons.as_deref());
+        let base_theme = Theme::nerv_with_icons(icon_mode).with_thin(thin);
         let theme = std::env::var("LAZARTUI_THEME")
             .ok()
             .filter(|name| !name.trim().is_empty())
@@ -173,6 +220,10 @@ impl App {
             })
             .unwrap_or_else(|| base_theme.clone())
             .with_thin(thin);
+        let (user, host) = current_user_host();
+        let jobs_handle = Some(JobsHandle::spawn(kernel_binary.clone(), options.lazar_home.clone()));
+        let exe_fingerprint = std::env::current_exe().ok().as_deref().and_then(fingerprint);
+        let kernel_fingerprint = fingerprint(&kernel_binary);
         Self {
             options,
             kernel_binary,
@@ -210,6 +261,21 @@ impl App {
             output_tokens: 0,
             last_theme_refresh: Instant::now(),
             turn_started: None,
+            user,
+            host,
+            context: None,
+            jobs: Vec::new(),
+            jobs_handle,
+            phase: None,
+            last_text_delta_at: None,
+            last_notice: String::new(),
+            notice_set_at: Instant::now(),
+            exe_fingerprint,
+            kernel_fingerprint,
+            last_binary_check: Instant::now(),
+            stale_binary_notice: None,
+            agents_screen: None,
+            footer_agent_focus: None,
         }
     }
 
@@ -256,6 +322,97 @@ impl App {
         while let Ok(event) = self.kernel.events.try_recv() {
             self.handle_kernel_event(event);
         }
+        if let Some(handle) = &self.jobs_handle {
+            if let Some(jobs) = handle.try_recv_latest() {
+                self.jobs = jobs;
+            }
+        }
+        self.tick_agents_screen();
+        self.expire_notice();
+        self.check_stale_binary();
+    }
+
+    /// While the Agents screen is open: drain its own (24h-window) jobs
+    /// poll, and — while a job detail is open — drain its `jobs --show`
+    /// fetch and, if the job is still running/starting, kick off a refresh
+    /// every 2s (never while one is already in flight).
+    fn tick_agents_screen(&mut self) {
+        let Some(screen) = self.agents_screen.as_mut() else {
+            return;
+        };
+        if let Some(jobs) = screen.jobs_handle.try_recv_latest() {
+            screen.jobs = jobs;
+            let total = jobs::selectable_jobs(&screen.jobs).len();
+            screen.selected = if total == 0 { 0 } else { screen.selected.min(total - 1) };
+        }
+        let Some(detail) = screen.detail.as_mut() else {
+            return;
+        };
+        if let Ok(result) = detail.fetch.try_recv() {
+            detail.loading = false;
+            match result {
+                Ok(value) => {
+                    if let Some(job) = value.get("job") {
+                        if let Some(status) = job.get("status").and_then(Value::as_str) {
+                            detail.status = status.to_string();
+                        }
+                        if let Some(elapsed) = job.get("elapsed_s").and_then(Value::as_u64) {
+                            detail.elapsed_s = elapsed;
+                        }
+                        if let Some(task) = job.get("task").and_then(Value::as_str) {
+                            detail.task = task.to_string();
+                        }
+                    }
+                    detail.blocks = timeline_blocks(value.get("timeline").unwrap_or(&Value::Null));
+                    detail.error = None;
+                }
+                Err(err) => detail.error = Some(err),
+            }
+        }
+        let running = matches!(detail.status.as_str(), "running" | "starting");
+        if running && !detail.loading && detail.last_poll.elapsed() >= Duration::from_secs(2) {
+            detail.loading = true;
+            detail.last_poll = Instant::now();
+            detail.fetch =
+                jobs::fetch_job_show(self.kernel_binary.clone(), self.options.lazar_home.clone(), detail.job_id.clone());
+        }
+    }
+
+    /// The user keeps running stale builds: every ~5s, re-stat this
+    /// process's own executable and the kernel binary it launched. If
+    /// either now looks rebuilt (see `status::binary_replaced`), show a
+    /// persistent restart notice once and never again this session.
+    fn check_stale_binary(&mut self) {
+        if self.stale_binary_notice.is_some() {
+            return;
+        }
+        if self.last_binary_check.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_binary_check = Instant::now();
+        let exe_changed = status::binary_replaced(
+            self.exe_fingerprint,
+            std::env::current_exe().ok().as_deref().and_then(fingerprint),
+        );
+        let kernel_changed =
+            status::binary_replaced(self.kernel_fingerprint, fingerprint(&self.kernel_binary));
+        if exe_changed || kernel_changed {
+            self.stale_binary_notice =
+                Some("new lazar build installed — restart lazartui to use it".to_string());
+        }
+    }
+
+    /// Notices are transient: ~3s after one is set (detected here, since
+    /// there's no single setter — see `last_notice`), or on the next
+    /// keypress (see `key`), whichever comes first.
+    fn expire_notice(&mut self) {
+        if self.notice != self.last_notice {
+            self.last_notice = self.notice.clone();
+            self.notice_set_at = Instant::now();
+        } else if !self.notice.is_empty() && self.notice_set_at.elapsed() >= Duration::from_secs(3) {
+            self.notice.clear();
+            self.last_notice.clear();
+        }
     }
 
     pub fn paste(&mut self, text: &str) {
@@ -294,6 +451,17 @@ impl App {
             if let PickerOutcome::Chosen(id) = outcome {
                 self.overlay = None;
                 self.apply_pick(kind, id, payload);
+                if matches!(
+                    kind,
+                    PickerKind::Theme
+                        | PickerKind::Weight
+                        | PickerKind::Icons
+                        | PickerKind::Model
+                        | PickerKind::Provider
+                        | PickerKind::Session
+                ) {
+                    self.composer.clear();
+                }
             }
             return;
         }
@@ -310,8 +478,37 @@ impl App {
 
     /// Returns true when the application should quit.
     pub fn key(&mut self, key: KeyEvent) -> bool {
+        // Notices are transient (see `tick`'s 3s expiry): any keypress also
+        // dismisses one immediately, whichever comes first. A handler below
+        // may set a fresh one in the same call, which is fine — it starts
+        // its own 3s countdown next tick.
+        if !self.notice.is_empty() {
+            self.notice.clear();
+            self.last_notice.clear();
+        }
         if self.overlay.is_some() {
             return self.overlay_key(key);
+        }
+        if self.agents_screen.is_some() {
+            return self.agents_key(key);
+        }
+        if self.footer_agent_focus.is_some() {
+            return self.footer_focus_key(key);
+        }
+        if key.code == KeyCode::Left
+            && key.modifiers.is_empty()
+            && should_open_agents_screen(self.composer.is_empty(), self.composer.cursor_col())
+        {
+            self.open_agents_screen();
+            return false;
+        }
+        if key.code == KeyCode::Down
+            && key.modifiers.is_empty()
+            && self.composer.is_empty()
+            && !self.jobs.is_empty()
+        {
+            self.footer_agent_focus = Some(0);
+            return false;
         }
         match action_for(&key, self.turn_running) {
             Action::Quit => return true,
@@ -378,6 +575,8 @@ impl App {
                     self.open_slash_picker("");
                 } else if c == '@' && self.composer.current_token() == "@" {
                     self.open_path_picker("");
+                } else if c == '$' && self.composer.current_token() == "$" {
+                    self.open_skill_picker("");
                 }
             }
             KeyCode::Backspace => self.composer.backspace(),
@@ -406,6 +605,7 @@ impl App {
             let prefix = match kind {
                 PickerKind::Slash => Some('/'),
                 PickerKind::Path => Some('@'),
+                PickerKind::Skill => Some('$'),
                 _ => None,
             };
             let remove_trigger = prefix.is_some()
@@ -466,11 +666,26 @@ impl App {
                     match selected.as_deref() {
                         Some("theme") => self.open_theme_picker(),
                         Some("weight") => self.open_weight_picker(),
+                        Some("icons") => self.open_icons_picker(),
                         _ => {}
                     }
                 }
                 return false;
             }
+            // These pickers act like commands (reached directly via a
+            // hotkey, or via a "/theme "-style slash token that opened a
+            // second, unprefixed picker): once one resolves, any leftover
+            // command text in the composer is stale and would otherwise
+            // linger (e.g. "/theme " staying after the theme was picked).
+            let is_command_picker = matches!(
+                kind,
+                PickerKind::Theme
+                    | PickerKind::Weight
+                    | PickerKind::Icons
+                    | PickerKind::Model
+                    | PickerKind::Provider
+                    | PickerKind::Session
+            );
             match outcome {
                 PickerOutcome::Pending => return false,
                 PickerOutcome::Cancelled => {
@@ -480,11 +695,17 @@ impl App {
                             self.preview_theme(previous);
                         }
                     }
+                    if is_command_picker {
+                        self.composer.clear();
+                    }
                     return false;
                 }
                 PickerOutcome::Chosen(id) => {
                     self.overlay = None;
                     self.apply_pick(kind, id, payload);
+                    if is_command_picker {
+                        self.composer.clear();
+                    }
                     return false;
                 }
             }
@@ -500,6 +721,168 @@ impl App {
         false
     }
 
+    /// Down from an empty composer, with the footer agents panel visible:
+    /// Up/Down move the selection, Enter opens that job's detail (via the
+    /// full Agents screen), Esc or Up past the top returns to the composer.
+    /// Any other key drops focus and falls through to ordinary composing.
+    fn footer_focus_key(&mut self, key: KeyEvent) -> bool {
+        let visible = self.jobs.len().min(4);
+        match key.code {
+            KeyCode::Down => {
+                if visible > 0 {
+                    let next = self.footer_agent_focus.unwrap_or(0) + 1;
+                    self.footer_agent_focus = Some(next.min(visible - 1));
+                }
+                false
+            }
+            KeyCode::Up => {
+                match self.footer_agent_focus {
+                    Some(0) | None => self.footer_agent_focus = None,
+                    Some(i) => self.footer_agent_focus = Some(i - 1),
+                }
+                false
+            }
+            KeyCode::Enter => {
+                if let Some(job_id) = self
+                    .footer_agent_focus
+                    .and_then(|i| self.jobs.get(i))
+                    .map(|job| job.job_id.clone())
+                {
+                    self.footer_agent_focus = None;
+                    self.open_agents_screen();
+                    self.open_job_detail(job_id);
+                }
+                false
+            }
+            KeyCode::Esc => {
+                self.footer_agent_focus = None;
+                false
+            }
+            _ => {
+                self.footer_agent_focus = None;
+                self.key(key)
+            }
+        }
+    }
+
+    /// Key handling for the full-screen Agents view and its job-detail
+    /// sub-screen (see `agents_state::AgentsScreenState`).
+    fn agents_key(&mut self, key: KeyEvent) -> bool {
+        let in_detail = matches!(&self.agents_screen, Some(s) if s.detail.is_some());
+        match key.code {
+            KeyCode::Esc if in_detail => {
+                if let Some(screen) = self.agents_screen.as_mut() {
+                    screen.detail = None;
+                }
+            }
+            KeyCode::Esc | KeyCode::Right if !in_detail => {
+                self.agents_screen = None;
+            }
+            KeyCode::Up if in_detail => self.detail_scroll(|s| s.saturating_sub(1)),
+            KeyCode::Down if in_detail => self.detail_scroll(|s| s.saturating_add(1)),
+            KeyCode::PageUp if in_detail => self.detail_scroll(|s| s.saturating_sub(10)),
+            KeyCode::PageDown if in_detail => self.detail_scroll(|s| s.saturating_add(10)),
+            KeyCode::Enter if in_detail => self.toggle_detail_tools(),
+            KeyCode::Char('t')
+                if in_detail && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.toggle_detail_tools()
+            }
+            KeyCode::Up if !in_detail => {
+                if let Some(screen) = self.agents_screen.as_mut() {
+                    screen.selected = screen.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down if !in_detail => {
+                if let Some(screen) = self.agents_screen.as_mut() {
+                    let total = jobs::selectable_jobs(&screen.jobs).len();
+                    if total > 0 {
+                        screen.selected = (screen.selected + 1).min(total - 1);
+                    }
+                }
+            }
+            KeyCode::Enter if !in_detail => {
+                let job_id = self.agents_screen.as_ref().and_then(|screen| {
+                    jobs::selectable_jobs(&screen.jobs)
+                        .get(screen.selected)
+                        .map(|job| job.job_id.clone())
+                });
+                if let Some(job_id) = job_id {
+                    self.open_job_detail(job_id);
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn detail_scroll(&mut self, f: impl FnOnce(u16) -> u16) {
+        if let Some(detail) = self.agents_screen.as_mut().and_then(|s| s.detail.as_mut()) {
+            detail.scroll = f(detail.scroll);
+        }
+    }
+
+    fn toggle_detail_tools(&mut self) {
+        if let Some(detail) = self.agents_screen.as_mut().and_then(|s| s.detail.as_mut()) {
+            detail.tools_unfolded = !detail.tools_unfolded;
+        }
+    }
+
+    /// Opens the full-screen Agents view (Left from an empty/at-column-0
+    /// composer, or Enter from the focused footer panel), starting its own
+    /// 24h-window `jobs` poll. A no-op if it's already open.
+    fn open_agents_screen(&mut self) {
+        if self.agents_screen.is_some() {
+            return;
+        }
+        let jobs_handle = JobsHandle::spawn_with_args(
+            self.kernel_binary.clone(),
+            self.options.lazar_home.clone(),
+            Duration::from_secs(2),
+            vec!["--since".into(), "86400".into()],
+        );
+        self.agents_screen = Some(AgentsScreenState {
+            jobs_handle,
+            jobs: self.jobs.clone(),
+            selected: 0,
+            detail: None,
+        });
+    }
+
+    /// Enter on an Agents-screen row: fetches `jobs --show <id>` off the UI
+    /// thread and opens the job-detail sub-screen. A no-op if the job isn't
+    /// known to the (already open) Agents screen.
+    fn open_job_detail(&mut self, job_id: String) {
+        let Some(screen) = self.agents_screen.as_mut() else {
+            return;
+        };
+        let Some(job) = jobs::selectable_jobs(&screen.jobs)
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .cloned()
+        else {
+            return;
+        };
+        let fetch = jobs::fetch_job_show(
+            self.kernel_binary.clone(),
+            self.options.lazar_home.clone(),
+            job_id.clone(),
+        );
+        screen.detail = Some(JobDetailState {
+            job_id,
+            task: job.task,
+            status: job.status,
+            elapsed_s: job.elapsed_s,
+            fetch,
+            blocks: Vec::new(),
+            loading: true,
+            error: None,
+            tools_unfolded: false,
+            scroll: 0,
+            last_poll: Instant::now(),
+        });
+    }
+
     fn apply_pick(&mut self, kind: PickerKind, id: String, payload: Option<String>) {
         match kind {
             PickerKind::Provider => self.switch_provider(id),
@@ -507,15 +890,20 @@ impl App {
             PickerKind::Session => self.load_session(id),
             PickerKind::Theme => self.apply_theme(&id),
             PickerKind::Weight => self.apply_weight(&id),
+            PickerKind::Icons => self.apply_icons(&id),
             PickerKind::Slash => {
                 self.composer.replace_current_token(&format!("/{id} "));
                 match id.as_str() {
                     "theme" => self.open_theme_picker(),
                     "weight" => self.open_weight_picker(),
+                    "icons" => self.open_icons_picker(),
                     _ => {}
                 }
             }
             PickerKind::Path => self.composer.replace_current_token(&format!("@{id}")),
+            // A trailing space, unlike @-paths: `$name` is a complete
+            // directive on its own, and the kernel resolves it as typed.
+            PickerKind::Skill => self.composer.replace_current_token(&format!("${id} ")),
             PickerKind::AddDirScope => {
                 if let Some(path) = payload {
                     let scope = if id == "always" {
@@ -575,6 +963,8 @@ impl App {
             Ok(()) => {
                 self.turn_running = true;
                 self.turn_started = Some(Instant::now());
+                self.phase = None;
+                self.last_text_delta_at = None;
                 self.status = "thinking".into();
                 self.notice.clear();
             }
@@ -618,6 +1008,13 @@ impl App {
                     self.open_weight_picker()
                 } else {
                     self.apply_weight(arg)
+                }
+            }
+            "icons" => {
+                if arg.is_empty() {
+                    self.open_icons_picker()
+                } else {
+                    self.apply_icons(arg)
                 }
             }
             "session" => match arg {
@@ -800,6 +1197,47 @@ impl App {
         self.persist();
     }
 
+    fn open_icons_picker(&mut self) {
+        let current = match self.theme.icon_mode {
+            IconMode::Nerd => "nerd",
+            IconMode::Unicode => "unicode",
+            IconMode::Ascii => "ascii",
+        };
+        let items = [
+            ("nerd", "Nerd", "Nerd Font glyphs (needs a patched font)"),
+            ("unicode", "Unicode", "plain Unicode symbols"),
+            ("ascii", "ASCII", "ASCII-only fallbacks"),
+        ]
+        .into_iter()
+        .map(|(id, label, detail)| {
+            let item = PickItem::new(id, label, detail);
+            if id == current {
+                item.with_tag("active")
+            } else {
+                item
+            }
+        })
+        .collect();
+        let mut picker = Picker::new("Icons", items);
+        picker.select_id(current);
+        self.overlay = Some(Overlay::Picker {
+            kind: PickerKind::Icons,
+            picker,
+            payload: None,
+        });
+    }
+
+    fn apply_icons(&mut self, value: &str) {
+        let Some(icon_mode) = IconMode::from_name(value) else {
+            self.notice = format!("unknown icon set {value}; use nerd, unicode, or ascii");
+            return;
+        };
+        self.theme = self.theme.with_icon_mode(icon_mode);
+        self.persisted.icons = Some(value.trim().to_ascii_lowercase());
+        self.notice = format!("icons: {}", value.trim().to_ascii_lowercase());
+        self.persist();
+    }
+
     fn open_slash_picker(&mut self, query: &str) {
         let mut items: Vec<_> = SLASH_COMMANDS
             .iter()
@@ -832,9 +1270,32 @@ impl App {
             self.open_path_picker(token.trim_start_matches('@'));
         } else if token.starts_with('/') {
             self.open_slash_picker(token.trim_start_matches('/'));
+        } else if token.starts_with('$') {
+            self.open_skill_picker(token.trim_start_matches('$'));
         } else {
-            self.notice = "Tab completes an @-path or /skill token".into();
+            self.notice = "Tab completes an @-path, /skill, or $skill token".into();
         }
+    }
+
+    /// `$` picker: installed skills only (unlike `/`, which mixes in
+    /// built-in commands). The kernel resolves a leading `$name` itself, so
+    /// selecting one just inserts the literal text — nothing is expanded.
+    fn open_skill_picker(&mut self, query: &str) {
+        let items = self
+            .skills
+            .iter()
+            .map(|skill| {
+                PickItem::new(skill.name.clone(), skill.name.clone(), skill.summary.clone())
+                    .with_tag("skill")
+            })
+            .collect();
+        let mut picker = Picker::new("Skill", items);
+        picker.set_query(query);
+        self.overlay = Some(Overlay::Picker {
+            kind: PickerKind::Skill,
+            picker,
+            payload: None,
+        });
     }
 
     fn open_path_picker(&mut self, query: &str) {
@@ -1024,6 +1485,7 @@ impl App {
                 self.ready = true;
                 self.turn_running = false;
                 self.turn_started = None;
+                self.phase = None;
                 self.status = "ready".into();
                 self.persist();
             }
@@ -1043,6 +1505,7 @@ impl App {
             }
             KernelEvent::TextDelta(text) => {
                 self.transcript.append_assistant(&text);
+                self.last_text_delta_at = Some(Instant::now());
             }
             KernelEvent::ToolStart { id, command } => self.transcript.start_tool(id, command),
             KernelEvent::ToolResult {
@@ -1055,6 +1518,7 @@ impl App {
                 self.transcript.finish_assistant();
                 self.turn_running = false;
                 self.turn_started = None;
+                self.phase = None;
                 self.status = stop_reason;
                 self.persist();
             }
@@ -1064,6 +1528,8 @@ impl App {
                 self.queued = None;
                 self.turn_running = true;
                 self.turn_started = Some(Instant::now());
+                self.phase = None;
+                self.last_text_delta_at = None;
                 self.status = "thinking".into();
                 self.notice.clear();
                 self.scroll_from_bottom = 0;
@@ -1076,6 +1542,7 @@ impl App {
                 self.transcript.finish_assistant();
                 self.turn_running = false;
                 self.turn_started = None;
+                self.phase = None;
                 self.error(err);
             }
         }
@@ -1157,6 +1624,57 @@ impl App {
                     .unwrap_or_default();
                 self.transcript
                     .push_verify(status, attempt, final_, tools_run, claims);
+            }
+            "answer" => {
+                // Emitted after any "verify" event, once per turn. `reply`
+                // duplicates the already-streamed text and `verify` the
+                // already-rendered verify block, so only sources/speech are
+                // new here.
+                let speech = event.get("speech").and_then(Value::as_str).unwrap_or("").to_string();
+                let sources = event
+                    .get("sources")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .map(|s| {
+                                let raw = s.get("ref").and_then(Value::as_str).unwrap_or("").to_string();
+                                let kind = match s.get("kind").and_then(Value::as_str) {
+                                    Some("url") => SourceKind::Url,
+                                    _ => SourceKind::File,
+                                };
+                                SourceEntry {
+                                    raw,
+                                    kind,
+                                    path: s.get("path").and_then(Value::as_str).map(str::to_string),
+                                    line: s.get("line").and_then(Value::as_u64),
+                                    exists: s.get("exists").and_then(Value::as_bool),
+                                    name: s.get("name").and_then(Value::as_str).map(str::to_string),
+                                    title: s.get("title").and_then(Value::as_str).map(str::to_string),
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.transcript.push_sources(sources, speech);
+            }
+            "context" => {
+                let model = event.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+                self.context = Some(ContextInfo {
+                    input_tokens: event.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    output_tokens: event.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    window: event.get("window").and_then(Value::as_u64).unwrap_or(0),
+                    served_model: event
+                        .get("served_model")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| model.clone()),
+                    model,
+                });
+            }
+            "phase" => {
+                if let Some(phase) = event.get("phase").and_then(Value::as_str) {
+                    self.phase = Some(phase.to_string());
+                }
             }
             "invoke_start" => {
                 if let Some(model) = event.get("model").and_then(Value::as_str) {
@@ -1247,6 +1765,88 @@ impl App {
         self.persist();
     }
 
+    fn spinner_glyph(&self) -> &'static str {
+        if self.theme.has_unicode_borders() {
+            SPINNER[self.spinner_frame % SPINNER.len()]
+        } else {
+            SPINNER_ASCII[self.spinner_frame % SPINNER_ASCII.len()]
+        }
+    }
+
+    /// The command of a currently-running tool call (a `Tool` block with no
+    /// output yet), if any — for both the activity indicator's "Running
+    /// <program>" label and the status line's running-tool count.
+    fn running_tool_commands(&self) -> Vec<&str> {
+        self.transcript
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::transcript::Block::Tool { command, output: None, .. } => Some(command.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The Claude-Code-style "✻ Thinking… (12s · …)" line shown just above
+    /// the composer while a turn runs, reusing the layout's existing gap row
+    /// so no extra row is ever reserved. `None` while idle.
+    fn build_activity_line(&self) -> Option<Vec<crate::status::Segment>> {
+        let running_tools = self.running_tool_commands();
+        let input = status::ActivityInput {
+            turn_running: self.turn_running,
+            running_tool_command: running_tools.first().copied(),
+            ms_since_last_text_delta: self
+                .last_text_delta_at
+                .map(|at| at.elapsed().as_millis() as u64),
+            phase: self.phase.as_deref(),
+            elapsed_s: self.turn_started.map(|s| s.elapsed().as_secs()).unwrap_or(0),
+            input_tokens: self.context.as_ref().map(|c| c.input_tokens).unwrap_or(0),
+            output_tokens: self.context.as_ref().map(|c| c.output_tokens).unwrap_or(0),
+        };
+        status::activity_line(&input, self.spinner_glyph())
+    }
+
+    /// The two-line status plus optional agent panel shown under the
+    /// composer. Built once per frame, before layout (its row count sizes
+    /// the status slot) and reused for the render itself.
+    fn build_status_info(&self) -> StatusInfo {
+        let scroll_label = if self.scroll_from_bottom == 0 {
+            "bottom".into()
+        } else {
+            format!("{} up", self.scroll_from_bottom)
+        };
+        let cwd = compact_path(&self.options.cwd);
+        let spinner = self.spinner_glyph();
+        let running_tools = self.running_tool_commands().len();
+        let sandbox_state = self.effective_sandbox_off.then_some("sandbox off");
+        let (agent_rows, agents_more) = status::agent_rows(&self.jobs, spinner, 4);
+        StatusInfo {
+            line1: status::status_line1(&Line1Input {
+                user: &self.user,
+                host: &self.host,
+                cwd: &cwd,
+                model: self.model.as_deref().unwrap_or("kernel default"),
+                context: self.context.as_ref(),
+            }),
+            line2: status::status_line2(&Line2Input {
+                provider: self.provider.as_deref(),
+                sandbox_state,
+                running_tools,
+                agent_count: self.jobs.len(),
+                queued: self.queued.is_some(),
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                turn_elapsed_s: self.turn_started.map(|started| started.elapsed().as_secs()),
+                scroll_label: &scroll_label,
+                notice: &self.notice,
+                stale_binary: self.stale_binary_notice.as_deref(),
+            }),
+            agent_rows,
+            agents_more,
+            focused_agent_row: self.footer_agent_focus,
+        }
+    }
+
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         frame.render_widget(FrameBlock::default().style(self.theme.canvas), area);
@@ -1260,18 +1860,31 @@ impl App {
             horizontal: gutter,
             vertical: 0,
         });
-        let max_width = available.width.min(132);
+        // Use the whole terminal width.
+        let max_width = available.width;
         let [content] = Layout::horizontal([Constraint::Length(max_width)])
             .flex(Flex::Center)
             .areas(available);
+        if self.agents_screen.is_some() {
+            self.draw_agents_screen(frame, content);
+            return;
+        }
         let composer_height = self.composer.height(content.width.saturating_sub(6)) + 2;
         let gap = u16::from(area.height >= 12);
-        let [header, transcript_slot, _, composer_area, footer] = Layout::vertical([
-            Constraint::Length(1),
+        // Built before the layout so its row count (line1 + line2 always,
+        // plus one row per job and an optional "+N more") can size the
+        // status slot before it's actually rendered, below.
+        let status_info = self.build_status_info();
+        let activity_line = self.build_activity_line();
+        let [header, transcript_slot, activity_area, composer_area, footer] = Layout::vertical([
+            // Header bar plus its underline row (see render_header).
+            Constraint::Length(2),
             Constraint::Min(2),
+            // Reused for the "✻ Thinking…" activity indicator while a turn
+            // runs; otherwise the same blank gap row as before.
             Constraint::Length(gap),
             Constraint::Length(composer_height),
-            Constraint::Length(1),
+            Constraint::Length(status_info.height()),
         ])
         .areas(content);
         render_header(
@@ -1340,15 +1953,10 @@ impl App {
             self.scroll_from_bottom == 0,
             &self.theme,
         );
+        if let Some(segments) = &activity_line {
+            render_activity(frame, activity_area, &self.theme, segments);
+        }
 
-        let composer_meta = composer_metadata(
-            self.model.as_deref().unwrap_or("kernel default"),
-            self.provider.as_deref().unwrap_or("legacy"),
-            self.theme.name(),
-            self.theme.glyph(" · ", " | "),
-            self.theme.glyph("…", "..."),
-            composer_area.width.saturating_sub(4) as usize,
-        );
         let composer_block = FrameBlock::default()
             .borders(Borders::ALL)
             .border_type(if self.theme.has_unicode_borders() {
@@ -1363,12 +1971,7 @@ impl App {
             } else {
                 self.theme.composer_border_active
             })
-            .style(self.theme.composer_surface)
-            .title_bottom(Span::styled(
-                format!(" {composer_meta} "),
-                self.theme.footer.patch(self.theme.composer_surface),
-            ))
-            .title_alignment(Alignment::Right);
+            .style(self.theme.composer_surface);
         let block_inner = composer_block.inner(composer_area);
         frame.render_widget(composer_block, composer_area);
         let editor_area = Rect {
@@ -1388,29 +1991,10 @@ impl App {
             self.theme.dim.patch(self.theme.composer_surface),
             composer_ghost(self.composer.text().as_str()),
         );
-        let scroll_label = if self.scroll_from_bottom == 0 {
-            "bottom".into()
-        } else {
-            format!("{} up", self.scroll_from_bottom)
-        };
-        let cwd = compact_path(&self.options.cwd);
-        render_footer(
-            frame,
-            footer,
-            &self.theme,
-            &FooterInfo {
-                cwd: &cwd,
-                input_tokens: self.input_tokens,
-                output_tokens: self.output_tokens,
-                scroll: &scroll_label,
-                queued: self.queued.is_some(),
-                notice: &self.notice,
-                turn_elapsed: self.turn_started.map(|started| started.elapsed().as_secs()),
-            },
-        );
+        render_status(frame, footer, &self.theme, &status_info);
         if let Some(Overlay::Picker { kind, picker, .. }) = self.overlay.as_mut() {
             match kind {
-                PickerKind::Slash | PickerKind::Path => {
+                PickerKind::Slash | PickerKind::Path | PickerKind::Skill => {
                     picker.render_completion(frame, composer_area, &self.theme)
                 }
                 _ => picker.render(frame, content, &self.theme),
@@ -1445,6 +2029,33 @@ impl App {
                     self.overlay_scroll,
                 ),
             }
+        }
+    }
+
+    /// The full-screen Agents view: either the job list, or — with a job
+    /// selected — its detail sub-screen. Replaces the whole chat layout
+    /// while open (see `draw`).
+    fn draw_agents_screen(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(screen) = &self.agents_screen else {
+            return;
+        };
+        if let Some(detail) = &screen.detail {
+            render_job_detail(frame, area, &self.theme, &self.highlighter, detail, self.spinner_glyph());
+        } else {
+            let cwd = compact_path(&self.options.cwd);
+            let spinner = self.spinner_glyph();
+            render_agents_list(
+                frame,
+                area,
+                &self.theme,
+                &AgentsListInfo {
+                    model: self.model.as_deref().unwrap_or("kernel default"),
+                    cwd: &cwd,
+                    jobs: &screen.jobs,
+                    selected: screen.selected,
+                    spinner,
+                },
+            );
         }
     }
 
@@ -1510,6 +2121,13 @@ impl App {
     }
 }
 
+/// The Left key opens the Agents screen only when the composer has nothing
+/// typed, or the cursor sits at column 0 of whatever line it's on —
+/// otherwise Left just moves the cursor, as usual.
+fn should_open_agents_screen(composer_empty: bool, cursor_col: usize) -> bool {
+    composer_empty || cursor_col == 0
+}
+
 fn prompt_limit_notice(text: &str) -> Option<String> {
     const MAX_PROMPT_BYTES: usize = 9_000;
     if text.len() > MAX_PROMPT_BYTES {
@@ -1520,6 +2138,45 @@ fn prompt_limit_notice(text: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// `user@host` for the status line. No crate carries this cross-platform, so
+/// this reads the usual env vars and shells out to `hostname` once, at
+/// startup — never per frame.
+fn current_user_host() -> (String, String) {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".into());
+    let host = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|h| !h.is_empty())
+        })
+        .unwrap_or_else(|| "host".into());
+    (user, host)
+}
+
+/// Cheap `stat()` for the stale-binary check: unreadable/missing paths are
+/// `None`, not an error — a transient stat failure should never itself read
+/// as "the binary changed" (see `status::binary_replaced`).
+fn fingerprint(path: &Path) -> Option<status::FileFingerprint> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let mtime_secs = modified
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some(status::FileFingerprint {
+        mtime_secs,
+        inode: metadata.ino(),
+    })
 }
 
 fn compact_path(path: &Path) -> String {
@@ -1574,68 +2231,17 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn composer_metadata(
-    model: &str,
-    provider: &str,
-    theme: &str,
-    separator: &str,
-    ellipsis: &str,
-    width: usize,
-) -> String {
-    let choices = [
-        format!("{model}{separator}{provider}{separator}{theme}"),
-        format!("{model}{separator}{theme}"),
-        model.to_string(),
-    ];
-    choices
-        .into_iter()
-        .find(|value| value.width() <= width)
-        .unwrap_or_else(|| truncate_columns(model, width, ellipsis))
-}
-
 fn composer_ghost(text: &str) -> Option<&'static str> {
     match text {
         "/theme " => Some("<theme>"),
         "/weight " => Some("<thin | regular>"),
+        "/icons " => Some("<nerd | unicode | ascii>"),
         "/model " => Some("<model>"),
         "/provider " => Some("<provider>"),
         "/session " => Some("<new | list | session-id>"),
         "/add-dir " => Some("<path>"),
         _ => None,
     }
-}
-
-fn truncate_columns(text: &str, width: usize, ellipsis: &str) -> String {
-    if text.width() <= width {
-        return text.to_string();
-    }
-    if width == 0 {
-        return String::new();
-    }
-    let marker = fit_prefix(ellipsis, width);
-    let budget = width.saturating_sub(marker.width());
-    let mut out = String::new();
-    for c in text.chars() {
-        let candidate = format!("{out}{c}");
-        if candidate.width() > budget {
-            break;
-        }
-        out.push(c);
-    }
-    out.push_str(&marker);
-    out
-}
-
-fn fit_prefix(text: &str, width: usize) -> String {
-    let mut out = String::new();
-    for c in text.chars() {
-        let candidate = format!("{out}{c}");
-        if candidate.width() > width {
-            break;
-        }
-        out.push(c);
-    }
-    out
 }
 
 fn preserve_parked_scroll(
@@ -1682,6 +2288,98 @@ mod tests {
 
     fn char_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn new_test_app(root: &Path) -> App {
+        App::new(LaunchOptions {
+            lazar_home: root.to_path_buf(),
+            cwd: root.to_path_buf(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        })
+    }
+
+    #[test]
+    fn left_key_opens_the_agents_screen_only_at_column_zero_or_an_empty_composer() {
+        assert!(should_open_agents_screen(true, 5), "empty composer: any column");
+        assert!(should_open_agents_screen(false, 0), "non-empty composer at column 0");
+        assert!(!should_open_agents_screen(false, 1), "mid-line: Left just moves the cursor");
+    }
+
+    #[test]
+    fn down_from_an_empty_composer_focuses_the_footer_panel_and_up_past_the_top_returns_focus() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-footer-focus-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = new_test_app(&root);
+
+        // No jobs yet: Down is ordinary composer navigation, not a focus.
+        assert!(!app.key(plain_key(KeyCode::Down)));
+        assert!(app.footer_agent_focus.is_none());
+
+        app.jobs = vec![Job { job_id: "1".into(), task: "a".into(), status: "running".into(), ..Job::default() }];
+        assert!(!app.key(plain_key(KeyCode::Down)));
+        assert_eq!(app.footer_agent_focus, Some(0));
+
+        // Up at the top returns focus to the composer.
+        assert!(!app.key(plain_key(KeyCode::Up)));
+        assert!(app.footer_agent_focus.is_none());
+
+        // Refocus, then an ordinary keypress drops focus and reaches the
+        // composer instead of being swallowed.
+        assert!(!app.key(plain_key(KeyCode::Down)));
+        assert!(!app.key(char_key('x')));
+        assert!(app.footer_agent_focus.is_none());
+        assert_eq!(app.composer.text(), "x");
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn esc_navigates_back_through_job_detail_then_the_agents_list_then_to_chat() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-agents-esc-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = new_test_app(&root);
+
+        app.open_agents_screen();
+        assert!(app.agents_screen.is_some());
+        {
+            let screen = app.agents_screen.as_mut().unwrap();
+            screen.jobs = vec![Job { job_id: "1".into(), task: "a".into(), status: "running".into(), ..Job::default() }];
+        }
+        app.open_job_detail("1".into());
+        assert!(app.agents_screen.as_ref().unwrap().detail.is_some());
+
+        // Esc from detail: back to the list, screen stays open.
+        assert!(!app.key(plain_key(KeyCode::Esc)));
+        assert!(app.agents_screen.is_some());
+        assert!(app.agents_screen.as_ref().unwrap().detail.is_none());
+
+        // Esc from the list: back to chat.
+        assert!(!app.key(plain_key(KeyCode::Esc)));
+        assert!(app.agents_screen.is_none());
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1828,6 +2526,99 @@ mod tests {
             .blocks
             .iter()
             .any(|b| matches!(b, crate::transcript::Block::Marker { text } if text.contains("KB"))));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn activity_line_is_none_while_idle_and_reports_a_running_tool_when_busy() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-activity-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+
+        assert!(app.build_activity_line().is_none(), "idle: no row reserved");
+
+        app.turn_running = true;
+        app.turn_started = Some(Instant::now());
+        app.transcript.start_tool("t1", "cargo build --release");
+        let segments = app.build_activity_line().expect("turn running");
+        assert!(segments[0].text.contains("Running cargo"), "{segments:?}");
+
+        app.transcript.finish_tool("t1", "ok".into(), Some(0));
+        app.phase = Some("verifying".into());
+        let segments = app.build_activity_line().expect("turn running");
+        assert!(segments[0].text.contains("Verifying"), "{segments:?}");
+
+        app.handle_kernel_event(KernelEvent::TurnFinished { stop_reason: "end_turn".into() });
+        assert!(app.build_activity_line().is_none(), "phase resets at turn end");
+        assert!(app.phase.is_none());
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn answer_events_become_a_sources_block_and_store_speech() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-answer-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+
+        app.handle_lazar_event(serde_json::json!({
+            "type": "answer",
+            "reply": "the fix is in x.rs",
+            "speech": "It's fixed.",
+            "sources": [
+                {"ref": "/abs/x.rs:42", "kind": "file", "path": "/abs/x.rs", "line": 42, "exists": true},
+                {"ref": "/abs/gone.rs:7", "kind": "file", "path": "/abs/gone.rs", "line": 7, "exists": false},
+                {"ref": "https://example.com/page", "kind": "url"},
+            ],
+            "verify": {"status": "none", "claims": 0},
+        }));
+
+        assert_eq!(app.transcript.last_speech.as_deref(), Some("It's fixed."));
+        match app.transcript.blocks.last() {
+            Some(crate::transcript::Block::Sources { entries, speech }) => {
+                assert_eq!(speech, "It's fixed.");
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].path.as_deref(), Some("/abs/x.rs"));
+                assert_eq!(entries[0].line, Some(42));
+                assert_eq!(entries[0].exists, Some(true));
+                assert_eq!(entries[1].exists, Some(false));
+                assert!(matches!(entries[2].kind, crate::transcript::SourceKind::Url));
+            }
+            other => panic!("{other:?}"),
+        }
 
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -2014,6 +2805,58 @@ mod tests {
     }
 
     #[test]
+    fn dollar_opens_a_skills_only_picker_and_sends_the_prompt_verbatim() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-dollar-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("user/skills")).unwrap();
+        fs::write(root.join("user/skills/INDEX.md"), "- todo — task list\n").unwrap();
+
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+        app.ready = true;
+
+        app.key(char_key('$'));
+        let Overlay::Picker { kind, picker, .. } = app.overlay.as_ref().unwrap() else {
+            panic!("$ did not open a picker");
+        };
+        assert_eq!(*kind, PickerKind::Skill);
+        // Only skills, no built-in commands like "model".
+        assert!(picker.filtered().iter().any(|(_, item)| item.id == "todo"));
+        assert!(!picker.filtered().iter().any(|(_, item)| item.id == "model"));
+
+        app.apply_pick(PickerKind::Skill, "todo".into(), None);
+        assert_eq!(app.composer.text(), "$todo ");
+
+        // The kernel resolves a leading `$name` itself; the TUI must not
+        // expand or otherwise rewrite it before sending.
+        app.composer.insert_str("do the thing");
+        app.submit_composer(false);
+        // submit_composer sends through send_prompt -> kernel.prompt(text),
+        // which also records the text verbatim in the transcript.
+        assert!(app
+            .transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b, crate::transcript::Block::User { text } if text == "$todo do the thing")));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn theme_picker_previews_reverts_and_persists() {
         let root = std::env::temp_dir().join(format!(
             "lazartui-theme-{}-{:?}",
@@ -2081,6 +2924,216 @@ mod tests {
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.theme.thin);
         assert!(PersistedState::load(&state_path(&root)).thin);
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_pickers_clear_the_composer_on_pick_and_on_cancel() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-picker-clears-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+
+        // Reached via the slash live-completion flow: the composer holds
+        // "/theme " when the (unprefixed) Theme picker opens over it.
+        app.key(char_key('/'));
+        for c in "theme".chars() {
+            app.key(char_key(c));
+        }
+        app.key(char_key(' '));
+        assert_eq!(app.composer.text(), "/theme ");
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "", "picking a theme clears the stale /theme token");
+
+        app.key(char_key('/'));
+        for c in "weight".chars() {
+            app.key(char_key(c));
+        }
+        app.key(char_key(' '));
+        assert_eq!(app.composer.text(), "/weight ");
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.composer.text(), "", "cancelling also clears the command token");
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn notices_are_transient_expiring_after_3s_or_on_the_next_keypress() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-transient-notice-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+
+        // Exercise `expire_notice` directly rather than the full `tick`: the
+        // fake `/usr/bin/false` kernel exits immediately and its background
+        // "connection closed" error would otherwise race this notice.
+        app.notice = "hook trace visible".into();
+        app.expire_notice();
+        assert_eq!(app.notice, "hook trace visible", "not expired yet");
+        app.notice_set_at = Instant::now() - Duration::from_secs(4);
+        app.expire_notice();
+        assert!(app.notice.is_empty(), "expires ~3s after it was set");
+
+        app.notice = "another notice".into();
+        app.expire_notice();
+        assert!(!app.notice.is_empty());
+        app.key(char_key('x'));
+        assert!(app.notice.is_empty(), "a keypress dismisses it immediately");
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_binary_notice_appears_once_after_a_rebuild_and_never_clears_itself() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-stale-binary-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let script = root.join("fake-lazar");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(script.clone()),
+            thin: None,
+        });
+        assert!(app.stale_binary_notice.is_none());
+
+        // Not due for a recheck yet: unchanged even if the file were newer.
+        let file = fs::File::open(&script).unwrap();
+        file.set_modified(SystemTime::now() + Duration::from_secs(60)).unwrap();
+        app.check_stale_binary();
+        assert!(app.stale_binary_notice.is_none(), "checked too soon");
+
+        // Due for a recheck, and the kernel binary is now newer: notice.
+        app.last_binary_check = Instant::now() - Duration::from_secs(6);
+        app.check_stale_binary();
+        let notice = app.stale_binary_notice.clone().expect("stale build detected");
+        assert!(notice.contains("restart lazartui"), "{notice:?}");
+        assert!(
+            status::status_line2(&Line2Input {
+                provider: None,
+                sandbox_state: None,
+                running_tools: 0,
+                agent_count: 0,
+                queued: false,
+                input_tokens: 0,
+                output_tokens: 0,
+                turn_elapsed_s: None,
+                scroll_label: "bottom",
+                notice: "",
+                stale_binary: app.stale_binary_notice.as_deref(),
+            })
+            .iter()
+            .any(|s| s.text == notice && s.tone == status::Tone::Warn)
+        );
+
+        // Doesn't nag: it stays exactly as it was after further checks, even
+        // once the recheck interval has passed again.
+        app.last_binary_check = Instant::now() - Duration::from_secs(6);
+        app.check_stale_binary();
+        assert_eq!(app.stale_binary_notice, Some(notice));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn icons_command_switches_and_persists_the_icon_mode() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-icons-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+
+        app.composer.set_text("/icons ascii");
+        assert!(app.handle_slash(&app.composer.text()));
+        assert_eq!(app.theme.icon_mode, crate::render::theme::IconMode::Ascii);
+        assert_eq!(
+            PersistedState::load(&state_path(&root)).icons.as_deref(),
+            Some("ascii")
+        );
+
+        app.composer.clear();
+        app.key(char_key('/'));
+        for c in "icons".chars() {
+            app.key(char_key(c));
+        }
+        app.key(char_key(' '));
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::Picker {
+                kind: PickerKind::Icons,
+                ..
+            })
+        ));
+        app.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.theme.icon_mode, crate::render::theme::IconMode::Unicode);
+        assert_eq!(
+            PersistedState::load(&state_path(&root)).icons.as_deref(),
+            Some("unicode")
+        );
 
         drop(app);
         fs::remove_dir_all(root).unwrap();

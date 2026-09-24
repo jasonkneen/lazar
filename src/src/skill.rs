@@ -4,6 +4,7 @@
 //!
 //!   [skill:<name>] <request>     the lazartui `/name` expansion
 //!   /<name> <request>            an ACP slash command (Zed and friends)
+//!   $<name> <request>            a skill mention (the lazartui `$` picker)
 //!
 //! The kernel resolves `$LAZAR_HOME/skills/<name>/SKILL.md` itself and puts
 //! its contents into the user message. The model never has to know a naming
@@ -73,7 +74,9 @@ pub fn parse_directive(prompt: &str) -> Option<(Directive, String, String)> {
         let rest = after[close + 1..].trim();
         return Some((Directive::Explicit, name.to_string(), rest.to_string()));
     }
-    if let Some(after) = trimmed.strip_prefix('/') {
+    // `$name` behaves like `/name`: a skill only when one is installed, so
+    // `$HOME is…` or `$5` stays ordinary text.
+    if let Some(after) = trimmed.strip_prefix('/').or_else(|| trimmed.strip_prefix('$')) {
         let (name, rest) = match after.find(char::is_whitespace) {
             Some(i) => (&after[..i], after[i..].trim()),
             None => (after, ""),
@@ -89,7 +92,7 @@ pub fn parse_directive(prompt: &str) -> Option<(Directive, String, String)> {
 pub enum Directive {
     /// `[skill:name]` — the client asked for this skill by name.
     Explicit,
-    /// `/name` — a slash command; only a skill if one by that name exists.
+    /// `/name` or `$name` — only a skill if one by that name exists.
     Slash,
 }
 
@@ -234,6 +237,21 @@ fn short(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dollar_mentions_a_skill_but_leaves_shell_text_alone() {
+        assert_eq!(
+            parse_directive("$memory note this"),
+            Some((Directive::Slash, "memory".into(), "note this".into()))
+        );
+        let root = std::env::temp_dir().join(format!("lazar-dollar-{}", std::process::id()));
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::write(root.join("memory/SKILL.md"), "# memory\nKeep notes.").unwrap();
+        assert_eq!(resolve("$memory note this", &root).unwrap().unwrap().name, "memory");
+        assert!(resolve("$HOME is where?", &root).unwrap().is_none());
+        assert!(resolve("$5 is cheap", &root).unwrap().is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     fn fixture() -> PathBuf {

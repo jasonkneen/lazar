@@ -141,6 +141,31 @@ bash "$LAZAR_HOME/scripts/kernel-build.sh"
 info "building TUI via scripts/tui-build.sh"
 bash "$LAZAR_HOME/scripts/tui-build.sh"
 
+# --- Icon font: Nerd Font symbols for lazartui (skip with LAZAR_SKIP_FONTS=1) ---
+# A terminal draws with its own font, so lazar cannot ship icons inside the
+# TUI. The symbols-only Nerd Font is small and, once installed, terminals that
+# fall back per glyph (Ghostty, kitty, WezTerm, iTerm2) render the icons with
+# any main font. lazartui switches to Nerd icons when it finds one installed.
+FONT_DIR="$HOME/Library/Fonts"
+if [[ "${LAZAR_SKIP_FONTS:-0}" == "1" ]]; then
+    info "skipping icon font (LAZAR_SKIP_FONTS=1)"
+elif ls "$FONT_DIR" 2>/dev/null | grep -qi 'nerd'; then
+    info "Nerd Font already installed"
+elif command -v brew >/dev/null 2>&1 && brew install --cask font-symbols-only-nerd-font >/dev/null 2>&1; then
+    info "installed Symbols Nerd Font (brew)"
+else
+    FONT_ZIP=$(mktemp -t lazar-nerd-symbols).zip
+    if curl -fsSL -o "$FONT_ZIP" \
+        https://github.com/ryanoasis/nerd-fonts/releases/latest/download/NerdFontsSymbolsOnly.zip \
+        && mkdir -p "$FONT_DIR" \
+        && unzip -o -q "$FONT_ZIP" '*.ttf' -d "$FONT_DIR"; then
+        info "installed Symbols Nerd Font into $FONT_DIR"
+    else
+        info "could not install the icon font; lazartui falls back to Unicode icons"
+    fi
+    rm -f "$FONT_ZIP"
+fi
+
 # --- Optional: factory reset of runtime state (the kernel itself is untouched) ---
 if [[ "${LAZAR_RESET_ALL:-0}" == "1" ]]; then
     info "LAZAR_RESET_ALL=1 — resetting skills/hooks/memory/workspace/logs"

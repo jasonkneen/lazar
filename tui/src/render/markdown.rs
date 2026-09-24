@@ -499,7 +499,7 @@ mod tests {
     #[test]
     fn renders_headings_lists_code_and_tables() {
         let hl = Highlighter::new();
-        let theme = Theme::nerv();
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let md = "# Title\n\nSome *em* and **strong** and `code`.\n\n- one\n- two\n  1. nested\n\n```bash\necho hi\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
         let lines = plain(&render_markdown(md, &theme, &hl));
         assert_eq!(lines[0], "# Title");
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn unterminated_fence_while_streaming_still_renders() {
         let hl = Highlighter::new();
-        let theme = Theme::nerv();
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let lines = plain(&render_markdown(
             "text\n\n```rust\nfn main() {",
             &theme,
@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn blockquotes_and_task_lists() {
         let hl = Highlighter::new();
-        let theme = Theme::nerv();
+        let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let lines = plain(&render_markdown(
             "> quoted\n\n- [x] done\n- [ ] todo\n",
             &theme,

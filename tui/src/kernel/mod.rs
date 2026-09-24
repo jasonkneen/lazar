@@ -156,7 +156,15 @@ struct KernelProcess {
 impl KernelProcess {
     fn start(config: &KernelConfig) -> Result<Self, String> {
         let mut command = Command::new(&config.binary);
-        command.arg("acp").arg("--cwd").arg(&config.cwd);
+        // The TUI only ever speaks the structured answer protocol (SPEAK /
+        // SOURCES tags plus a trailing `answer` event), so it always asks
+        // for it — unlike other ACP clients, which may still want raw text.
+        command
+            .arg("acp")
+            .arg("--cwd")
+            .arg(&config.cwd)
+            .arg("--answer-format")
+            .arg("structured");
         if let Some(provider) = config.provider.as_deref() {
             command.arg("--provider").arg(provider);
         }
@@ -692,6 +700,7 @@ mod tests {
             &script,
             r####"#!/usr/bin/env bash
 set -u
+printf '%s\n' "$*" > "$LAZAR_HOME/argv"
 LOG="$LAZAR_HOME/requests.jsonl"
 while IFS= read -r line; do
     printf '%s\n' "$line" >>"$LOG"
@@ -973,6 +982,12 @@ done
         }
         thread::sleep(Duration::from_millis(50));
         drop(handle);
+
+        let argv = fs::read_to_string(root.join("argv")).unwrap();
+        assert!(
+            argv.contains("--answer-format structured"),
+            "the TUI is a structured-answer client: {argv:?}"
+        );
 
         let requests: Vec<Value> = fs::read_to_string(root.join("requests.jsonl"))
             .unwrap()

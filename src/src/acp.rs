@@ -66,6 +66,11 @@ pub struct AcpArgs {
     #[arg(long, conflicts_with = "sandbox")]
     pub no_sandbox: bool,
 
+    /// `structured`: end every answer with a typed record (reply, speech,
+    /// sources, verification) for rich clients. Default `raw`.
+    #[arg(long, value_name = "raw|structured", value_parser = ["raw", "structured"])]
+    pub answer_format: Option<String>,
+
     /// Default working directory when a session does not override cwd.
     #[arg(long, value_name = "PATH")]
     pub cwd: Option<PathBuf>,
@@ -983,6 +988,9 @@ pub fn run(args: AcpArgs) -> Result<(), Box<dyn std::error::Error>> {
     ensure_hooks_seeded();
     if let Some(provider) = args.provider.as_deref() {
         env::set_var("LAZAR_PROVIDER", provider);
+    }
+    if let Some(format) = args.answer_format.as_deref() {
+        env::set_var("LAZAR_ANSWER_FORMAT", format);
     }
     if let Some(model) = args.model.as_deref() {
         env::set_var("LAZAR_MODEL", model);

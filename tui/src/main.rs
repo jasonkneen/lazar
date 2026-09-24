@@ -1,6 +1,8 @@
 mod access;
+mod agents_state;
 mod app;
 mod composer;
+mod jobs;
 mod kernel;
 mod keys;
 mod overlays;
@@ -8,6 +10,8 @@ mod providers;
 mod render;
 mod skills;
 mod state;
+mod status;
+mod timeline;
 mod transcript;
 
 use app::{App, LaunchOptions};
