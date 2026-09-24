@@ -1834,6 +1834,75 @@ mod tests {
     }
 
     #[test]
+    fn verify_events_become_transcript_blocks_and_kernel_nudges_are_hidden_from_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "lazartui-verify-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut app = App::new(LaunchOptions {
+            lazar_home: root.clone(),
+            cwd: root.clone(),
+            add_dirs: vec![],
+            provider: None,
+            model: None,
+            session_id: None,
+            no_sandbox: false,
+            kernel: Some(PathBuf::from("/usr/bin/false")),
+            thin: None,
+        });
+
+        app.handle_lazar_event(serde_json::json!({
+            "type":"verify","status":"passed","attempt":1,"final":true,"tools_run":1,
+            "claims":[{"claim":"exists=/tmp/x","ok":true,"detail":"exists"}],
+        }));
+        assert!(matches!(
+            app.transcript.blocks.last(),
+            Some(crate::transcript::Block::Verify {
+                status: crate::transcript::VerifyStatus::Passed,
+                ..
+            })
+        ));
+
+        app.handle_lazar_event(serde_json::json!({
+            "type":"verify","status":"failed","attempt":1,"final":false,"tools_run":2,
+            "claims":[{"claim":"exists=/tmp/x","ok":false,"detail":"missing"}],
+        }));
+        assert!(matches!(
+            app.transcript.blocks.last(),
+            Some(crate::transcript::Block::Verify {
+                status: crate::transcript::VerifyStatus::Failed,
+                final_: false,
+                ..
+            })
+        ));
+
+        // A replayed operator-role kernel nudge is not something the user
+        // typed; it must not show up as a user message in the transcript.
+        app.handle_kernel_event(KernelEvent::HistoryUser(
+            "[kernel verification] your previous reply failed a check".into(),
+        ));
+        assert!(!app
+            .transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b, crate::transcript::Block::User { text } if text.contains("kernel verification"))));
+
+        // An ordinary replayed user message still comes through.
+        app.handle_kernel_event(KernelEvent::HistoryUser("hello there".into()));
+        assert!(app
+            .transcript
+            .blocks
+            .iter()
+            .any(|b| matches!(b, crate::transcript::Block::User { text } if text == "hello there")));
+
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn oversized_prompt_is_rejected_before_transport() {
         let root = std::env::temp_dir().join(format!(
             "lazartui-prompt-limit-{}-{:?}",

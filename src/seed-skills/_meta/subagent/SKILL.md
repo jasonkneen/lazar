@@ -54,8 +54,9 @@ The spawn `-p` string stays thin and points at the BRIEF.
 
 ## Gate on the envelope
 
-`lazar-spawn` re-checks EXPECT-VERIFY and returns
-`{"status":"ok","matched":true}` only if claims hold. Trust `matched`, not
+`lazar-spawn` re-checks EXPECT-VERIFY with the kernel's checker
+(`lazar verify`, the same claim language as a turn's `[VERIFY]` block) and
+returns `{"status":"ok","matched":true}` only if claims hold. Trust `matched`, not
 child prose. On `matched:false`, fix the BRIEF and retry within ceilings.
 
 ## Bounds (all models)

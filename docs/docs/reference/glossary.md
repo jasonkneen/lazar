@@ -16,8 +16,14 @@ prompt, response, tool call, and result. Recorded by the kernel, loaded only
 via bounded recipes.
 
 **EXPECT-VERIFY** — the testable claims a parent authors for a spawned task;
-`lazar-spawn` re-checks them against the filesystem before reporting
+`lazar-spawn` re-checks them with `lazar verify` before reporting
 `matched: true`.
+
+**[VERIFY]** — the block of claims (`exists=`, `not_exists=`, `size=`,
+`size_at_least=`, `size_at_most=`, `contains=`, `mtime_within=`) that ends any
+answer asserting an outcome. The kernel checks each claim against the
+filesystem; a failure earns one correction turn, a second ends the turn as
+`grounding_failed`. `lazar verify` runs the same checker from a script.
 
 **grounding** — the discipline of proving file-state claims with real
 commands (run the tool, read the output) rather than narrating an outcome.

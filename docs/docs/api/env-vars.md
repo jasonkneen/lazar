@@ -51,6 +51,7 @@ by bundled helper scripts. Provider key names come from the checked-in
 | `LAZAR_NO_SANDBOX` | `1` forces the sandbox off for the invocation. |
 | `LAZAR_GUARDRAILS` | One-build override read by `scripts/kernel-build.sh`, not the kernel. `on` relocks and `off` leaves `bin/` and `src/` writable. Without it, the builder follows operator-owned `$LAZAR_HOME/.guardrails`; that persisted mode is also read when the next kernel process starts. |
 | `LAZAR_TOOL_TIMEOUT_SECS` | Wall-clock timeout per bash tool call. |
+| `LAZAR_VERIFY` | Grounded verification of `[VERIFY]` claims, on by default. `0` / `off` disables the check (for evals or debugging only). |
 | `LAZAR_TOOL_OUTPUT_MAX_BYTES` | Cap on captured tool output returned to the model (default 32000 bytes, up to 256000). Older outputs are elided further by in-turn compaction. |
 | `LAZAR_TOOL_ENV` | Set to `1` on every tool subprocess. A nested `lazar` only trusts `LAZAR_INHERITED_CWD` / `LAZAR_INHERITED_ADD_DIRS` when this marker is present. |
 | `LAZAR_TOOL_INHERIT_PROVIDER_KEY` | Operator opt-in on the parent Lazar process. `1` exposes only the active catalog provider's named key to tool subprocesses so nested Lazar calls can authenticate. Default is isolation. |

@@ -65,7 +65,8 @@ Guardrails OFF removes *enforcement*, not *discipline*. Still true:
 
 - Kernel edits go through `workspace/proposals/` + `scripts/kernel-apply.sh`.
 - Back up before destructive edits (`engineering/safe-edit`).
-- VERIFY still runs — grounding is independent of the sandbox.
+- VERIFY still runs — the kernel checks every `[VERIFY]` claim against the
+  filesystem whatever the sandbox mode (only `LAZAR_VERIFY=0` turns it off).
 - Do nothing the operator did not ask for. Full access is trust, not licence.
 
 ## Re-locking after a kernel rebuild
