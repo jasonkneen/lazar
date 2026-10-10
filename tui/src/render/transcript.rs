@@ -105,7 +105,7 @@ impl RenderCache {
         spinner_frame: usize,
     ) -> Vec<Line<'static>> {
         self.entries.truncate(transcript.blocks.len());
-        let plan = tool_fold_plan(&transcript.blocks, transcript.hooks_visible());
+        let plan = tool_fold_plan(&transcript.blocks, transcript.hooks_visible(), false);
         let mut out = Vec::new();
         for (i, block) in transcript.blocks.iter().enumerate() {
             // Entries are indexed by block; a folded block still needs its
@@ -189,15 +189,11 @@ fn tool_is_live(block: &Block) -> bool {
     matches!(block, Block::Tool { running: true, .. } | Block::Tool { output: None, .. })
 }
 
-fn tool_folded(block: &Block) -> bool {
-    matches!(block, Block::Tool { folded: true, .. } | Block::Tool { output: None, .. })
-}
-
 /// Cascading fold: a finished run of consecutive tool calls (something came
 /// after it) collapses to one row; the live run at the tail collapses each
 /// stretch of same-program calls, keeping the running call on its own row.
 /// Unfolding (^T) shows every call.
-fn tool_fold_plan(blocks: &[Block], hooks_visible: bool) -> Vec<Fold> {
+fn tool_fold_plan(blocks: &[Block], hooks_visible: bool, tools_unfolded: bool) -> Vec<Fold> {
     let mut plan = vec![Fold::Show; blocks.len()];
     let skippable = |b: &Block| matches!(b, Block::Hook { .. }) && !hooks_visible;
     let mut i = 0;
@@ -214,15 +210,16 @@ fn tool_fold_plan(blocks: &[Block], hooks_visible: bool) -> Vec<Fold> {
             }
             j += 1;
         }
-        let all_folded = run.iter().all(|&k| tool_folded(&blocks[k]));
+        // Collapse any finished run of 2+ tools into one summary row.
+        // Only the live run (if any) escapes fold; it stays as individual rows.
         let finished = j < blocks.len() && !run.iter().any(|&k| tool_is_live(&blocks[k]));
-        if all_folded && finished && run.len() > 1 {
+        if finished && run.len() > 1 && !tools_unfolded {
             plan[run[0]] = Fold::Summary(run.clone());
             for &k in &run[1..] {
                 plan[k] = Fold::Hide;
             }
-        } else if all_folded {
-            // Live: fold each stretch of finished same-program calls.
+        } else {
+            // Live tail: keep the running call visible, but fold finished same-program stretches.
             let mut s = 0;
             while s < run.len() {
                 let program = match &blocks[run[s]] { Block::Tool { command, .. } => tool_program(command), _ => "" };
@@ -234,7 +231,7 @@ fn tool_fold_plan(blocks: &[Block], hooks_visible: bool) -> Vec<Fold> {
                 {
                     e += 1;
                 }
-                if e > s {
+                if e > s && !tools_unfolded {
                     plan[run[s]] = Fold::Summary(run[s..=e].to_vec());
                     for &k in &run[s + 1..=e] {
                         plan[k] = Fold::Hide;
@@ -574,6 +571,7 @@ pub(crate) fn render_block(
             if *folded || output.is_none() {
                 // Folded or still running: the header is one row — the
                 // command's first line, cut with … so the status always fits.
+                // When folded the raw command is hidden; ^T restores it.
                 let first = args.lines().next().unwrap_or("");
                 let more = command.trim().lines().nth(1).is_some();
                 let budget = (width as usize)
@@ -1269,7 +1267,7 @@ mod tests {
             done_tool("grep x", 1),
             Block::Assistant { markdown: "found it".into(), streaming: false },
         ];
-        let plan = tool_fold_plan(&blocks, false);
+        let plan = tool_fold_plan(&blocks, false, false);
         assert_eq!(plan[0], Fold::Summary(vec![0, 1, 2]));
         assert_eq!(plan[1], Fold::Hide);
         assert_eq!(plan[3], Fold::Show);
@@ -1288,7 +1286,7 @@ mod tests {
             *exit_code = None;
         }
         let blocks = vec![done_tool("cd a", 0), done_tool("cd b", 0), done_tool("cd c", 0), done_tool("sed 1p f", 0), running];
-        let plan = tool_fold_plan(&blocks, false);
+        let plan = tool_fold_plan(&blocks, false, false);
         assert_eq!(plan[0], Fold::Summary(vec![0, 1, 2]));
         assert_eq!(plan[3], Fold::Show);
         assert_eq!(plan[4], Fold::Show);
@@ -1315,12 +1313,9 @@ mod tests {
 
     #[test]
     fn unfolded_tools_are_never_grouped() {
-        let mut open = done_tool("cd b", 0);
-        if let Block::Tool { folded, .. } = &mut open {
-            *folded = false;
-        }
-        let blocks = vec![done_tool("cd a", 0), open, Block::Assistant { markdown: "x".into(), streaming: false }];
-        assert!(tool_fold_plan(&blocks, false).iter().all(|f| *f == Fold::Show));
+        let blocks = vec![done_tool("cd a", 0), done_tool("cd b", 0), Block::Assistant { markdown: "x".into(), streaming: false }];
+        // When tools_unfolded is true, no summary fold is generated.
+        assert!(tool_fold_plan(&blocks, false, true).iter().all(|f| *f == Fold::Show));
     }
 
     #[test]
