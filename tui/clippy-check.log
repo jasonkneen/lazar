@@ -1,0 +1,34 @@
+    Checking lazartui v0.1.0 (/Users/jkneen/.legion/worktrees/project_b69f2455-94c6-4d33-ac37-8e6cb4642c8c/thread_d4fc48af-3815-43c6-92f7-6c18b302ab04/tui)
+warning: manual checked division
+    --> src/app.rs:2065:19
+     |
+2065 |         } else if total == 0 {
+     |                   ^^^^^^^^^^ check performed here
+...
+2068 |             format!("{served}  cache {}%", cached * 100 / total)
+     |                                            -------------------- division performed here
+     |
+     = help: consider using `checked_div`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#manual_checked_ops
+     = note: `#[warn(clippy::manual_checked_ops)]` on by default
+
+warning: `lazartui` (bin "lazartui") generated 1 warning
+warning: the borrowed expression implements the required traits
+    --> src/render/transcript.rs:1188:26
+     |
+1188 |             t.start_tool(&format!("t{n}"), &format!("cd d{n}"));
+     |                          ^^^^^^^^^^^^^^^^ help: change this to: `format!("t{n}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_borrows_for_generic_args
+     = note: `#[warn(clippy::needless_borrows_for_generic_args)]` on by default
+
+warning: the borrowed expression implements the required traits
+    --> src/render/transcript.rs:1188:44
+     |
+1188 |             t.start_tool(&format!("t{n}"), &format!("cd d{n}"));
+     |                                            ^^^^^^^^^^^^^^^^^^^ help: change this to: `format!("cd d{n}")`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_borrows_for_generic_args
+
+warning: `lazartui` (bin "lazartui" test) generated 3 warnings (1 duplicate) (run `cargo clippy --fix --bin "lazartui" -p lazartui --tests -- ` to apply 2 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.71s

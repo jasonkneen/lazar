@@ -25,7 +25,6 @@ use std::path::Path;
 
 pub(crate) const SPEAK: &str = "SPEAK";
 pub(crate) const SOURCES: &str = "SOURCES";
-const VERIFY: &str = "VERIFY";
 
 pub(crate) const PROMPT_SECTION: &str = "ANSWER FORMAT
 This client renders structured answers. Write your reply as normal text, then
@@ -76,24 +75,70 @@ pub(crate) fn blocks(text: &str, tag: &str) -> Vec<String> {
     out
 }
 
-/// `text` without any of the tagged blocks, trimmed.
-pub(crate) fn strip(text: &str, tags: &[&str]) -> String {
-    let mut out = Vec::new();
-    let mut inside: Option<&str> = None;
-    for line in text.lines() {
-        match inside {
-            Some(tag) => {
-                if close_tag(line, tag) {
-                    inside = None;
+/// Incremental display filter. Only a possible tag prefix is buffered; raw
+/// model text remains untouched for verification, speech and session storage.
+#[derive(Default)]
+pub(crate) struct DisplayText {
+    pending: String,
+    inside: Option<&'static str>,
+}
+
+impl DisplayText {
+    pub(crate) fn push(&mut self, text: &str) -> String {
+        let mut out = String::new();
+        for ch in text.chars() {
+            self.pending.push(ch);
+            loop {
+                let lower = self.pending.to_ascii_lowercase();
+                if let Some(tag) = self.inside {
+                    let close = format!("[/{tag}");
+                    if lower == close || close.starts_with(&lower) {
+                        break;
+                    }
+                    if lower.starts_with(&close) {
+                        self.pending.drain(..close.len());
+                        if self.pending.starts_with(']') {
+                            self.pending.remove(0);
+                        }
+                        self.inside = None;
+                        continue;
+                    }
+                } else {
+                    let tags = [("verify", "[verify]"), ("speak", "[speak]"), ("sources", "[sources]")];
+                    if let Some((tag, _)) = tags.iter().find(|(_, open)| *open == lower) {
+                        self.inside = Some(tag);
+                        self.pending.clear();
+                        break;
+                    }
+                    if tags.iter().any(|(_, open)| open.starts_with(&lower)) {
+                        break;
+                    }
                 }
+                let Some(first) = self.pending.chars().next() else { break };
+                if self.inside.is_none() {
+                    out.push(first);
+                }
+                self.pending.drain(..first.len_utf8());
+                if self.pending.is_empty() { break; }
             }
-            None => match tags.iter().find(|tag| open_tag(line, tag)) {
-                Some(tag) => inside = Some(tag),
-                None => out.push(line),
-            },
         }
+        out
     }
-    out.join("\n").trim().to_string()
+
+    pub(crate) fn finish(&mut self) -> String {
+        let tail = if self.inside.is_none() { std::mem::take(&mut self.pending) } else { String::new() };
+        self.pending.clear();
+        self.inside = None;
+        tail
+    }
+}
+
+/// Display-ready text for complete records, including inline machine blocks.
+pub(crate) fn display(text: &str) -> String {
+    let mut filter = DisplayText::default();
+    let mut shown = filter.push(text);
+    shown.push_str(&filter.finish());
+    shown
 }
 
 fn clean(line: &str) -> &str {
@@ -193,7 +238,7 @@ pub(crate) fn build(text: &str, cwd: &Path, verify: Value) -> Value {
         .map(|line| source(&line, cwd))
         .collect();
     json!({
-        "reply": strip(text, &[SPEAK, SOURCES, VERIFY]),
+        "reply": display(text).trim(),
         "speech": speech,
         "sources": sources,
         "verify": verify,
@@ -203,6 +248,41 @@ pub(crate) fn build(text: &str, cwd: &Path, verify: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_strips_inline_repeated_and_unclosed_blocks() {
+        for (raw, expected) in [
+            ("Done.\n[VERIFY]exists=/x[/VERIFY]\nMore.", "Done.\n\nMore."),
+            ("a[verify]x[/verify]b[SPEAK]y[/SPEAK]c[SOURCES]z[/SOURCES]d", "abcd"),
+            ("before\n[VERIFY]x[/VERIFY", "before\n"),
+            ("before\n[speak]hi", "before\n"),
+            ("before\n[SOURCES]/x[/SOURCES", "before\n"),
+            ("[VERIFY]only hidden", ""),
+            ("héllo [other] 世界 [SPE", "héllo [other] 世界 [SPE"),
+        ] {
+            assert_eq!(display(raw), expected);
+            for split in raw.char_indices().map(|(i, _)| i).chain(std::iter::once(raw.len())) {
+                let mut filter = DisplayText::default();
+                let mut shown = filter.push(&raw[..split]);
+                shown.push_str(&filter.push(&raw[split..]));
+                shown.push_str(&filter.finish());
+                assert_eq!(shown, expected, "split {split}: {raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn display_stream_never_leaks_partial_machine_tags() {
+        let mut filter = DisplayText::default();
+        let mut shown = String::new();
+        for ch in "héllo[SPEAK]secret[/SPEAK]世界[VERIFY]claim[/VERIFY]".chars() {
+            shown.push_str(&filter.push(&ch.to_string()));
+            assert!("héllo世界".starts_with(&shown), "leaked {shown}");
+        }
+        shown.push_str(&filter.finish());
+        assert_eq!(shown, "héllo世界");
+        assert_eq!(filter.push("next"), "next", "finish resets state");
+    }
 
     const ANSWER: &str = "Fixed the wrap bug.\n\n**Details** below.\n[SPEAK]\nFixed the wrap bug;\n  tests pass.\n[/SPEAK]\n[SOURCES]\n- `/etc/hosts:3`\nhttps://example.com/a\n/definitely/missing.rs\n/etc/hosts:3\n[/SOURCES]\n[VERIFY]\nexists=/etc/hosts\n[/VERIFY]\n";
 
@@ -245,7 +325,7 @@ mod tests {
         assert_eq!(answer["reply"], "just words");
         assert_eq!(answer["speech"], "");
         assert_eq!(answer["sources"], json!([]));
-        assert_eq!(strip("hi\n[speak]\nsay hi", &[SPEAK]), "hi");
+        assert_eq!(display("hi\n[speak]\nsay hi").trim(), "hi");
         assert_eq!(blocks("hi\n[speak]\nsay hi\n[/SPEAK", SPEAK), vec!["say hi"]);
     }
 }

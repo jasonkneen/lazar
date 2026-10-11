@@ -1,0 +1,97 @@
+   Compiling lazar v0.1.0 (/Users/jkneen/.legion/worktrees/project_b69f2455-94c6-4d33-ac37-8e6cb4642c8c/thread_d4fc48af-3815-43c6-92f7-6c18b302ab04/src)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.98s
+     Running unittests src/main.rs (src/target/debug/deps/lazar-6dc7e2468054e2fa)
+
+running 186 tests
+....................................................................................... 87/186
+.............. 101/186
+hooks::tests::strict_hook_that_prints_transform_then_fails_vetoes --- FAILED
+...sandbox-exec: sandbox_apply: Operation not permitted
+ 105/186
+spawn::tests::sandbox_command_writes_inside_allowed_root_but_not_its_sibling --- FAILED
+. 107/186
+hooks::tests::strict_hook_that_prints_transform_then_times_out_vetoes --- FAILED
+....................... 131/186
+tests::a_false_claim_gets_one_correction_turn --- FAILED
+........ 140/186
+tests::agent_loop_executes_tool_calls_then_ends_on_end_turn --- FAILED
+.......................... 167/186
+tests::nested_commands_inherit_turn_budgets --- FAILED
+..... 173/186
+tests::provider_overflow_compacts_and_retries_once --- FAILED
+...... 180/186
+tests::structured_answers_carry_reply_speech_sources_and_verification --- FAILED
+.... 185/186
+tests::verified_claims_pass_in_one_request --- FAILED
+
+failures:
+
+---- hooks::tests::strict_hook_that_prints_transform_then_fails_vetoes stdout ----
+[lazar] hook rewrite.strict stderr (pre-tool):
+sandbox-exec: sandbox_apply: Operation not permitted
+
+thread 'hooks::tests::strict_hook_that_prints_transform_then_fails_vetoes' (106408635) panicked at src/hooks.rs:678:9:
+assertion `left == right` failed
+  left: 71
+ right: 7
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- spawn::tests::sandbox_command_writes_inside_allowed_root_but_not_its_sibling stdout ----
+
+thread 'spawn::tests::sandbox_command_writes_inside_allowed_root_but_not_its_sibling' (106408732) panicked at src/spawn.rs:397:9:
+assertion failed: allowed_status.success()
+
+---- hooks::tests::strict_hook_that_prints_transform_then_times_out_vetoes stdout ----
+[lazar] hook rewrite.strict stderr (pre-tool):
+sandbox-exec: sandbox_apply: Operation not permitted
+
+thread 'hooks::tests::strict_hook_that_prints_transform_then_times_out_vetoes' (106408636) panicked at src/hooks.rs:693:9:
+assertion failed: result.timed_out
+
+---- tests::a_false_claim_gets_one_correction_turn stdout ----
+
+thread 'tests::a_false_claim_gets_one_correction_turn' (106408753) panicked at src/main.rs:3903:14:
+the corrected answer passes: "grounding failed: 1 of 1 claim(s) did not hold after a correction turn: exists=$LAZAR_HOME/user/workspace/made.txt (/var/folders/2p/sxcyllnn2ds9dlyqt78jd8nm0000gn/T/lazar-agent-verify-correct-77039-1791696232011/user/workspace/made.txt does not exist)"
+
+---- tests::agent_loop_executes_tool_calls_then_ends_on_end_turn stdout ----
+{"type":"result","stop_reason":"end_turn","model":"claude-sonnet-4-6","result":"Wrote the probe file.","content":[{"type":"text","text":"Wrote the probe file."}],"duration_ms":62,"input_tokens":30,"output_tokens":8}
+
+thread 'tests::agent_loop_executes_tool_calls_then_ends_on_end_turn' (106408759) panicked at src/main.rs:3539:47:
+probe written: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+---- tests::nested_commands_inherit_turn_budgets stdout ----
+{"type":"result","stop_reason":"end_turn","model":"claude-sonnet-4-6","result":"ok","content":[{"type":"text","text":"ok"}],"duration_ms":63,"input_tokens":30,"output_tokens":8}
+
+thread 'tests::nested_commands_inherit_turn_budgets' (106408816) panicked at src/main.rs:4086:82:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+
+---- tests::provider_overflow_compacts_and_retries_once stdout ----
+
+thread 'tests::provider_overflow_compacts_and_retries_once' (106408829) panicked at src/main.rs:4027:14:
+overflow is recovered by compaction: "context could not be compacted below 184 bytes (at 513); the model's context window is too small for this turn"
+
+---- tests::structured_answers_carry_reply_speech_sources_and_verification stdout ----
+
+thread 'tests::structured_answers_carry_reply_speech_sources_and_verification' (106408883) panicked at src/main.rs:3944:14:
+structured turn: "API request failed: error sending request for url (http://127.0.0.1:65161/v1/messages)"
+
+---- tests::verified_claims_pass_in_one_request stdout ----
+
+thread 'tests::verified_claims_pass_in_one_request' (106408990) panicked at src/main.rs:3885:14:
+true claims pass: "API request failed: error sending request for url (http://127.0.0.1:65176/v1/messages)"
+
+
+failures:
+    hooks::tests::strict_hook_that_prints_transform_then_fails_vetoes
+    hooks::tests::strict_hook_that_prints_transform_then_times_out_vetoes
+    spawn::tests::sandbox_command_writes_inside_allowed_root_but_not_its_sibling
+    tests::a_false_claim_gets_one_correction_turn
+    tests::agent_loop_executes_tool_calls_then_ends_on_end_turn
+    tests::nested_commands_inherit_turn_budgets
+    tests::provider_overflow_compacts_and_retries_once
+    tests::structured_answers_carry_reply_speech_sources_and_verification
+    tests::verified_claims_pass_in_one_request
+
+test result: FAILED. 177 passed; 9 failed; 0 ignored; 0 measured; 0 filtered out; finished in 29.86s
+
+error: test failed, to rerun pass `--bin lazar`

@@ -1,0 +1,7 @@
+Transcribed from baseline release command output, before display protocol changes:
+cargo test --release --manifest-path tui/Cargo.toml bench_timing -- --nocapture
+BENCH highlighter_new_ms=0.83
+BENCH first_paint_ms=110.25 lines=6899
+BENCH cached_frame_ms_avg=0.881 frames=200
+BENCH uncached_frame_ms_avg=81.33 frames=5
+test render::bench_timing::bench_timing ... ok

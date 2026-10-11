@@ -910,6 +910,7 @@ struct SseMessage {
     /// Stream-json text held until the coalesce window elapses or the block ends.
     pending_deltas: std::collections::HashMap<u64, String>,
     pending_since: Option<Instant>,
+    display_filters: std::collections::HashMap<u64, core::answer::DisplayText>,
 }
 
 impl SseMessage {
@@ -1074,6 +1075,12 @@ impl SseMessage {
                         }
                         if format == OutputFormat::StreamJson {
                             self.flush_text_delta(idx);
+                            if let Some(mut filter) = self.display_filters.remove(&idx) {
+                                let tail = filter.finish();
+                                if !tail.is_empty() {
+                                    emit_event(json!({"type": "text_delta", "index": idx, "text": "", "display_text": tail}));
+                                }
+                            }
                             emit_event(json!({
                                 "type": "text_done",
                                 "index": idx,
@@ -1159,11 +1166,24 @@ impl SseMessage {
         if text.is_empty() {
             return;
         }
+        let display_text = self.display_filters.entry(idx).or_default().push(&text);
         emit_event(json!({
             "type": "text_delta",
             "index": idx,
             "text": text,
+            "display_text": display_text,
         }));
+    }
+
+    fn finish_display_filters(&mut self) {
+        let mut indices: Vec<_> = self.display_filters.keys().copied().collect();
+        indices.sort_unstable();
+        for idx in indices {
+            let tail = self.display_filters.remove(&idx).unwrap().finish();
+            if !tail.is_empty() {
+                emit_event(json!({"type": "text_delta", "index": idx, "text": "", "display_text": tail}));
+            }
+        }
     }
 
     fn partial_text_blocks(&mut self) -> Vec<Value> {
@@ -1188,6 +1208,7 @@ impl SseMessage {
 
     fn cut(mut self, message: String) -> Box<ModelError> {
         self.flush_text_deltas();
+        self.finish_display_filters();
         Box::new(ModelError {
             message,
             partial_text: self.partial_text_blocks(),
@@ -1220,6 +1241,7 @@ impl SseMessage {
         }
 
         self.flush_text_deltas();
+        self.finish_display_filters();
         if format == OutputFormat::Text && self.printed_any_text {
             println!();
         }
@@ -4573,6 +4595,34 @@ data: {"type":"message_stop"}
         assert_eq!(stop_reason, "end_turn");
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "abc");
+    }
+
+    #[test]
+    fn stream_display_events_strip_tags_without_changing_raw_text() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        set_event_sink(Some(tx));
+        struct ClearSink;
+        impl Drop for ClearSink {
+            fn drop(&mut self) { set_event_sink(None); }
+        }
+        let _clear = ClearSink;
+        let raw = "héllo[SPEAK]secret[/SPEAK] world[VERIFY]exists=/x[/VERIFY][";
+        let mut message = SseMessage::default();
+        for ch in raw.chars() {
+            message.push_text_delta(0, &ch.to_string());
+            message.flush_text_delta(0);
+        }
+        message.finish_display_filters();
+        let mut logged = String::new();
+        let mut shown = String::new();
+        while let Ok(event) = rx.try_recv() {
+            assert_eq!(event["type"], "text_delta");
+            logged.push_str(event["text"].as_str().unwrap());
+            shown.push_str(event["display_text"].as_str().unwrap());
+            assert!("héllo world[".starts_with(&shown));
+        }
+        assert_eq!(logged, raw);
+        assert_eq!(shown, "héllo world[");
     }
 
     #[test]

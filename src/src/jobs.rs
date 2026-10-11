@@ -325,7 +325,7 @@ fn timeline(log: &Path) -> Vec<Value> {
     // Tagged blocks ([VERIFY], [SPEAK], [SOURCES]) are machine records with
     // their own steps; the text step keeps only what the agent said.
     let flush = |buffer: &mut String, steps: &mut Vec<Value>| {
-        let said = crate::core::answer::strip(buffer, &["VERIFY", "SPEAK", "SOURCES"]);
+        let said = crate::core::answer::display(buffer).trim().to_string();
         if !said.is_empty() {
             steps.push(json!({"kind": "text", "text": said}));
         }

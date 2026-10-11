@@ -1,0 +1,123 @@
+    Checking lazar v0.1.0 (/Users/jkneen/.legion/worktrees/project_b69f2455-94c6-4d33-ac37-8e6cb4642c8c/thread_d4fc48af-3815-43c6-92f7-6c18b302ab04/src)
+warning: empty line after doc comment
+  --> src/session.rs:30:1
+   |
+30 | / /// rest — set the override lower for models that degrade on long replays.
+31 | |
+   | |_^
+32 |   /// Maximum length of a session id.
+33 |   const MAX_SESSION_ID_LEN: usize = 64;
+   |   ------------------------ the comment documents this constant item
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#empty_line_after_doc_comments
+   = note: `#[warn(clippy::empty_line_after_doc_comments)]` on by default
+   = help: if the empty line is unintentional, remove it
+help: if the documentation should include the empty line include it in the comment
+   |
+31 | ///
+   |
+
+warning: called `Iterator::last` on a `DoubleEndedIterator`; this will needlessly iterate the entire iterator
+   --> src/core/compact.rs:146:37
+    |
+146 |               Value::Array(blocks) => blocks
+    |  _____________________________________^
+147 | |                 .iter()
+148 | |                 .filter(|b| b["type"] == "text")
+149 | |                 .filter_map(|b| b["text"].as_str())
+150 | |                 .last()
+    | |_______________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#double_ended_iterator_last
+    = note: `#[warn(clippy::double_ended_iterator_last)]` on by default
+help: try
+    |
+150 -                 .last()
+150 +                 .next_back()
+    |
+
+warning: this function has too many arguments (8/7)
+   --> src/core/fallback.rs:109:1
+    |
+109 | / fn await_response(
+110 | |     rpc: &mut Rpc,
+111 | |     id: u64,
+112 | |     emit: &mut dyn FnMut(Value),
+...   |
+117 | |     deadline: Option<std::time::Instant>,
+118 | | ) -> Result<Value, String> {
+    | |__________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#too_many_arguments
+    = note: `#[warn(clippy::too_many_arguments)]` on by default
+
+warning: consider using `sort_by_key`
+   --> src/jobs.rs:105:5
+    |
+105 |     rows.sort_by(|a, b| b.0.cmp(&a.0));
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_sort_by
+    = note: `#[warn(clippy::unnecessary_sort_by)]` on by default
+help: try
+    |
+105 -     rows.sort_by(|a, b| b.0.cmp(&a.0));
+105 +     rows.sort_by_key(|b| std::cmp::Reverse(b.0));
+    |
+
+warning: called `map(f)` on an `Option` value where `f` is a closure that returns the unit type `()`
+   --> src/jobs.rs:281:5
+    |
+281 | /     record.as_object_mut().map(|o| {
+282 | |         o.remove("pid");
+283 | |         o.remove("child_rc");
+284 | |         o.remove("matched");
+285 | |         o.remove("failed_claims");
+286 | |     });
+    | |______^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#option_map_unit_fn
+    = note: `#[warn(clippy::option_map_unit_fn)]` on by default
+help: use `if let` instead
+    |
+281 -     record.as_object_mut().map(|o| {
+282 -         o.remove("pid");
+283 -         o.remove("child_rc");
+284 -         o.remove("matched");
+285 -         o.remove("failed_claims");
+286 -     });
+281 +     if let Some(o) = record.as_object_mut() { ... }
+    |
+
+warning: the borrowed expression implements the required traits
+    --> src/main.rs:2997:19
+     |
+2997 |     if fs::rename(&path, &taken).is_err() {
+     |                   ^^^^^ help: change this to: `path`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#needless_borrows_for_generic_args
+     = note: `#[warn(clippy::needless_borrows_for_generic_args)]` on by default
+
+warning: this `map_or` can be simplified
+   --> src/core/compact.rs:303:17
+    |
+303 | /                 m["content"].as_array().map_or(true, |blocks| {
+304 | |                     blocks.iter().filter(|b| b["type"] == "tool_result").all(|b| {
+305 | |                         i > 0 && messages[i - 1]["content"].as_array().is_some_and(|prev| {
+306 | |                             prev.iter().any(|p| p["id"] == b["tool_use_id"])
+307 | |                         })
+308 | |                     })
+309 | |                 })
+    | |__________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#unnecessary_map_or
+    = note: `#[warn(clippy::unnecessary_map_or)]` on by default
+help: use `is_none_or` instead
+    |
+303 -                 m["content"].as_array().map_or(true, |blocks| {
+303 +                 m["content"].as_array().is_none_or(|blocks| {
+    |
+
+warning: `lazar` (bin "lazar") generated 6 warnings (run `cargo clippy --fix --bin "lazar" -p lazar -- ` to apply 2 suggestions)
+warning: `lazar` (bin "lazar" test) generated 7 warnings (6 duplicates) (run `cargo clippy --fix --bin "lazar" -p lazar --tests -- ` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.01s

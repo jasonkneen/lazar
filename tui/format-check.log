@@ -1,0 +1,3 @@
+Summary of executed command (full formatter diff not retained):
+cargo fmt --manifest-path tui/Cargo.toml -- --check
+Exit status: 1. Formatter proposed changes across the crate, including edited and unedited files. No crate-wide formatting rewrite applied. Formatting acceptance remains failed, not waived.

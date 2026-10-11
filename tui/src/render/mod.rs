@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod bench_timing;
+
 pub mod agents;
 pub mod block_frame;
 pub mod chrome;

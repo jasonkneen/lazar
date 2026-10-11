@@ -403,54 +403,6 @@ fn wrap_overlong(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 #[cfg(test)]
 pub static RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Strip `[TAG]...[/TAG]` blocks the kernel consumes for its own purposes —
-/// `VERIFY` (grounding check), `SPEAK` (voice-only summary) and `SOURCES`
-/// (citation list) — before the reply is rendered (tag case-insensitive; the
-/// closing tag may be missing its final `]`, e.g. an unclosed `[/VERIFY` at
-/// the end of a still-streaming reply). The kernel reports each of these
-/// separately (`Block::Verify`, the `answer` event's `speech`/`sources`), so
-/// the raw block is just noise in the rendered transcript.
-fn strip_tagged_blocks(markdown: &str, tag: &str) -> String {
-    let open = format!("[{tag}]");
-    let close = format!("[/{tag}");
-    let lower = markdown.to_ascii_lowercase();
-    let open_lower = open.to_ascii_lowercase();
-    let close_lower = close.to_ascii_lowercase();
-    let mut out = String::with_capacity(markdown.len());
-    let mut pos = 0usize;
-    loop {
-        match lower[pos..].find(&open_lower) {
-            Some(rel) => {
-                let start = pos + rel;
-                out.push_str(&markdown[pos..start]);
-                let after_open = start + open_lower.len();
-                pos = match lower[after_open..].find(&close_lower) {
-                    Some(rel_close) => {
-                        let close_start = after_open + rel_close;
-                        match lower[close_start..].find(']') {
-                            Some(rel_bracket) => close_start + rel_bracket + 1,
-                            None => markdown.len(),
-                        }
-                    }
-                    // No closing tag yet (still streaming): drop the rest.
-                    None => markdown.len(),
-                };
-            }
-            None => {
-                out.push_str(&markdown[pos..]);
-                break;
-            }
-        }
-    }
-    out
-}
-
-fn strip_verify_blocks(markdown: &str) -> String {
-    let stripped = strip_tagged_blocks(markdown, "VERIFY");
-    let stripped = strip_tagged_blocks(&stripped, "SPEAK");
-    strip_tagged_blocks(&stripped, "SOURCES")
-}
-
 /// `pub(crate)`: also used directly by `render::agents` to render a job
 /// detail's `timeline_blocks` output with the same look as the live
 /// transcript, without going through `RenderCache` (whose per-block
@@ -504,18 +456,14 @@ pub(crate) fn render_block(
             markdown,
             streaming,
         } => {
-            let shown = if debug {
-                markdown.clone()
-            } else {
-                strip_verify_blocks(markdown)
-            };
-            // Whitespace-only text (models emit "\n\n" between tool calls, or
-            // a reply that was only a now-stripped [VERIFY] block) would add
+            // Core owns the display protocol; rendering never parses tags.
+            let shown = markdown;
+            // Whitespace-only text (models emit "\n\n" between tool calls) would add
             // blank rows; render nothing so tool rows stay one line apart.
             if !*streaming && shown.trim().is_empty() {
                 return out;
             }
-            let mut body = render_markdown(&shown, theme, hl);
+            let mut body = render_markdown(shown, theme, hl);
             if *streaming {
                 let cursor = Span::styled(theme.glyph("▍", "_"), theme.accent);
                 match body.last_mut() {
@@ -1052,88 +1000,27 @@ mod tests {
     }
 
     #[test]
-    fn strips_a_verify_block_in_the_middle_of_a_reply() {
-        let stripped = strip_verify_blocks(
-            "Done.\n\n[VERIFY]\nexists=/tmp/x\n[/VERIFY]\n\nLet me know if that works.",
-        );
-        assert!(!stripped.to_ascii_lowercase().contains("verify"));
-        assert!(stripped.contains("Done."));
-        assert!(stripped.contains("Let me know if that works."));
-    }
-
-    #[test]
-    fn strips_multiple_verify_blocks() {
-        let stripped = strip_verify_blocks(
-            "a\n[VERIFY]\nexists=/x\n[/VERIFY]\nb\n[verify]\ncontains=/y:z\n[/verify]\nc",
-        );
-        assert_eq!(stripped, "a\n\nb\n\nc");
-    }
-
-    #[test]
-    fn strips_an_unclosed_verify_tag_variant() {
-        // The kernel's closing tag may be missing its `]`, and a still
-        // streaming reply may not have the closing tag at all yet.
-        let stripped = strip_verify_blocks("before\n[VERIFY]\nexists=/x\n[/VERIFY");
-        assert_eq!(stripped, "before\n");
-
-        let mid_stream = strip_verify_blocks("before\n[VERIFY]\nexists=/x");
-        assert_eq!(mid_stream, "before\n");
-    }
-
-    #[test]
-    fn debug_mode_keeps_the_raw_verify_block() {
+    fn display_ready_text_renders_identically_in_debug() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
-        let block = Block::Assistant {
-            markdown: "Done.\n\n[VERIFY]\nexists=/tmp/x\n[/VERIFY]".into(),
-            streaming: false,
-        };
-        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true, 0));
-        assert!(debug_lines.iter().any(|l| l.contains("[VERIFY]")));
-        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
-        assert!(!plain_lines.iter().any(|l| l.to_ascii_lowercase().contains("verify")));
+        let block = Block::Assistant { markdown: "Done.\n\nMore text.".into(), streaming: false };
+        assert_eq!(text(&render_block(&block, 80, &theme, &hl, true, 0)), text(&render_block(&block, 80, &theme, &hl, false, 0)));
     }
 
     #[test]
-    fn a_reply_that_is_only_a_verify_block_renders_nothing() {
+    fn empty_display_reply_renders_nothing() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
-        let block = Block::Assistant {
-            markdown: "[VERIFY]\nexists=/tmp/x\n[/VERIFY]\n".into(),
-            streaming: false,
-        };
-        let lines = render_block(&block, 40, &theme, &hl, false, 0);
-        assert!(lines.is_empty(), "{lines:?}");
+        let block = Block::Assistant { markdown: "\n\n".into(), streaming: false };
+        assert!(render_block(&block, 40, &theme, &hl, false, 0).is_empty());
     }
 
     #[test]
-    fn strips_speak_and_sources_blocks_but_keeps_them_in_debug() {
-        let markdown = "Done.\n[SPEAK]\nIt's fixed.\n[/SPEAK]\n[SOURCES]\n/abs/x.rs:42\n[/SOURCES]\nmore text";
-        let stripped = strip_verify_blocks(markdown);
-        let lower = stripped.to_ascii_lowercase();
-        assert!(!lower.contains("speak"), "{stripped:?}");
-        assert!(!lower.contains("sources"), "{stripped:?}");
-        assert!(stripped.contains("Done."));
-        assert!(stripped.contains("more text"));
-
+    fn renderer_does_not_interpret_protocol_tags() {
         let theme = Theme::nerv_with_icons(crate::render::theme::IconMode::Unicode);
         let hl = Highlighter::new();
-        let block = Block::Assistant { markdown: markdown.into(), streaming: false };
-        let debug_lines = text(&render_block(&block, 80, &theme, &hl, true, 0));
-        let joined = debug_lines.join("\n");
-        assert!(joined.contains("[SPEAK]") && joined.contains("[SOURCES]"), "{debug_lines:?}");
-        let plain_lines = text(&render_block(&block, 80, &theme, &hl, false, 0));
-        let plain_lower = plain_lines.join("\n").to_ascii_lowercase();
-        assert!(!plain_lower.contains("speak") && !plain_lower.contains("sources"), "{plain_lines:?}");
-    }
-
-    #[test]
-    fn strips_unclosed_speak_and_sources_tag_variants() {
-        // Matches the VERIFY behaviour: closing tag may lack the final `]`,
-        // and a still-streaming reply may have no closing tag at all.
-        assert_eq!(strip_verify_blocks("before\n[SPEAK]\nhi\n[/SPEAK"), "before\n");
-        assert_eq!(strip_verify_blocks("before\n[speak]\nhi"), "before\n");
-        assert_eq!(strip_verify_blocks("before\n[SOURCES]\n/x\n[/SOURCES"), "before\n");
+        let block = Block::Assistant { markdown: "[VERIFY] literal input [/VERIFY]".into(), streaming: false };
+        assert!(text(&render_block(&block, 80, &theme, &hl, false, 0)).join("\n").contains("[VERIFY]"));
     }
 
     fn file_source(raw: &str, line: Option<u64>, exists: Option<bool>) -> crate::transcript::SourceEntry {

@@ -496,7 +496,14 @@ pub(crate) fn prompt_blocks_to_text(blocks: &[ContentBlock]) -> Result<String, E
 pub(crate) fn map_stream_event(event: &Value) -> Option<SessionUpdate> {
     match event.get("type").and_then(Value::as_str)? {
         "text_delta" => {
-            let text = event.get("text").and_then(Value::as_str).unwrap_or("");
+            // Core supplies display text separately from raw model/log text.
+            let fallback;
+            let text = if let Some(shown) = event.get("display_text").and_then(Value::as_str) {
+                shown
+            } else {
+                fallback = crate::core::answer::display(event.get("text").and_then(Value::as_str).unwrap_or(""));
+                &fallback
+            };
             if text.is_empty() {
                 return None;
             }
@@ -614,6 +621,10 @@ fn replay_history(session_id: &SessionId) -> Vec<SessionUpdate> {
     let Ok(messages) = session::load_messages_checked(&id) else {
         return Vec::new();
     };
+    replay_messages(&messages)
+}
+
+fn replay_messages(messages: &[Value]) -> Vec<SessionUpdate> {
     let mut updates = Vec::new();
     for message in messages {
         let role = message.get("role").and_then(Value::as_str).unwrap_or("");
@@ -621,7 +632,9 @@ fn replay_history(session_id: &SessionId) -> Vec<SessionUpdate> {
             // Kernel nudges (continuation, verification) are not operator text.
             Some(Value::String(text)) if role == "user" && text.starts_with("[kernel") => {}
             Some(Value::String(text)) if !text.is_empty() => {
-                let chunk = ContentChunk::new(text.clone().into());
+                let shown = if role == "assistant" { crate::core::answer::display(text) } else { text.clone() };
+                if shown.is_empty() { continue; }
+                let chunk = ContentChunk::new(shown.into());
                 match role {
                     "user" => updates.push(SessionUpdate::UserMessageChunk(chunk)),
                     "assistant" => updates.push(SessionUpdate::AgentMessageChunk(chunk)),
@@ -636,7 +649,9 @@ fn replay_history(session_id: &SessionId) -> Vec<SessionUpdate> {
                             if text.is_empty() {
                                 continue;
                             }
-                            let chunk = ContentChunk::new(text.to_string().into());
+                            let shown = if role == "user" { text.to_string() } else { crate::core::answer::display(text) };
+                            if shown.is_empty() { continue; }
+                            let chunk = ContentChunk::new(shown.into());
                             updates.push(if role == "user" {
                                 SessionUpdate::UserMessageChunk(chunk)
                             } else {
@@ -1114,6 +1129,32 @@ mod tests {
         assert!(text.contains("hello"));
         assert!(text.contains("readme"));
         assert!(text.contains("file:///tmp/README.md"));
+    }
+
+    #[test]
+    fn replay_strips_assistant_machine_blocks_but_preserves_user_text() {
+        let messages = vec![
+            json!({"role": "user", "content": "[VERIFY]user literal[/VERIFY]"}),
+            json!({"role": "assistant", "content": "Done[SPEAK]voice[/SPEAK][VERIFY]claim[/VERIFY]"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "More[SOURCES]/x[/SOURCES]"}, {"type": "text", "text": "[VERIFY]hidden"}]}),
+        ];
+        let updates = replay_messages(&messages);
+        let values: Vec<_> = updates.into_iter().map(|u| serde_json::to_value(u).unwrap()).collect();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0]["content"]["text"], "[VERIFY]user literal[/VERIFY]");
+        assert_eq!(values[1]["content"]["text"], "Done");
+        assert_eq!(values[2]["content"]["text"], "More");
+        assert_eq!(messages[1]["content"], "Done[SPEAK]voice[/SPEAK][VERIFY]claim[/VERIFY]", "raw session is unchanged");
+    }
+
+    #[test]
+    fn display_text_is_authoritative_even_when_empty() {
+        assert!(map_stream_event(&json!({"type": "text_delta", "text": "[VERIFY]secret", "display_text": ""})).is_none());
+        let mapped = map_stream_event(&json!({"type": "text_delta", "text": "raw", "display_text": "Shown"})).unwrap();
+        let value = serde_json::to_value(mapped).unwrap();
+        assert_eq!(value["content"]["text"], "Shown");
+        let mapped = map_stream_event(&json!({"type": "text_delta", "text": "", "display_text": "["})).unwrap();
+        assert_eq!(serde_json::to_value(mapped).unwrap()["content"]["text"], "[");
     }
 
     #[test]

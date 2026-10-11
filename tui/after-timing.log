@@ -1,0 +1,12 @@
+   Compiling lazartui v0.1.0 (/Users/jkneen/.legion/worktrees/project_b69f2455-94c6-4d33-ac37-8e6cb4642c8c/thread_d4fc48af-3815-43c6-92f7-6c18b302ab04/tui)
+    Finished `release` profile [optimized] target(s) in 25.03s
+     Running unittests src/main.rs (tui/target/release/deps/lazartui-ba92505943e5a72f)
+
+running 1 test
+BENCH highlighter_new_ms=0.99
+BENCH first_paint_ms=102.31 lines=6899
+BENCH cached_frame_ms_avg=0.829 frames=200
+BENCH uncached_frame_ms_avg=75.07 frames=5
+test render::bench_timing::bench_timing ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 123 filtered out; finished in 0.65s

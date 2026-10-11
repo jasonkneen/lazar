@@ -1,0 +1,8 @@
+   Compiling lazartui v0.1.0 (/Users/jkneen/.legion/worktrees/project_b69f2455-94c6-4d33-ac37-8e6cb4642c8c/thread_d4fc48af-3815-43c6-92f7-6c18b302ab04/tui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.00s
+     Running unittests src/main.rs (tui/target/debug/deps/lazartui-b75be3f797407416)
+
+running 124 tests
+.........................i............................................................. 87/124
+.....................................
+test result: ok. 123 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 6.06s
